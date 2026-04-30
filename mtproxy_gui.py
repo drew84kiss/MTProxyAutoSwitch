@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QIcon, QIntValidator, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QIcon, QIntValidator, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -289,9 +289,110 @@ QListWidget#cardList::item {
 }
 """
 
+QSS_LIGHT = QSS
+QSS_DARK = QSS_LIGHT
+for _light, _dark in {
+    "#F3F0F8": "#16131D",
+    "#221D31": "#F5F0FF",
+    "#FAF8FD": "#201B2A",
+    "#D8D1E5": "#3A324A",
+    "#EEE8F5": "#2A2435",
+    "#D5CCE4": "#443A57",
+    "#F0ECFF": "#2D2740",
+    "#BFB3D5": "#5B4D72",
+    "#D8CFF0": "#39304E",
+    "#E1D9EC": "#3B334A",
+    "#6158C7": "#9A90FF",
+    "#5148B8": "#B0A7FF",
+    "#443AA3": "#8176F0",
+    "#E6DFF6": "#312A41",
+    "#D9CEF3": "#3A3150",
+    "#BBAEE0": "#675B82",
+    "#C9BCEB": "#463A61",
+    "#9A91AA": "#9487A8",
+    "#CFC5E0": "#554B66",
+}.items():
+    QSS_DARK = QSS_DARK.replace(_light, _dark)
+
+THEMES = {
+    "light": {
+        "qss": QSS_LIGHT,
+        "text": "#221D31",
+        "soft": "#6E667F",
+        "badge_bg": "#E6DFF6",
+        "badge_fg": "#6158C7",
+        "status_on_bg": "#D7F0DE",
+        "status_on_fg": "#1A7D55",
+        "status_off_bg": "#E8E2F1",
+        "status_off_fg": "#5E5670",
+        "alert_bg": "#FAF8FD",
+        "alert_border": "#D8D1E5",
+        "primary_on": "#D95B75",
+        "primary_on_hover": "#C94A67",
+        "primary_off": "#6158C7",
+        "primary_off_hover": "#5148B8",
+        "proxy_selected_bg": "#EEE9FF",
+        "proxy_active_bg": "#F7F4FB",
+        "proxy_bg": "#FAF8FD",
+        "proxy_selected_border": "#6158C7",
+        "proxy_active_border": "#1A7D55",
+        "proxy_border": "#D8D1E5",
+    },
+    "dark": {
+        "qss": QSS_DARK,
+        "text": "#F5F0FF",
+        "soft": "#B8ACCB",
+        "badge_bg": "#312A41",
+        "badge_fg": "#B0A7FF",
+        "status_on_bg": "#173826",
+        "status_on_fg": "#6EE7B7",
+        "status_off_bg": "#2A2435",
+        "status_off_fg": "#B8ACCB",
+        "alert_bg": "#201B2A",
+        "alert_border": "#3A324A",
+        "primary_on": "#D95B75",
+        "primary_on_hover": "#E06B82",
+        "primary_off": "#9A90FF",
+        "primary_off_hover": "#B0A7FF",
+        "proxy_selected_bg": "#2D2740",
+        "proxy_active_bg": "#202C26",
+        "proxy_bg": "#201B2A",
+        "proxy_selected_border": "#9A90FF",
+        "proxy_active_border": "#6EE7B7",
+        "proxy_border": "#3A324A",
+    },
+}
+
 
 def _asset_icon() -> QIcon:
     return QIcon(str(APP_ICON_PATH)) if APP_ICON_PATH.exists() else QIcon()
+
+
+def _system_prefers_dark() -> bool:
+    if sys.platform == "win32" and winreg is not None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                0,
+                winreg.KEY_READ,
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return int(value) == 0
+        except Exception:
+            return False
+    app = QApplication.instance()
+    if app is None:
+        return False
+    return app.palette().color(QPalette.Window).lightness() < 128
+
+
+def _resolve_theme(appearance: str) -> str:
+    if appearance == "dark":
+        return "dark"
+    if appearance == "light":
+        return "light"
+    return "dark" if _system_prefers_dark() else "light"
 
 
 def _safe_float(value: object) -> float | None:
@@ -560,6 +661,8 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(_asset_icon())
         self.resize(438, 720)
         self.setMinimumSize(438, 720)
+        self.setMaximumSize(560, 860)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
 
         self.log_lines: list[str] = []
         self.task_callbacks: dict[str, tuple[Callable[[Any], None] | None, Callable[[str], None] | None]] = {}
@@ -583,6 +686,8 @@ class MainWindow(QMainWindow):
         self.bridge.task_failed.connect(self._on_task_failed)
         self.runtime = AppRuntime(log_sink=self._runtime_log, event_sink=self._runtime_event)
         self.runtime.config.autostart_enabled = is_autostart_enabled()
+        self._theme_name = _resolve_theme(self.runtime.config.appearance)
+        QApplication.instance().setStyleSheet(THEMES[self._theme_name]["qss"])
 
         self._build_ui()
         self._build_tray()
@@ -712,8 +817,9 @@ class MainWindow(QMainWindow):
         size = int(getattr(self, "_primary_button_size", 144))
         radius = size // 2
         running = bool(getattr(self, "_local_running", False))
-        color = "#D95B75" if running else "#6158C7"
-        hover = "#C94A67" if running else "#5148B8"
+        theme = THEMES[getattr(self, "_theme_name", "light")]
+        color = theme["primary_on"] if running else theme["primary_off"]
+        hover = theme["primary_on_hover"] if running else theme["primary_off_hover"]
         font_size = 18 if size < 112 else 20 if size < 136 else 22
         self.primary_button.setStyleSheet(
             f"QPushButton#primary {{"
@@ -745,10 +851,39 @@ class MainWindow(QMainWindow):
     def _label(self, text: str = "", *, size: int = 12, bold: bool = False, soft: bool = False) -> QLabel:
         label = QLabel(text)
         label.setWordWrap(True)
-        color = "#6E667F" if soft else "#221D31"
-        weight = "700" if bold else "400"
-        label.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: {weight};")
+        label.setProperty("mtSoft", bool(soft))
+        label.setProperty("mtSize", int(size))
+        label.setProperty("mtBold", bool(bold))
+        self._style_label(label)
         return label
+
+    def _style_label(self, label: QLabel) -> None:
+        theme = THEMES[getattr(self, "_theme_name", "light")]
+        color = theme["soft"] if bool(label.property("mtSoft")) else theme["text"]
+        size = int(label.property("mtSize") or 12)
+        weight = "700" if bool(label.property("mtBold")) else "400"
+        label.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: {weight};")
+
+    def _refresh_themed_widgets(self) -> None:
+        theme = THEMES[getattr(self, "_theme_name", "light")]
+        for label in self.findChildren(QLabel):
+            if label.property("mtSize") is not None:
+                self._style_label(label)
+        if hasattr(self, "version_badge"):
+            self.version_badge.setStyleSheet(
+                f"background:{theme['badge_bg']};color:{theme['badge_fg']};"
+                "border-radius:12px;padding:4px 10px;font-weight:700;"
+            )
+        if hasattr(self, "status_chip"):
+            self._refresh_snapshot()
+        else:
+            self._apply_primary_style()
+
+    def apply_appearance(self, appearance: str | None = None) -> None:
+        appearance = appearance or self.runtime.config.appearance
+        self._theme_name = _resolve_theme(appearance)
+        QApplication.instance().setStyleSheet(THEMES[self._theme_name]["qss"])
+        self._refresh_themed_widgets()
 
     def _card(self, name: str = "card") -> QFrame:
         card = QFrame()
@@ -796,8 +931,10 @@ class MainWindow(QMainWindow):
 
         card = QFrame()
         card.setObjectName("alertCard")
+        theme = THEMES[getattr(self, "_theme_name", "light")]
         card.setStyleSheet(
-            "QFrame#alertCard { background:#FAF8FD; border:1px solid #D8D1E5; border-radius:22px; }"
+            f"QFrame#alertCard {{ background:{theme['alert_bg']}; "
+            f"border:1px solid {theme['alert_border']}; border-radius:22px; }}"
         )
         card_width = min(380, max(330, self.stack.width() - 40))
         card.setFixedWidth(card_width)
@@ -878,8 +1015,10 @@ class MainWindow(QMainWindow):
         title_row = QHBoxLayout()
         title = self._label("MTProxy", size=24, bold=True)
         self.version_badge = QLabel(f"v{APP_PUBLIC_VERSION}")
+        theme = THEMES[getattr(self, "_theme_name", "light")]
         self.version_badge.setStyleSheet(
-            "background:#E6DFF6;color:#6158C7;border-radius:12px;padding:4px 10px;font-weight:700;"
+            f"background:{theme['badge_bg']};color:{theme['badge_fg']};"
+            "border-radius:12px;padding:4px 10px;font-weight:700;"
         )
         title_row.addWidget(title)
         title_row.addWidget(self.version_badge)
@@ -892,7 +1031,8 @@ class MainWindow(QMainWindow):
 
         self.status_chip = QLabel("Подготовка")
         self.status_chip.setStyleSheet(
-            "background:#D7F0DE;color:#1A7D55;border-radius:16px;padding:8px 14px;font-weight:700;"
+            f"background:{theme['status_on_bg']};color:{theme['status_on_fg']};"
+            "border-radius:16px;padding:8px 14px;font-weight:700;"
         )
         layout.addWidget(self.status_chip, 0, Qt.AlignLeft)
 
@@ -1074,6 +1214,9 @@ class MainWindow(QMainWindow):
         for widget in (self.autostart_check, self.start_minimized_check, self.auto_start_local_check, self.auto_update_check):
             form.addWidget(widget)
         self.appearance_combo = self._combo(list(APPEARANCE_LABELS.values()))
+        self.appearance_combo.currentTextChanged.connect(
+            lambda text: self.apply_appearance(APPEARANCE_BY_LABEL.get(text, "auto"))
+        )
         self.close_combo = self._combo(list(CLOSE_LABELS.values()))
         form.addLayout(self._form_row("Тема", self.appearance_combo))
         form.addLayout(self._form_row("При закрытии окна", self.close_combo))
@@ -1486,8 +1629,13 @@ class MainWindow(QMainWindow):
         card.setCursor(QCursor(Qt.PointingHandCursor))
         if on_click is not None:
             card.clicked.connect(on_click)
-        bg = "#EEE9FF" if selected else "#F7F4FB" if active else "#FAF8FD"
-        border = "#6158C7" if selected else "#1A7D55" if active else "#D8D1E5"
+        theme = THEMES[getattr(self, "_theme_name", "light")]
+        bg = theme["proxy_selected_bg"] if selected else theme["proxy_active_bg"] if active else theme["proxy_bg"]
+        border = (
+            theme["proxy_selected_border"]
+            if selected
+            else theme["proxy_active_border"] if active else theme["proxy_border"]
+        )
         card.setStyleSheet(
             f"QFrame#proxyRow {{ background:{bg}; border:1px solid {border}; border-radius:18px; }}"
         )
@@ -1498,9 +1646,11 @@ class MainWindow(QMainWindow):
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setFixedSize(34, 34)
         avatar.setStyleSheet(
-            "background:#6158C7;color:#FFFFFF;border-radius:17px;font-weight:700;font-size:11px;"
+            f"background:{theme['proxy_selected_border']};color:#FFFFFF;"
+            "border-radius:17px;font-weight:700;font-size:11px;"
             if selected or active
-            else "background:#E6DFF6;color:#6158C7;border-radius:17px;font-weight:700;font-size:11px;"
+            else f"background:{theme['badge_bg']};color:{theme['badge_fg']};"
+            "border-radius:17px;font-weight:700;font-size:11px;"
         )
         layout.addWidget(avatar)
         text_col = QVBoxLayout()
@@ -1642,6 +1792,7 @@ class MainWindow(QMainWindow):
         self._update_advanced_probe_ui()
         self._update_telegram_api_proxy_ui()
         self._update_telegram_auth_ui()
+        self.apply_appearance(cfg.appearance)
 
     def _update_telegram_api_proxy_ui(self) -> None:
         if hasattr(self, "telegram_api_proxy_panel"):
@@ -1860,8 +2011,13 @@ class MainWindow(QMainWindow):
         running = bool(snapshot.get("local_running"))
         self._local_running = running
         self.status_chip.setText("Локальный прокси активен" if running else "Локальный прокси остановлен")
+        theme = THEMES[getattr(self, "_theme_name", "light")]
         self.status_chip.setStyleSheet(
-            ("background:#D7F0DE;color:#1A7D55;" if running else "background:#E8E2F1;color:#5E5670;")
+            (
+                f"background:{theme['status_on_bg']};color:{theme['status_on_fg']};"
+                if running
+                else f"background:{theme['status_off_bg']};color:{theme['status_off_fg']};"
+            )
             + "border-radius:16px;padding:8px 14px;font-weight:700;"
         )
         self.primary_button.setText("Стоп" if running else "Пуск")
