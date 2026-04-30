@@ -21,16 +21,12 @@ echo "Using macOS target arch: ${MTPROXY_TARGET_ARCH:-default}"
 
 python3 -m pip install --upgrade \
     pyinstaller \
-    customtkinter \
-    darkdetect \
-    pystray \
+    PySide6 \
     qrcode \
     telethon \
     certifi \
     cryptography \
     pillow \
-    imageio \
-    imageio-ffmpeg \
     pyobjc-core \
     pyobjc-framework-Cocoa \
     pyobjc-framework-Quartz

@@ -15,6 +15,8 @@ release-public/
 release-macos/
 
 data/
+debug_screens/
+hiddify-app-main/
 *.session
 *.sec
 *.log

@@ -1,6 +1,6 @@
 #define MyAppName "MTProxy AutoSwitch"
 #define MyAppExeName "MTProxyAutoSwitch.exe"
-#define MyAppVersion "1.2"
+#define MyAppVersion "1.3"
 #define MyAppPublisher "pengvench"
 #define MyAppURL "https://github.com/pengvench/MTProxyAutoSwitch"
 #define MyAppId "MTProxyAutoSwitch"
@@ -37,10 +37,10 @@ Name: "startmenuicon"; Description: "Создать ярлык в меню ""П�
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 
 [Files]
-Source: "dist\MTProxyAutoSwitch\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "release-public\portable\MTProxyAutoSwitch\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 Source: "config.template.json"; DestDir: "{app}"; DestName: "config.template.json"; Flags: ignoreversion
-Source: "list\proxy_list.txt"; DestDir: "{app}\list"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "list\*.txt"; DestDir: "{app}\list"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "list\report.json"; DestDir: "{app}\list"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]

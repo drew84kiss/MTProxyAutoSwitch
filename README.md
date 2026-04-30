@@ -97,7 +97,7 @@ macOS:
 - `list/proxy_list.txt` — рабочие MTProto-прокси
 - `list/all_list.txt` — все найденные MTProto-прокси
 - `list/rejected_list.txt` — отсеянные MTProto-прокси
-- `list/socks5_list.txt` — найденные SOCKS5
+- `list/fast_list.txt` — быстрый поднабор лучших прокси, который приложение использует первым при старте
 - `list/report.json` — подробный отчет
 
 ## Обновления
@@ -172,7 +172,7 @@ macOS:
 - Xcode Command Line Tools
 - `pkgbuild`
 
-Если в проекте используются `customtkinter`, `telethon`, `cryptography`, `pillow`, `imageio`, `imageio-ffmpeg`, они должны быть установлены в окружении сборки. Релизные скрипты ставят эти зависимости автоматически.
+Если в проекте используются `PySide6`, `telethon`, `cryptography`, `pillow`, они должны быть установлены в окружении сборки. Релизные скрипты ставят эти зависимости автоматически.
 
 ## Публикация релиза
 

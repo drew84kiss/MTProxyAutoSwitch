@@ -1,12 +1,63 @@
 from __future__ import annotations
 
+import contextlib
+import os
+import socket
 import ssl
+import threading
 from urllib.error import URLError
 
 try:
     import certifi
 except ImportError:  # pragma: no cover
     certifi = None
+
+
+TELEGRAM_WEB_HOSTS_LINES = [
+    "149.154.167.220 telegram.me",
+    "149.154.167.220 telegram.dog",
+    "149.154.167.220 telegram.space",
+    "149.154.167.220 telesco.pe",
+    "149.154.167.220 tg.dev",
+    "149.154.167.220 telegram.org",
+    "149.154.167.220 t.me",
+    "149.154.167.220 api.telegram.org",
+    "149.154.167.220 td.telegram.org",
+    "149.154.167.220 web.telegram.org",
+    "149.154.167.220 pluto.web.telegram.org",
+    "149.154.167.220 pluto-1.web.telegram.org",
+    "149.154.167.220 flora.web.telegram.org",
+    "149.154.167.220 flora-1.web.telegram.org",
+    "149.154.167.220 venus.web.telegram.org",
+    "149.154.167.220 venus-1.web.telegram.org",
+    "149.154.167.220 vesta.web.telegram.org",
+    "149.154.167.220 vesta-1.web.telegram.org",
+    "149.154.167.220 aurora.web.telegram.org",
+    "149.154.167.220 aurora-1.web.telegram.org",
+    "149.154.167.220 kws1.web.telegram.org",
+    "149.154.167.220 kws1-1.web.telegram.org",
+    "149.154.167.220 kws2.web.telegram.org",
+    "149.154.167.220 kws2-1.web.telegram.org",
+    "149.154.167.220 kws4.web.telegram.org",
+    "149.154.167.220 kws4-1.web.telegram.org",
+    "149.154.167.220 kws5.web.telegram.org",
+    "149.154.167.220 kws5-1.web.telegram.org",
+    "149.154.167.220 zws1.web.telegram.org",
+    "149.154.167.220 zws1-1.web.telegram.org",
+    "149.154.167.220 zws2.web.telegram.org",
+    "149.154.167.220 zws2-1.web.telegram.org",
+    "149.154.167.220 zws4.web.telegram.org",
+    "149.154.167.220 zws4-1.web.telegram.org",
+    "149.154.167.220 zws5.web.telegram.org",
+    "149.154.167.220 zws5-1.web.telegram.org",
+    "149.154.167.220 my.telegram.org",
+]
+TELEGRAM_WEB_HOST_MAP = {
+    host.lower(): ip
+    for line in TELEGRAM_WEB_HOSTS_LINES
+    for ip, host in [line.split(maxsplit=1)]
+}
+_DNS_OVERRIDE_LOCK = threading.RLock()
 
 
 def create_verified_ssl_context() -> ssl.SSLContext:
@@ -23,6 +74,38 @@ def create_verified_ssl_context() -> ssl.SSLContext:
 
 def create_insecure_ssl_context() -> ssl.SSLContext:
     return ssl._create_unverified_context()
+
+
+def telegram_web_dns_override_enabled() -> bool:
+    return os.environ.get("MTPROXY_TELEGRAM_WEB_DNS_OVERRIDE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+@contextlib.contextmanager
+def telegram_web_dns_override(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        normalized_host = str(host or "").rstrip(".").lower()
+        mapped_ip = TELEGRAM_WEB_HOST_MAP.get(normalized_host)
+        if mapped_ip:
+            return original_getaddrinfo(mapped_ip, port, family, type, proto, flags)
+        return original_getaddrinfo(host, port, family, type, proto, flags)
+
+    with _DNS_OVERRIDE_LOCK:
+        socket.getaddrinfo = patched_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
 
 
 def is_tls_verification_error(exc: BaseException) -> bool:

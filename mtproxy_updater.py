@@ -14,7 +14,7 @@ from typing import Callable
 
 from mtproxy_net import create_verified_ssl_context
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_PUBLIC_VERSION = APP_VERSION
 GITHUB_REPO = "pengvench/MTProxyAutoSwitch"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -23,7 +23,7 @@ WINDOWS_INSTALLER_ASSET_CANDIDATES = ("MTProxyAutoSwitch-Setup.exe",)
 WINDOWS_ARCHIVE_ASSET_CANDIDATES = ("MTProxyAutoSwitch.zip", "MTProxyAutoSwitchPublic.zip")
 MACOS_INSTALLER_ASSET_CANDIDATES = ("MTProxyAutoSwitch.pkg",)
 MACOS_ARCHIVE_ASSET_CANDIDATES = ("MTProxyAutoSwitch.dmg",)
-USER_AGENT = "MTProxyAutoSwitchUpdater/1.2"
+USER_AGENT = "MTProxyAutoSwitchUpdater/1.3"
 URLLIB_SSL_CONTEXT = create_verified_ssl_context()
 WINDOWS_DEFAULT_INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "Programs" / "MTProxy AutoSwitch"
 
@@ -77,15 +77,7 @@ def is_update_available(
     platform_name: str | None = None,
     install_dir: Path | None = None,
 ) -> bool:
-    if is_newer_version(current_version, release.tag_name):
-        return True
-    if install_dir is None:
-        return False
-    return _can_offer_installer_migration(
-        release,
-        platform_name=(platform_name or sys.platform),
-        install_dir=install_dir,
-    )
+    return is_newer_version(current_version, release.tag_name)
 
 
 def prepare_update(

@@ -51,6 +51,7 @@ LIVE_ACTIVITY_UPDATE_MIN_DELTA_BYTES = 24 * 1024
 LIVE_ACTIVITY_MIN_SAMPLE_SECONDS = 0.12
 RATE_EWMA_ALPHA = 0.45
 MEDIA_PIN_TTL_SECONDS = 120.0
+STICKY_SESSION_TTL_SECONDS = 300.0
 
 
 @dataclass
@@ -146,6 +147,34 @@ class ProxyPool:
         self._states: dict[tuple[str, int, str], UpstreamProxyState] = {}
         self._media_pin_key: tuple[str, int, str] | None = None
         self._media_pin_until: float = 0.0
+        self._manual_override_key: tuple[str, int, str] | None = None
+        self._selection_strategy = "sticky_session"
+        self._round_robin_cursor = {
+            "main": 0,
+            "media": 0,
+        }
+        self._sticky_assignments: dict[str, tuple[tuple[str, int, str], float]] = {}
+
+    def set_selection_strategy(self, strategy: str) -> None:
+        with self._lock:
+            normalized = str(strategy or "").strip().lower().replace("-", "_")
+            if normalized not in {"round_robin", "consistent_hash", "sticky_session"}:
+                normalized = "sticky_session"
+            self._selection_strategy = normalized
+
+    def selection_strategy(self) -> str:
+        with self._lock:
+            return self._selection_strategy
+
+    def set_manual_override(self, proxy_key: tuple[str, int, str] | None) -> None:
+        with self._lock:
+            if proxy_key is not None and proxy_key not in self._states:
+                return
+            self._manual_override_key = proxy_key
+
+    def manual_override_key(self) -> tuple[str, int, str] | None:
+        with self._lock:
+            return self._manual_override_key
 
     def _active_media_pin_key(self) -> tuple[str, int, str] | None:
         now = time.time()
@@ -196,6 +225,8 @@ class ProxyPool:
             if self._media_pin_key is not None and self._media_pin_key not in self._states:
                 self._media_pin_key = None
                 self._media_pin_until = 0.0
+            if self._manual_override_key is not None and self._manual_override_key not in self._states:
+                self._manual_override_key = None
 
     def update_deep_media_score(
         self,
@@ -243,7 +274,7 @@ class ProxyPool:
             state = self._states.get(proxy_key)
             if state is None:
                 return None
-            soft_latency_limit = min(max(80.0, float(max_latency_ms or 300.0)), 150.0)
+            soft_latency_limit = max(300.0, float(max_latency_ms or 300.0))
             if ok and latency_ms is not None:
                 state.counters.live_latency_ms = latency_ms
                 state.counters.recent_successes = min(50, state.counters.recent_successes + 1)
@@ -313,26 +344,28 @@ class ProxyPool:
 
     def select_candidates(self, *, is_media: bool, limit: int = 5) -> list[UpstreamProxyState]:
         with self._lock:
-            candidates = self._available_states()
-            if not candidates:
-                candidates = list(self._states.values())
-            pressure = self.media_pressure()
-            prefer_media = (
-                is_media
-                or pressure["active_heavy"] > 0
-                or pressure["recent_media"] > 0
-                or self._has_strong_media_candidate(candidates)
+            return self._ordered_candidates_unlocked(is_media=is_media, limit=limit)
+
+    def select_session_candidates(
+        self,
+        *,
+        is_media: bool,
+        session_key: str,
+        limit: int = 5,
+        prefer_media: bool | None = None,
+    ) -> list[UpstreamProxyState]:
+        with self._lock:
+            ordered = self._ordered_candidates_unlocked(
+                is_media=is_media,
+                limit=limit,
+                prefer_media=prefer_media,
             )
-            if prefer_media:
-                ordered = sorted(candidates, key=self._media_turbo_score, reverse=True)
-            else:
-                ordered = sorted(candidates, key=lambda item: self._score(item, is_media), reverse=True)
-            pinned_key = self._active_media_pin_key() if prefer_media else None
-            if pinned_key is not None:
-                pinned_state = next((item for item in ordered if item.key == pinned_key), None)
-                if pinned_state is not None:
-                    ordered = [pinned_state] + [item for item in ordered if item.key != pinned_key]
-            return ordered[:limit]
+            return self._apply_selection_strategy_unlocked(
+                ordered,
+                session_key=session_key,
+                is_media=is_media,
+                prefer_media=bool(prefer_media),
+            )
 
     def select_turbo_media_candidates(self, *, limit: int = 5) -> list[UpstreamProxyState]:
         with self._lock:
@@ -593,6 +626,7 @@ class ProxyPool:
                         "last_error": state.counters.cooldown_reason or state.counters.last_error,
                         "reason": runtime_state,
                         "score": round(self._score(state, False), 2),
+                        "manual_selected": state.key == self._manual_override_key,
                     }
                 )
             return rows
@@ -625,8 +659,138 @@ class ProxyPool:
             }
 
     def best(self) -> UpstreamProxyState | None:
+        with self._lock:
+            if self._manual_override_key is not None:
+                override_state = self._states.get(self._manual_override_key)
+                if override_state is not None:
+                    return override_state
         items = self.select_candidates(is_media=True, limit=1)
         return items[0] if items else None
+
+    def _ordered_candidates_unlocked(
+        self,
+        *,
+        is_media: bool,
+        limit: int = 5,
+        prefer_media: bool | None = None,
+    ) -> list[UpstreamProxyState]:
+        candidates = self._available_states()
+        if not candidates:
+            candidates = list(self._states.values())
+        if not candidates:
+            return []
+        pressure = self.media_pressure()
+        prefer_media_mode = (
+            bool(prefer_media)
+            if prefer_media is not None
+            else (
+                is_media
+                or pressure["active_heavy"] > 0
+                or pressure["recent_media"] > 0
+                or self._has_strong_media_candidate(candidates)
+            )
+        )
+        if prefer_media_mode:
+            ordered = sorted(candidates, key=self._media_turbo_score, reverse=True)
+        else:
+            ordered = sorted(candidates, key=lambda item: self._score(item, is_media), reverse=True)
+        pinned_key = self._active_media_pin_key() if prefer_media_mode else None
+        if pinned_key is not None:
+            pinned_state = next((item for item in ordered if item.key == pinned_key), None)
+            if pinned_state is not None:
+                ordered = [pinned_state] + [item for item in ordered if item.key != pinned_key]
+        return ordered[:limit]
+
+    def _apply_selection_strategy_unlocked(
+        self,
+        ordered: list[UpstreamProxyState],
+        *,
+        session_key: str,
+        is_media: bool,
+        prefer_media: bool,
+    ) -> list[UpstreamProxyState]:
+        if len(ordered) <= 1:
+            return ordered
+        if self._manual_override_key is not None:
+            manual_state = next((item for item in ordered if item.key == self._manual_override_key), None)
+            if manual_state is not None:
+                return [manual_state] + [item for item in ordered if item.key != manual_state.key]
+        strategy = self._selection_strategy
+        if prefer_media and self._active_media_pin_key() is not None:
+            strategy = "sticky_session"
+        chosen_key: tuple[str, int, str] | None = None
+        if strategy == "round_robin":
+            chosen_key = self._choose_round_robin_key_unlocked(ordered, is_media=is_media or prefer_media)
+        elif strategy == "consistent_hash":
+            chosen_key = self._choose_consistent_hash_key_unlocked(ordered, session_key=session_key)
+        else:
+            chosen_key = self._choose_sticky_session_key_unlocked(ordered, session_key=session_key, is_media=is_media or prefer_media)
+        if chosen_key is None:
+            return ordered
+        chosen_state = next((item for item in ordered if item.key == chosen_key), None)
+        if chosen_state is None:
+            return ordered
+        return [chosen_state] + [item for item in ordered if item.key != chosen_key]
+
+    def _choose_round_robin_key_unlocked(
+        self,
+        ordered: list[UpstreamProxyState],
+        *,
+        is_media: bool,
+    ) -> tuple[str, int, str] | None:
+        if not ordered:
+            return None
+        bucket = "media" if is_media else "main"
+        index = self._round_robin_cursor[bucket] % len(ordered)
+        self._round_robin_cursor[bucket] = (self._round_robin_cursor[bucket] + 1) % max(1, len(ordered))
+        return ordered[index].key
+
+    def _choose_consistent_hash_key_unlocked(
+        self,
+        ordered: list[UpstreamProxyState],
+        *,
+        session_key: str,
+    ) -> tuple[str, int, str] | None:
+        if not ordered:
+            return None
+        digest = hashlib.blake2b(session_key.encode("utf-8", errors="ignore"), digest_size=8).digest()
+        index = int.from_bytes(digest, "big") % len(ordered)
+        return ordered[index].key
+
+    def _choose_sticky_session_key_unlocked(
+        self,
+        ordered: list[UpstreamProxyState],
+        *,
+        session_key: str,
+        is_media: bool,
+    ) -> tuple[str, int, str] | None:
+        if not ordered:
+            return None
+        self._prune_sticky_assignments_unlocked()
+        assigned = self._sticky_assignments.get(session_key)
+        if assigned is not None:
+            proxy_key, _expires_at = assigned
+            if any(item.key == proxy_key for item in ordered):
+                self._sticky_assignments[session_key] = (proxy_key, time.time() + STICKY_SESSION_TTL_SECONDS)
+                return proxy_key
+        proxy_key = self._choose_round_robin_key_unlocked(ordered, is_media=is_media)
+        if proxy_key is None:
+            proxy_key = ordered[0].key
+        self._sticky_assignments[session_key] = (proxy_key, time.time() + STICKY_SESSION_TTL_SECONDS)
+        return proxy_key
+
+    def _prune_sticky_assignments_unlocked(self) -> None:
+        if not self._sticky_assignments:
+            return
+        now = time.time()
+        live_keys = set(self._states.keys())
+        stale_keys = [
+            session_key
+            for session_key, (proxy_key, expires_at) in self._sticky_assignments.items()
+            if expires_at <= now or proxy_key not in live_keys
+        ]
+        for session_key in stale_keys:
+            self._sticky_assignments.pop(session_key, None)
 
     def _latency_penalty(self, state: UpstreamProxyState, is_media: bool) -> float:
         ping_ms = state.telegram_ping_ms
@@ -751,6 +915,7 @@ class LocalMTProxyServer:
         host: str = "127.0.0.1",
         port: int = 1443,
         secret: str,
+        selection_strategy: str = "sticky_session",
         connect_timeout: float = 8.0,
         log_sink: Any | None = None,
         event_sink: Any | None = None,
@@ -766,7 +931,10 @@ class LocalMTProxyServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop_event: asyncio.Event | None = None
+        self._start_event: threading.Event | None = None
+        self._start_error = ""
         self._local_secret_bytes = _normalize_proxy_secret(self.secret)
+        self.pool.set_selection_strategy(selection_strategy)
 
     @property
     def local_proxy_url(self) -> str:
@@ -784,7 +952,7 @@ class LocalMTProxyServer:
 
     @property
     def link_secret(self) -> str:
-        return self.secret
+        return "dd" + self._local_secret_bytes.hex()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -792,8 +960,18 @@ class LocalMTProxyServer:
     def start(self) -> None:
         if self.is_running():
             return
+        self._start_event = threading.Event()
+        self._start_error = ""
         self._thread = threading.Thread(target=self._thread_main, daemon=True, name="mtproxy-local-server")
         self._thread.start()
+        timeout = max(2.0, min(float(self.connect_timeout or 8.0), 8.0))
+        if not self._start_event.wait(timeout=timeout):
+            raise RuntimeError(f"local_server_start_timeout:{self.host}:{self.port}")
+        if self._start_error:
+            if self._thread is not None:
+                self._thread.join(timeout=0.5)
+            self._thread = None
+            raise RuntimeError(self._start_error)
 
     def stop(self, timeout: float = 5.0) -> None:
         loop = self._loop
@@ -813,6 +991,9 @@ class LocalMTProxyServer:
         self._loop = None
         self._stop_event = None
 
+    def set_selection_strategy(self, strategy: str) -> None:
+        self.pool.set_selection_strategy(strategy)
+
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
         self._loop = loop
@@ -822,6 +1003,9 @@ class LocalMTProxyServer:
         try:
             loop.run_until_complete(self._run(stop_event))
         except Exception as exc:
+            self._start_error = str(exc)
+            if self._start_event is not None:
+                self._start_event.set()
             self._log(f"[local] failed to start on {self.host}:{self.port}: {exc}")
             self._emit("local_server_state", running=False, host=self.host, port=self.port, error=str(exc))
         finally:
@@ -837,6 +1021,8 @@ class LocalMTProxyServer:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
         self._log(f"[local] listening on {self.host}:{self.port}")
         self._emit("local_server_state", running=True, host=self.host, port=self.port)
+        if self._start_event is not None:
+            self._start_event.set()
         async with self._server:
             await stop_event.wait()
         self._emit("local_server_state", running=False, host=self.host, port=self.port)
@@ -869,16 +1055,18 @@ class LocalMTProxyServer:
             dc_idx = -dc_id if is_media else dc_id
             local_dec, local_enc = _build_local_ciphers(client_prekey_iv, self._local_secret_bytes)
             use_media_shortlist = is_media or self.pool.media_pressure()["recent_media"] > 0 or self.pool.media_pressure()["active_heavy"] > 0
-            candidates = (
-                self.pool.select_turbo_media_candidates(limit=MEDIA_TURBO_CANDIDATE_LIMIT)
-                if use_media_shortlist
-                else self.pool.select_candidates(is_media=is_media, limit=5)
+            session_key = self._build_session_key(
+                peer=peer,
+                dc_id=dc_id,
+                is_media=is_media,
+                proto_tag=proto_tag,
             )
-            media_leader = self.pool.best_media_leader() if not use_media_shortlist else None
-            if media_leader is not None and media_leader in candidates:
-                candidates = [media_leader] + [item for item in candidates if item.key != media_leader.key]
-            elif media_leader is not None and not use_media_shortlist:
-                candidates = [media_leader] + [item for item in candidates if item.key != media_leader.key]
+            candidates = self.pool.select_session_candidates(
+                is_media=is_media,
+                session_key=session_key,
+                limit=MEDIA_TURBO_CANDIDATE_LIMIT if use_media_shortlist else 5,
+                prefer_media=use_media_shortlist,
+            )
             if not candidates:
                 self._log("[local] no working upstream proxies in pool")
                 return
@@ -1135,6 +1323,21 @@ class LocalMTProxyServer:
         latency_ms = (time.perf_counter() - started_at) * 1000.0
         return reader, writer, upstream_enc, upstream_dec, latency_ms
 
+    @staticmethod
+    def _build_session_key(
+        *,
+        peer: Any,
+        dc_id: int,
+        is_media: bool,
+        proto_tag: bytes,
+    ) -> str:
+        if isinstance(peer, tuple) and len(peer) >= 2:
+            client_host = str(peer[0])
+        else:
+            client_host = "unknown"
+        media_flag = "media" if is_media else "main"
+        return f"{client_host}|dc:{dc_id}|{media_flag}|proto:{proto_tag.hex()}"
+
     def _log(self, message: str) -> None:
         if self.log_sink is not None:
             self.log_sink(message)
@@ -1211,7 +1414,7 @@ def _build_upstream_header(secret: bytes, dc_idx: int, proto_tag: bytes) -> tupl
 
 def _normalize_proxy_secret(secret: str) -> bytes:
     normalized = secret.strip().lower()
-    if normalized.startswith("dd"):
+    if normalized.startswith(("dd", "ee")):
         normalized = normalized[2:]
     raw = bytes.fromhex(normalized)
     return raw[:16]

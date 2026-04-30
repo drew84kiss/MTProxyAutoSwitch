@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import html
 import json
@@ -24,12 +25,17 @@ from telethon import TelegramClient, functions
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.sessions import MemorySession
 
-from mtproxy_net import create_insecure_ssl_context, create_verified_ssl_context, is_tls_verification_error
+from mtproxy_net import (
+    create_insecure_ssl_context,
+    create_verified_ssl_context,
+    is_tls_verification_error,
+    telegram_web_dns_override,
+    telegram_web_dns_override_enabled,
+)
 
 
 DEFAULT_SOURCES = [
     "https://mtpro.xyz/mtproto-ru",
-    "https://mtpro.xyz/socks5-ru",
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
@@ -59,6 +65,10 @@ BROWSER_HEADERS = {
 
 SCRIPT_SRC_RE = re.compile(r"<script[^>]+\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE)
 CONFIG_URL_RE = re.compile(r"(?:API_URL|PUB_URL)\s*[:=]\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+ATOB_RE = re.compile(
+    r"\batob\(\s*[\"'](?P<payload>[A-Za-z0-9+/_=-]{32,})[\"']\s*\)",
+    re.IGNORECASE,
+)
 JSON_URL_RE = re.compile(
     r"https?://[^\s\"'<>]+(?:\.json(?:[?#][^\s\"'<>]*)?|/api/\?type=[^\s\"'<>]+)",
     re.IGNORECASE,
@@ -72,13 +82,14 @@ SOCKS_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 PROXY_OBJECT_RE = re.compile(
-    r"\{[^{}]*?(?:host|server)\s*:\s*[\"'](?P<host>[^\"']+)[\"']"
-    r"[^{}]*?port\s*:\s*(?P<port>\d+)"
-    r"[^{}]*?secret\s*:\s*[\"'](?P<secret>[^\"']+)[\"'][^{}]*?\}",
+    r"\{[^{}]*?[\"']?(?:host|server)[\"']?\s*:\s*[\"'](?P<host>[^\"']+)[\"']"
+    r"[^{}]*?[\"']?port[\"']?\s*:\s*[\"']?(?P<port>\d+)[\"']?"
+    r"[^{}]*?[\"']?secret[\"']?\s*:\s*[\"'](?P<secret>[^\"']+)[\"'][^{}]*?\}",
     re.IGNORECASE | re.DOTALL,
 )
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 SECRET_RE = re.compile(r"^[0-9a-fA-F]{16,512}$")
+SECRET_B64_RE = re.compile(r"^[A-Za-z0-9+/_-]{16,512}={0,2}$")
 
 PROBE_API_ID = 9
 PROBE_API_HASH = "00000000000000000000000000000000"
@@ -168,6 +179,14 @@ class SourceSummary:
     source_url: str
     fetched_urls: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    mtproxy_found: int = 0
+    mtproxy_new: int = 0
+    mtproxy_duplicate: int = 0
+    socks5_found: int = 0
+    socks5_new: int = 0
+    socks5_duplicate: int = 0
+    script_urls_found: int = 0
+    data_urls_found: int = 0
 
 
 @dataclass
@@ -242,6 +261,7 @@ class Fetcher:
         self.ssl_context = create_verified_ssl_context()
         self.insecure_ssl_context = create_insecure_ssl_context()
         self.allow_insecure_tls = os.environ.get("MTPROXY_ALLOW_INSECURE_TLS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self.telegram_dns_override = telegram_web_dns_override_enabled()
 
     def fetch_text(self, url: str, referer: str | None = None) -> str:
         headers = dict(BROWSER_HEADERS)
@@ -268,7 +288,9 @@ class Fetcher:
             raise RuntimeError(f"{url} -> {exc}") from exc
 
     def _fetch_text(self, request: Request, context) -> str:
-        with urlopen(request, timeout=self.timeout, context=context) as response:
+        with telegram_web_dns_override(self.telegram_dns_override):
+            response_context = urlopen(request, timeout=self.timeout, context=context)
+        with response_context as response:
             payload = response.read()
             charset = response.headers.get_content_charset() or "utf-8"
             return payload.decode(charset, errors="replace")
@@ -317,15 +339,27 @@ def normalize_host(host: str) -> str | None:
     return host
 
 
+def _decode_secret_to_hex(raw_secret: str) -> str | None:
+    if SECRET_RE.fullmatch(raw_secret) and len(raw_secret) % 2 == 0:
+        return raw_secret.lower()
+    if not SECRET_B64_RE.fullmatch(raw_secret):
+        return None
+    try:
+        padded = raw_secret + ("=" * ((4 - len(raw_secret) % 4) % 4))
+        decoded = base64.urlsafe_b64decode(padded)
+    except Exception:
+        return None
+    hex_secret = decoded.hex()
+    if SECRET_RE.fullmatch(hex_secret) and len(hex_secret) % 2 == 0:
+        return hex_secret
+    return None
+
+
 def normalize_secret(secret: str) -> str | None:
-    secret = "".join(secret.strip().split()).lower()
+    secret = "".join(str(secret).strip().split())
     if not secret or "${" in secret or "{{" in secret:
         return None
-    if secret.startswith("ee"):
-        return None
-    if not SECRET_RE.fullmatch(secret):
-        return None
-    return secret
+    return _decode_secret_to_hex(secret)
 
 
 def normalize_auth_value(value: str | None) -> str:
@@ -521,25 +555,65 @@ def scan_text(text: str, source_url: str, current_url: str) -> ScanArtifacts:
         artifacts.data_urls.add(match.group(0))
 
     artifacts.script_urls = extract_scripts(normalized, current_url)
+    for match in ATOB_RE.finditer(normalized):
+        payload = match.group("payload")
+        try:
+            padded = payload + ("=" * ((4 - len(payload) % 4) % 4))
+            decoded = base64.b64decode(padded, validate=False).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not decoded:
+            continue
+        nested = scan_text(decoded, source_url, current_url)
+        artifacts.proxies.extend(nested.proxies)
+        artifacts.socks5.extend(nested.socks5)
+        artifacts.data_urls.update(nested.data_urls)
+        artifacts.script_urls.update(nested.script_urls)
     return artifacts
 
 
-def merge_proxy(registry: dict[tuple[str, int, str], ProxyRecord], proxy: ProxyRecord) -> None:
+def merge_proxy(registry: dict[tuple[str, int, str], ProxyRecord], proxy: ProxyRecord) -> bool:
     existing = registry.get(proxy.key)
     if existing is None:
         registry[proxy.key] = proxy
-        return
+        return True
     existing.sources.update(proxy.sources)
     existing.discovered_from.update(proxy.discovered_from)
+    return False
 
 
-def merge_socks5(registry: dict[tuple[str, int, str, str], Socks5Record], proxy: Socks5Record) -> None:
+def merge_socks5(registry: dict[tuple[str, int, str, str], Socks5Record], proxy: Socks5Record) -> bool:
     existing = registry.get(proxy.key)
     if existing is None:
         registry[proxy.key] = proxy
-        return
+        return True
     existing.sources.update(proxy.sources)
     existing.discovered_from.update(proxy.discovered_from)
+    return False
+
+
+def record_proxy(
+    summary: SourceSummary,
+    registry: dict[tuple[str, int, str], ProxyRecord],
+    proxy: ProxyRecord,
+) -> None:
+    summary.mtproxy_found += 1
+    if merge_proxy(registry, proxy):
+        summary.mtproxy_new += 1
+    else:
+        summary.mtproxy_duplicate += 1
+
+
+def record_socks5(
+    summary: SourceSummary,
+    registry: dict[tuple[str, int, str, str], Socks5Record],
+    proxy: Socks5Record,
+) -> None:
+    summary.socks5_found += 1
+    if merge_socks5(registry, proxy):
+        summary.socks5_new += 1
+    else:
+        summary.socks5_duplicate += 1
 
 
 def fetch_data_url(
@@ -578,16 +652,18 @@ def fetch_data_url(
 
     if parsed_json is not None:
         for proxy in parse_json_proxies(parsed_json, source_url, data_url):
-            merge_proxy(registry, proxy)
+            record_proxy(summary, registry, proxy)
         for proxy in parse_json_socks5(parsed_json, source_url, data_url):
-            merge_socks5(socks5_registry, proxy)
+            record_socks5(summary, socks5_registry, proxy)
         return
 
     artifacts = scan_text(payload, source_url, data_url)
+    summary.script_urls_found += len(artifacts.script_urls)
+    summary.data_urls_found += len(artifacts.data_urls)
     for proxy in artifacts.proxies:
-        merge_proxy(registry, proxy)
+        record_proxy(summary, registry, proxy)
     for proxy in artifacts.socks5:
-        merge_socks5(socks5_registry, proxy)
+        record_socks5(summary, socks5_registry, proxy)
 
 
 def scrape_source(
@@ -610,10 +686,12 @@ def scrape_source(
         return summary
 
     artifacts = scan_text(html_text, source_url, source_url)
+    summary.script_urls_found += len(artifacts.script_urls)
+    summary.data_urls_found += len(artifacts.data_urls)
     for proxy in artifacts.proxies:
-        merge_proxy(registry, proxy)
+        record_proxy(summary, registry, proxy)
     for proxy in artifacts.socks5:
-        merge_socks5(socks5_registry, proxy)
+        record_socks5(summary, socks5_registry, proxy)
 
     data_urls = set(artifacts.data_urls)
     source_host = urlsplit(source_url).netloc
@@ -630,10 +708,12 @@ def scrape_source(
             continue
 
         script_artifacts = scan_text(script_text, source_url, script_url)
+        summary.script_urls_found += len(script_artifacts.script_urls)
+        summary.data_urls_found += len(script_artifacts.data_urls)
         for proxy in script_artifacts.proxies:
-            merge_proxy(registry, proxy)
+            record_proxy(summary, registry, proxy)
         for proxy in script_artifacts.socks5:
-            merge_socks5(socks5_registry, proxy)
+            record_socks5(summary, socks5_registry, proxy)
         data_urls.update(script_artifacts.data_urls)
 
     for data_url in sorted(data_urls):
@@ -733,15 +813,15 @@ def classify_probe(
     elif success_rate < settings.min_success_rate:
         accepted = False
         reason = "unstable"
-    elif avg_latency_ms is not None and avg_latency_ms > settings.max_latency_ms:
-        accepted = False
-        reason = "high_latency"
     elif (
-        max_consecutive_high_latency >= settings.high_latency_streak
-        or high_latency_ratio >= settings.max_high_latency_ratio
+        avg_latency_ms is not None
+        and (
+            avg_latency_ms > settings.max_latency_ms
+            or max_consecutive_high_latency >= settings.high_latency_streak
+            or high_latency_ratio >= settings.max_high_latency_ratio
+        )
     ):
-        accepted = False
-        reason = "high_latency"
+        reason = "slow"
 
     return ProbeOutcome(
         proxy=proxy,
@@ -837,9 +917,6 @@ async def probe_proxy(
                         max_consecutive_high_latency,
                         consecutive_high_latency,
                     )
-                    if consecutive_high_latency >= settings.high_latency_streak:
-                        early_stop = "high_latency"
-                        break
                 else:
                     consecutive_high_latency = 0
 
@@ -963,6 +1040,7 @@ def build_report(
             "high_latency_streak": config.high_latency_streak,
             "max_proxies": config.max_proxies,
             "fetch_timeout": config.fetch_timeout,
+            "telegram_web_dns_override": telegram_web_dns_override_enabled(),
         },
         "counts": {
             "unique_proxies": len(all_proxies),
@@ -974,7 +1052,17 @@ def build_report(
             {
                 "source_url": summary.source_url,
                 "fetched_urls": summary.fetched_urls,
+                "fetched_count": len(summary.fetched_urls),
+                "mtproxy_found": summary.mtproxy_found,
+                "mtproxy_new": summary.mtproxy_new,
+                "mtproxy_duplicate": summary.mtproxy_duplicate,
+                "socks5_found": summary.socks5_found,
+                "socks5_new": summary.socks5_new,
+                "socks5_duplicate": summary.socks5_duplicate,
+                "script_urls_found": summary.script_urls_found,
+                "data_urls_found": summary.data_urls_found,
                 "errors": summary.errors,
+                "error_count": len(summary.errors),
             }
             for summary in source_summaries
         ],
@@ -1028,7 +1116,7 @@ def build_report(
             "Validation is performed through real Telegram MTProto requests over the proxy.",
             "Each successful sample includes connect + help.getConfig + help.getNearestDc round-trips.",
             "Media download verification is still not included because it requires an authenticated Telegram session.",
-            "SOCKS5 links are exported separately and are not used by the local MTProto frontend.",
+            "SOCKS5 links may still be discovered during scraping, but the local MTProto frontend ignores them.",
         ],
     }
 
@@ -1157,7 +1245,9 @@ def run_collection(
         write_text_file(all_txt_path, [proxy.url for proxy in proxies])
         write_text_file(working_txt_path, [item.proxy.url for item in working])
         write_text_file(rejected_txt_path, [item.proxy.url for item in rejected])
-        write_text_file(socks5_all_txt_path, [proxy.url for proxy in socks5])
+        with contextlib.suppress(Exception):
+            if socks5_all_txt_path.exists():
+                socks5_all_txt_path.unlink()
         report_json_path.write_text(
             json.dumps(
                 build_report(source_summaries, proxies, socks5, outcomes, config),
@@ -1276,7 +1366,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-latency-ms",
         type=float,
         default=300.0,
-        help="Latency above this value counts as high latency. Default: 300.",
+        help="Latency above this value is marked as slow and deprioritized. Default: 300.",
     )
     parser.add_argument(
         "--min-success-rate",
@@ -1288,13 +1378,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-high-latency-ratio",
         type=float,
         default=0.6,
-        help="Drop proxy if high latency dominates successful attempts. Default: 0.6.",
+        help="Mark proxy as slow if high latency dominates successful attempts. Default: 0.6.",
     )
     parser.add_argument(
         "--high-latency-streak",
         type=int,
         default=3,
-        help="Drop proxy early after this many high-latency successes in a row. Default: 3.",
+        help="Mark proxy as slow after this many high-latency successes in a row. Default: 3.",
     )
     parser.add_argument(
         "--max-proxies",

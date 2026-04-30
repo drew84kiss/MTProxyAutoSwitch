@@ -25,16 +25,12 @@ The build script installs these dependencies automatically:
 
 ```text
 pyinstaller
-customtkinter
-darkdetect
-pystray
+PySide6
 qrcode
 telethon
 certifi
 cryptography
 pillow
-imageio
-imageio-ffmpeg
 pyobjc-core
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz

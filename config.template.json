@@ -1,7 +1,6 @@
 {
   "sources": [
     "https://mtpro.xyz/mtproto-ru",
-    "https://mtpro.xyz/socks5-ru",
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
@@ -19,10 +18,12 @@
   "min_success_rate": 0.7,
   "max_high_latency_ratio": 0.6,
   "high_latency_streak": 3,
-  "max_proxies": 180,
+  "max_proxies": 500,
   "local_host": "127.0.0.1",
   "local_port": 1443,
   "local_secret": "274763e0d711fd394e833938dd93c8c3",
+  "balancer_strategy": "sticky_session",
+  "manual_upstream_url": "",
   "auto_start_local": true,
   "autostart_enabled": false,
   "start_minimized_to_tray": false,
@@ -45,11 +46,13 @@
   "live_probe_top_n": 12,
   "deep_media_enabled": false,
   "rf_whitelist_check_enabled": false,
-  "deep_media_top_n": 10,
+  "deep_media_top_n": 0,
   "appearance": "auto",
   "auto_update_enabled": true,
   "telegram_api_id": 0,
   "telegram_api_hash": "",
+  "telegram_api_proxy_enabled": false,
+  "telegram_api_proxy_url": "https://t.me/proxy?server=max.ru.rightarion.ru&port=443&secret=eedcaae509a2455bbfc6165f1708fd5c586d61782e7275",
   "telegram_phone": "",
-  "telegram_session_file": "data/telegram_user.sec"
+  "telegram_session_file": "telegram_user.sec"
 }

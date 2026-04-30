@@ -1,13 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import platform
-import tempfile
-import pathlib
 import os
-
-from PyInstaller.utils.hooks import collect_all
-
-imageio_datas, imageio_binaries, imageio_hiddenimports = collect_all('imageio')
-imageio_ffmpeg_datas, imageio_ffmpeg_binaries, imageio_ffmpeg_hidden = collect_all('imageio_ffmpeg')
 
 
 def _resolve_target_arch() -> str | None:
@@ -24,47 +17,27 @@ def _resolve_target_arch() -> str | None:
 
 target_arch = _resolve_target_arch()
 
-_hook_code = (
-    "import os, sys, pathlib\n"
-    "if getattr(sys, 'frozen', False):\n"
-    "    _d = pathlib.Path(sys._MEIPASS)\n"
-    "    for _p in ('imageio_ffmpeg/binaries/ffmpeg*.exe',\n"
-    "               'imageio_ffmpeg/binaries/ffmpeg*',\n"
-    "               'ffmpeg*.exe', 'ffmpeg*'):\n"
-    "        _c = sorted(_d.glob(_p))\n"
-    "        if _c:\n"
-    "            os.environ.setdefault('IMAGEIO_FFMPEG_EXE', str(_c[0]))\n"
-    "            break\n"
-)
-_hook_path = pathlib.Path(tempfile.gettempdir()) / "_mtproxy_public_hook.py"
-_hook_path.write_text(_hook_code, encoding="utf-8")
-
 a = Analysis(
     ['mtproxy_gui.py'],
     pathex=[],
-    binaries=imageio_binaries + imageio_ffmpeg_binaries,
+    binaries=[],
     datas=(
-        imageio_datas
-        + imageio_ffmpeg_datas
-        + [
+        [
             ('img/icon.ico', 'img'),
-            ('img/dancecardiscordrtc.mp4', 'img'),
             ('mtproxy_seed.json', '.'),
         ]
     ),
     hiddenimports=(
-        imageio_hiddenimports
-        + imageio_ffmpeg_hidden
-        + [
-            'customtkinter',
-            'darkdetect',
-            'pystray',
+        [
+            'PySide6',
+            'PySide6.QtCore',
+            'PySide6.QtGui',
+            'PySide6.QtWidgets',
             'qrcode',
             'telethon',
             'cryptography',
             'PIL',
             'PIL.Image',
-            'PIL.ImageTk',
             'objc',
             'Foundation',
             'AppKit',
@@ -73,7 +46,7 @@ a = Analysis(
     ),
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[str(_hook_path)],
+    runtime_hooks=[],
     excludes=['win32crypt'],
     noarchive=False,
     optimize=0,
@@ -118,8 +91,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'MTProxy AutoSwitch',
         'CFBundleDisplayName': 'MTProxy AutoSwitch',
-        'CFBundleShortVersionString': '1.2',
-        'CFBundleVersion': '1.2',
+        'CFBundleShortVersionString': '1.3',
+        'CFBundleVersion': '1.3',
         'LSMinimumSystemVersion': '10.15',
         'NSHighResolutionCapable': True,
         'NSAppleEventsUsageDescription':

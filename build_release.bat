@@ -5,14 +5,10 @@ cd /d "%~dp0"
 
 python -m pip install --upgrade ^
     pyinstaller ^
-    customtkinter ^
-    darkdetect ^
-    pystray ^
+    PySide6 ^
     qrcode ^
     cryptography ^
     pillow ^
-    imageio ^
-    imageio-ffmpeg ^
     pywin32
 
 python -m pip install telethon==1.42.0
@@ -41,8 +37,8 @@ for %%I in (iscc.exe) do set "ISCC_EXE=%%~$PATH:I"
 if not defined ISCC_EXE if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not defined ISCC_EXE if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles%\Inno Setup 6\ISCC.exe"
 if not defined ISCC_EXE (
-    echo Inno Setup 6 not found. Install ISCC.exe and rerun build_release.bat.
-    exit /b 1
+    echo Inno Setup 6 not found. Skipping installer build and keeping portable artifacts only.
+    goto :portable_only
 )
 
 "%ISCC_EXE%" /Qp MTProxyAutoSwitch.iss
@@ -50,11 +46,13 @@ if errorlevel 1 exit /b 1
 
 attrib +h release-public\portable\MTProxyAutoSwitch\_internal >nul 2>nul
 
+:portable_only
+
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist __pycache__ rmdir /s /q __pycache__
 
 echo Build complete:
-echo   release-public\MTProxyAutoSwitch-Setup.exe
 echo   release-public\MTProxyAutoSwitch.zip
+if exist release-public\MTProxyAutoSwitch-Setup.exe echo   release-public\MTProxyAutoSwitch-Setup.exe
 endlocal
