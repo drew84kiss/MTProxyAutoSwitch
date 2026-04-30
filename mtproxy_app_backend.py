@@ -201,6 +201,7 @@ LEGACY_SOCKS5_FILE_NAME = "socks5_all.txt"
 LEGACY_REPORT_FILE_NAME = "mtproxy_report.json"
 CONFIG_FILE_NAME = "config.json"
 DATA_DIR_NAME = "data"
+TELEGRAM_AUTH_STATE_FILE_NAME = "telegram_auth.json"
 FILE_ATTRIBUTE_HIDDEN = 0x02
 RECOMMENDED_WEB_SOURCE_ADDITIONS = [
     "https://t.me/s/ProxyFree_Ru",
@@ -333,6 +334,7 @@ class AppRuntime:
     def save_config(self) -> None:
         payload = self._config_payload(self.config)
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._save_persistent_telegram_auth(payload)
 
     @staticmethod
     def _config_payload(config: AppConfig) -> dict[str, Any]:
@@ -755,12 +757,18 @@ class AppRuntime:
                 "display": "",
                 "phone": "",
                 "session_exists": session_path.exists(),
+                "credentials_configured": False,
+                "reason": "credentials_missing",
             }
         with self.telegram_lock:
-            return self._run_telegram_api_call(
+            result = self._run_telegram_api_call(
                 "auth-status",
                 lambda upstream: get_auth_status(cfg, upstream_proxy=upstream),
             )
+        result["credentials_configured"] = True
+        if result.get("session_exists") and not result.get("authorized"):
+            result["reason"] = "session_not_authorized"
+        return result
 
     def request_auth_code(self, phone: str) -> dict[str, Any]:
         with self.telegram_lock:
@@ -1915,6 +1923,21 @@ class AppRuntime:
         if "telegram_api_proxy_enabled" not in data:
             data["telegram_api_proxy_enabled"] = False
             normalized = True
+        persistent_auth = self._load_persistent_telegram_auth() or self._load_legacy_telegram_auth(legacy_paths)
+        if persistent_auth:
+            for key, value in persistent_auth.items():
+                if key == "telegram_api_id":
+                    if int(data.get(key) or 0) <= 0 and int(value or 0) > 0:
+                        data[key] = int(value)
+                        normalized = True
+                elif key in {"telegram_api_hash", "telegram_phone", "telegram_api_proxy_url", "telegram_session_file"}:
+                    if not str(data.get(key) or "").strip() and str(value or "").strip():
+                        data[key] = str(value).strip()
+                        normalized = True
+                elif key == "telegram_api_proxy_enabled":
+                    if bool(data.get(key, False)) != bool(value):
+                        data[key] = bool(value)
+                        normalized = True
         if "telegram_sources_enabled" not in data:
             data["telegram_sources_enabled"] = bool(data.get("thread_source_enabled", False))
             normalized = True
@@ -1954,7 +1977,72 @@ class AppRuntime:
                 self.config_path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         defaults = asdict(AppConfig())
         defaults.update(data)
-        return AppConfig(**defaults)
+        config = AppConfig(**defaults)
+        self._save_persistent_telegram_auth(self._config_payload(config))
+        return config
+
+    def _persistent_telegram_auth_path(self) -> Path:
+        return self.state_dir / TELEGRAM_AUTH_STATE_FILE_NAME
+
+    def _load_persistent_telegram_auth(self) -> dict[str, Any]:
+        auth_path = self._persistent_telegram_auth_path()
+        if not auth_path.exists():
+            return {}
+        try:
+            payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        allowed = {
+            "telegram_api_id",
+            "telegram_api_hash",
+            "telegram_phone",
+            "telegram_api_proxy_enabled",
+            "telegram_api_proxy_url",
+            "telegram_session_file",
+        }
+        return {key: payload[key] for key in allowed if key in payload}
+
+    def _load_legacy_telegram_auth(self, config_paths: list[Path]) -> dict[str, Any]:
+        for config_path in config_paths:
+            if not config_path.exists():
+                continue
+            try:
+                payload = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            api_id = int(payload.get("telegram_api_id") or 0)
+            api_hash = str(payload.get("telegram_api_hash") or "").strip()
+            if api_id <= 0 or not api_hash:
+                continue
+            return {
+                "telegram_api_id": api_id,
+                "telegram_api_hash": api_hash,
+                "telegram_phone": str(payload.get("telegram_phone") or "").strip(),
+                "telegram_api_proxy_enabled": bool(payload.get("telegram_api_proxy_enabled", False)),
+                "telegram_api_proxy_url": str(payload.get("telegram_api_proxy_url") or DEFAULT_TELEGRAM_API_PROXY_URL).strip(),
+                "telegram_session_file": Path(str(payload.get("telegram_session_file") or "telegram_user.sec")).name,
+            }
+        return {}
+
+    def _save_persistent_telegram_auth(self, payload: dict[str, Any]) -> None:
+        auth_payload = {
+            "telegram_api_id": int(payload.get("telegram_api_id") or 0),
+            "telegram_api_hash": str(payload.get("telegram_api_hash") or "").strip(),
+            "telegram_phone": str(payload.get("telegram_phone") or "").strip(),
+            "telegram_api_proxy_enabled": bool(payload.get("telegram_api_proxy_enabled", False)),
+            "telegram_api_proxy_url": str(payload.get("telegram_api_proxy_url") or DEFAULT_TELEGRAM_API_PROXY_URL).strip(),
+            "telegram_session_file": Path(str(payload.get("telegram_session_file") or "telegram_user.sec")).name,
+        }
+        with contextlib.suppress(Exception):
+            auth_path = self._persistent_telegram_auth_path()
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text(json.dumps(auth_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            _hide_windows_path(auth_path.parent)
+            _hide_windows_path(auth_path)
 
     def _working_priority_key(self, outcome: ProbeOutcome) -> tuple[float, float, float, float, str]:
         latency = outcome.avg_latency_ms if outcome.avg_latency_ms is not None else 9_999.0

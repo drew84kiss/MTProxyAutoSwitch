@@ -752,34 +752,34 @@ class MainWindow(QMainWindow):
             return
         height = max(540, int(self.height() or 720))
         if height < 620:
-            primary_size = 82
+            primary_size = 138
             spacing = 4
             hero_margins = (10, 8, 10, 8)
-            active_height = 96
+            active_height = 92
             stat_height = 78
             show_thread = False
             show_active_hint = False
             show_footer = False
             show_hero_hint = False
         elif height < 760:
-            primary_size = 112
+            primary_size = 198
             spacing = 6
-            hero_margins = (14, 12, 14, 10)
-            active_height = 126
+            hero_margins = (14, 10, 14, 8)
+            active_height = 116
             stat_height = 78
             show_thread = False
             show_active_hint = True
             show_footer = False
             show_hero_hint = True
         else:
-            primary_size = 136
-            spacing = 10
-            hero_margins = (16, 16, 16, 12)
-            active_height = 154
+            primary_size = 234
+            spacing = 8
+            hero_margins = (16, 12, 16, 10)
+            active_height = 128
             stat_height = 90
             show_thread = True
             show_active_hint = True
-            show_footer = True
+            show_footer = False
             show_hero_hint = True
         self.main_layout.setSpacing(spacing)
         margin = 10 if height < 620 else 12 if height < 760 else 16
@@ -820,7 +820,7 @@ class MainWindow(QMainWindow):
         theme = THEMES[getattr(self, "_theme_name", "light")]
         color = theme["primary_on"] if running else theme["primary_off"]
         hover = theme["primary_on_hover"] if running else theme["primary_off_hover"]
-        font_size = 18 if size < 112 else 20 if size < 136 else 22
+        font_size = 20 if size < 150 else 24 if size < 210 else 28
         self.primary_button.setStyleSheet(
             f"QPushButton#primary {{"
             f"min-width:{size}px;max-width:{size}px;min-height:{size}px;max-height:{size}px;"
@@ -2262,7 +2262,10 @@ class MainWindow(QMainWindow):
         elif payload.get("session_exists"):
             self._telegram_authorized = False
             self._telegram_auth_stage = "start"
-            self.auth_status.setText("Сессия найдена, но авторизация не подтверждена")
+            if not payload.get("credentials_configured", True):
+                self.auth_status.setText("Сессия найдена. Укажите API ID и API Hash, чтобы проверить вход.")
+            else:
+                self.auth_status.setText("Сессия найдена, но Telegram ее не принял. Нужен повторный вход.")
         else:
             self._telegram_authorized = False
             self._telegram_auth_stage = "start"
