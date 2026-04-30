@@ -1,3 +1,6 @@
+<img width="433" height="741" alt="Снимок экрана 2026-05-01 035203" src="https://github.com/user-attachments/assets/8d4cc4b9-7f42-4fe6-96ab-33f1f0a347c0" />
+<img width="438" height="745" alt="Снимок экрана 2026-05-01 035157" src="https://github.com/user-attachments/assets/d223f0cf-157a-4ac1-a401-78adb398f642" />
+
 # MTProxy AutoSwitch
 
 `MTProxy AutoSwitch` поднимает локальный MTProto frontend на `127.0.0.1:1443`, собирает прокси из веб-источников и Telegram, проверяет их и автоматически переключает upstream на лучший доступный вариант.
