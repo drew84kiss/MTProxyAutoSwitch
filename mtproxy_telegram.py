@@ -120,6 +120,13 @@ def auth_is_configured(config: TelegramAuthConfig) -> bool:
     return bool(config.api_id and config.api_hash.strip())
 
 
+TELEGRAM_USER_ERROR_PREFIX = "telegram_user_error:"
+
+
+def _telegram_user_error(message: str) -> RuntimeError:
+    return RuntimeError(f"{TELEGRAM_USER_ERROR_PREFIX}{message}")
+
+
 def normalize_telegram_phone(phone: str) -> str:
     raw_value = str(phone or "").strip()
     if not raw_value:
@@ -202,7 +209,20 @@ async def request_login_code(
     client = build_client(config, upstream_proxy=upstream_proxy, timeout=DEFAULT_AUTH_TIMEOUT)
     try:
         await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
-        sent = await _await_timeout(client.send_code_request(normalized_phone), DEFAULT_AUTH_TIMEOUT, "send_code")
+        try:
+            sent = await _await_timeout(client.send_code_request(normalized_phone), DEFAULT_AUTH_TIMEOUT, "send_code")
+        except errors.PhoneNumberInvalidError as exc:
+            raise _telegram_user_error("Telegram не принял номер телефона. Введите российский номер в формате +7XXXXXXXXXX.") from exc
+        except errors.PhoneNumberBannedError as exc:
+            raise _telegram_user_error("Этот номер заблокирован Telegram и не может быть использован для входа.") from exc
+        except errors.PhoneNumberFloodError as exc:
+            raise _telegram_user_error("Telegram временно ограничил запросы кода для этого номера. Попробуйте позже.") from exc
+        except errors.ApiIdInvalidError as exc:
+            raise _telegram_user_error("API ID или API Hash неверные. Проверьте данные с my.telegram.org/apps.") from exc
+        except errors.FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 0) or 0)
+            suffix = f" Подождите {seconds} сек." if seconds > 0 else ""
+            raise _telegram_user_error(f"Telegram временно ограничил запросы кода.{suffix}") from exc
         return {
             "phone_code_hash": sent.phone_code_hash,
             "type": type(sent.type).__name__ if sent.type is not None else "",
@@ -236,7 +256,24 @@ async def complete_login(
         except errors.SessionPasswordNeededError:
             if not password.strip():
                 return {"authorized": False, "password_required": True}
-            await _await_timeout(client.sign_in(password=password), DEFAULT_AUTH_TIMEOUT, "password_sign_in")
+            try:
+                await _await_timeout(client.sign_in(password=password), DEFAULT_AUTH_TIMEOUT, "password_sign_in")
+            except errors.PasswordHashInvalidError as exc:
+                raise _telegram_user_error("Неверный пароль 2FA.") from exc
+        except errors.PhoneCodeInvalidError as exc:
+            raise _telegram_user_error("Неверный код подтверждения.") from exc
+        except errors.PhoneCodeExpiredError as exc:
+            raise _telegram_user_error("Код подтверждения истек или относится к предыдущему запросу. Запросите новый код и введите последний пришедший код.") from exc
+        except errors.PhoneCodeEmptyError as exc:
+            raise _telegram_user_error("Введите код подтверждения.") from exc
+        except errors.PhoneNumberInvalidError as exc:
+            raise _telegram_user_error("Telegram не принял номер телефона. Введите российский номер в формате +7XXXXXXXXXX.") from exc
+        except errors.ApiIdInvalidError as exc:
+            raise _telegram_user_error("API ID или API Hash неверные. Проверьте данные с my.telegram.org/apps.") from exc
+        except errors.FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 0) or 0)
+            suffix = f" Подождите {seconds} сек." if seconds > 0 else ""
+            raise _telegram_user_error(f"Telegram временно ограничил попытки входа.{suffix}") from exc
 
         me = await _await_timeout(client.get_me(), DEFAULT_AUTH_TIMEOUT, "get_me")
         return {
@@ -320,7 +357,10 @@ async def qr_login_flow(
                     "qr": True,
                     "expires_at": expires_at,
                 }
-            await _await_timeout(client.sign_in(password=password.strip()), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "qr_password")
+            try:
+                await _await_timeout(client.sign_in(password=password.strip()), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "qr_password")
+            except errors.PasswordHashInvalidError as exc:
+                raise _telegram_user_error("Неверный пароль 2FA.") from exc
         except RuntimeError as exc:
             if str(exc) == "qr_wait_timeout":
                 return {

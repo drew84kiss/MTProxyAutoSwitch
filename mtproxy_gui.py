@@ -16,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover
     winreg = None
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QIcon, QIntValidator, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -697,6 +697,7 @@ class MainWindow(QMainWindow):
         self._telegram_auth_stage = "start"
         self._telegram_auth_busy: str | None = None
 
+        QApplication.instance().installEventFilter(self)
         self.bridge = UiBridge()
         self.bridge.log.connect(self._append_log)
         self.bridge.event.connect(self._handle_runtime_event)
@@ -729,6 +730,71 @@ class MainWindow(QMainWindow):
 
     def _runtime_event(self, event_name: str, payload: dict[str, object]) -> None:
         self.bridge.event.emit(str(event_name), dict(payload or {}))
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.KeyPress and isinstance(watched, QLineEdit):
+            if self._handle_line_edit_shortcut(watched, event):
+                return True
+        return super().eventFilter(watched, event)
+
+    def _handle_line_edit_shortcut(self, field: QLineEdit, event: QEvent) -> bool:
+        modifiers = event.modifiers()
+        native_key = int(event.nativeVirtualKey() or 0) if hasattr(event, "nativeVirtualKey") else 0
+        key = int(event.key()) if hasattr(event, "key") else 0
+        ctrl = bool(modifiers & Qt.ControlModifier)
+        shift = bool(modifiers & Qt.ShiftModifier)
+        alt = bool(modifiers & Qt.AltModifier)
+
+        if ctrl and not alt:
+            if native_key == 0x41 or key == Qt.Key_A:
+                field.selectAll()
+            elif native_key == 0x43 or key == Qt.Key_C:
+                field.copy()
+            elif native_key == 0x56 or key == Qt.Key_V:
+                if not field.isReadOnly():
+                    self._paste_into_line_edit(field)
+            elif native_key == 0x58 or key == Qt.Key_X:
+                if not field.isReadOnly():
+                    field.cut()
+            elif native_key == 0x5A or key == Qt.Key_Z:
+                if not field.isReadOnly():
+                    field.undo()
+            elif native_key == 0x59 or key == Qt.Key_Y:
+                if not field.isReadOnly():
+                    field.redo()
+            elif native_key == 0x2D or key == Qt.Key_Insert:
+                field.copy()
+            else:
+                return False
+            event.accept()
+            return True
+
+        if shift and not alt:
+            if native_key == 0x2D or key == Qt.Key_Insert:
+                if not field.isReadOnly():
+                    self._paste_into_line_edit(field)
+                event.accept()
+                return True
+            if native_key == 0x2E or key == Qt.Key_Delete:
+                if not field.isReadOnly():
+                    field.cut()
+                event.accept()
+                return True
+
+        return False
+
+    def _paste_into_line_edit(self, field: QLineEdit) -> None:
+        if field is getattr(self, "telegram_api_id", None):
+            text = "".join(ch for ch in QApplication.clipboard().text() if ch.isdigit())
+            if text:
+                field.insert(text)
+            return
+        if field is getattr(self, "telegram_api_hash", None):
+            text = QApplication.clipboard().text().strip()
+            if text:
+                field.insert(text)
+            return
+        field.paste()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -1872,8 +1938,29 @@ class MainWindow(QMainWindow):
         self._update_telegram_auth_ui()
 
     def _telegram_auth_failed(self, error: str) -> None:
-        self._set_telegram_auth_busy(None, f"Ошибка Telegram: {error}")
-        self.show_error("Telegram", error)
+        message = self._format_telegram_error(error)
+        self._set_telegram_auth_busy(None, f"Ошибка Telegram: {message}")
+        self.show_error("Telegram", message)
+
+    @staticmethod
+    def _format_telegram_error(error: str) -> str:
+        text = str(error or "").strip()
+        messages = {
+            "telegram_api_credentials_missing": "Укажите API ID и API Hash.",
+            "phone_code_hash_missing": "Сначала запросите код Telegram.",
+            "connect_timeout": "Не удалось подключиться к Telegram API: истекло время ожидания. Проверьте интернет или API proxy.",
+            "send_code_timeout": "Telegram не ответил на запрос кода. Проверьте подключение или попробуйте другой API proxy.",
+            "sign_in_timeout": "Telegram не ответил при проверке кода. Проверьте подключение или попробуйте еще раз.",
+            "password_sign_in_timeout": "Telegram не ответил при проверке пароля 2FA. Проверьте подключение или попробуйте еще раз.",
+            "auth_status_timeout": "Telegram не ответил на проверку сессии. Проверьте подключение или API proxy.",
+            "qr_login_timeout": "Telegram не выдал QR-код вовремя. Проверьте подключение или API proxy.",
+            "qr_wait_timeout": "QR-код истек. Запустите QR вход еще раз.",
+            "qr_password_timeout": "Telegram не ответил при проверке пароля 2FA для QR входа.",
+            "logout_timeout": "Telegram не ответил на запрос выхода. Проверьте подключение.",
+            "send_empty_timeout": "Telegram не ответил при отправке сообщения в Saved.",
+            "send_chunk_timeout": "Telegram не ответил при отправке списка в Saved.",
+        }
+        return messages.get(text, text or "Неизвестная ошибка")
 
     def _telegram_sources_toggled(self, checked: bool) -> None:
         if checked and not self._telegram_authorized:
@@ -2329,7 +2416,7 @@ class MainWindow(QMainWindow):
     def _auth_status_failed(self, error: str) -> None:
         self._telegram_auth_known = False
         self._telegram_authorized = False
-        self.auth_status.setText(f"Ошибка проверки авторизации: {error}")
+        self.auth_status.setText(f"Ошибка проверки авторизации: {self._format_telegram_error(error)}")
         self._update_telegram_auth_ui()
 
     def _save_auth_config_inline(self) -> None:
@@ -2337,14 +2424,20 @@ class MainWindow(QMainWindow):
         set_autostart_enabled(bool(cfg.autostart_enabled))
         self.runtime.apply_config(cfg)
 
+    def _normalized_telegram_phone_input(self) -> str:
+        phone = normalize_telegram_phone(self.telegram_phone.text().strip())
+        if phone:
+            self.telegram_phone.setText(phone)
+        return phone
+
     def request_auth_code(self) -> None:
         if getattr(self, "_telegram_auth_busy", None):
             return
         try:
-            self._save_auth_config_inline()
-            phone = normalize_telegram_phone(self.telegram_phone.text().strip())
+            phone = self._normalized_telegram_phone_input()
             if not phone:
                 raise RuntimeError("Введите телефон")
+            self._save_auth_config_inline()
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
@@ -2356,7 +2449,11 @@ class MainWindow(QMainWindow):
             on_error=self._telegram_auth_failed,
         )
 
-    def _auth_code_requested(self, _result: object) -> None:
+    def _auth_code_requested(self, result: object) -> None:
+        payload = dict(result or {})
+        phone = str(payload.get("phone") or "")
+        if phone:
+            self.telegram_phone.setText(phone)
         self._telegram_auth_known = True
         self._telegram_authorized = False
         self._telegram_auth_stage = "code"
@@ -2368,11 +2465,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "_telegram_auth_busy", None):
             return
         try:
-            self._save_auth_config_inline()
-            phone = normalize_telegram_phone(self.telegram_phone.text().strip())
+            phone = self._normalized_telegram_phone_input()
             code = self.telegram_code.text().strip()
             if not phone or not code:
                 raise RuntimeError("Нужны телефон и код подтверждения")
+            self._save_auth_config_inline()
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
@@ -2384,7 +2481,15 @@ class MainWindow(QMainWindow):
             on_error=self._telegram_auth_failed,
         )
 
-    def _auth_completed(self, _result: object) -> None:
+    def _auth_completed(self, result: object) -> None:
+        payload = dict(result or {})
+        if payload.get("password_required"):
+            self._telegram_auth_known = True
+            self._telegram_authorized = False
+            self._telegram_auth_stage = "code"
+            self.auth_status.setText("Telegram запросил пароль 2FA. Введите пароль и нажмите «Войти» еще раз.")
+            self._update_telegram_auth_ui()
+            return
         self._telegram_auth_known = True
         self._telegram_authorized = True
         self._telegram_auth_stage = "authorized"
@@ -2412,7 +2517,7 @@ class MainWindow(QMainWindow):
         self._update_telegram_auth_ui()
 
     def start_qr_auth(self, password: str = "") -> None:
-        if getattr(self, "_telegram_auth_busy", None) and not password:
+        if getattr(self, "_telegram_auth_busy", None):
             return
         try:
             self._save_auth_config_inline()
@@ -2424,7 +2529,10 @@ class MainWindow(QMainWindow):
             "qr_auth",
             lambda: self.runtime.run_qr_login(password=password),
             on_success=self._qr_auth_completed,
-            on_error=lambda error: (self._set_telegram_auth_busy(None, f"Ошибка QR входа: {error}"), self.show_warning("Telegram", error)),
+            on_error=lambda error: (
+                self._set_telegram_auth_busy(None, f"Ошибка QR входа: {self._format_telegram_error(error)}"),
+                self.show_warning("Telegram", self._format_telegram_error(error)),
+            ),
         )
 
     def _qr_auth_completed(self, result: object) -> None:

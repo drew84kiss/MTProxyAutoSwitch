@@ -32,6 +32,7 @@ from mtproxy_telegram import (
     DEFAULT_SOURCE_MAX_PROXIES,
     DEFAULT_SOURCE_MAX_MESSAGES,
     DEFAULT_TELEGRAM_SOURCE_URLS,
+    TELEGRAM_USER_ERROR_PREFIX,
     MediaProbeResult,
     TelegramAuthConfig,
     auth_is_configured,
@@ -42,6 +43,7 @@ from mtproxy_telegram import (
     get_auth_status,
     light_media_probe,
     logout,
+    normalize_telegram_phone,
     qr_login_flow,
     request_login_code,
     send_proxy_list_to_saved_messages,
@@ -300,6 +302,7 @@ class AppRuntime:
         self.live_probe_thread = threading.Thread(target=self._live_probe_loop, daemon=True, name="mtproxy-live-probe")
         self.live_probe_thread.start()
         self._auth_code_hash: str = ""
+        self._auth_code_phone: str = ""
         if self.config.auto_start_local and self.pool.count() > 0:
             self.start_local_server(
                 raise_on_verify_failure=False,
@@ -771,27 +774,34 @@ class AppRuntime:
         return result
 
     def request_auth_code(self, phone: str) -> dict[str, Any]:
+        normalized_phone = normalize_telegram_phone(phone)
+        self._auth_code_hash = ""
+        self._auth_code_phone = normalized_phone
         with self.telegram_lock:
             result = self._run_telegram_api_call(
                 "request-code",
                 lambda upstream: request_login_code(
                     self.auth_config,
-                    phone=phone,
+                    phone=normalized_phone,
                     upstream_proxy=upstream,
                 ),
             )
         self._auth_code_hash = result.get("phone_code_hash", "")
+        self._auth_code_phone = str(result.get("phone") or normalized_phone)
         return result
 
     def complete_auth(self, phone: str, code: str, password: str = "") -> dict[str, Any]:
         if not self._auth_code_hash:
             raise RuntimeError("phone_code_hash_missing")
+        normalized_phone = normalize_telegram_phone(phone)
+        if self._auth_code_phone and normalized_phone != self._auth_code_phone:
+            raise RuntimeError("Запросите новый код для текущего номера телефона.")
         with self.telegram_lock:
             result = self._run_telegram_api_call(
                 "complete-login",
                 lambda upstream: complete_login(
                     self.auth_config,
-                    phone=phone,
+                    phone=normalized_phone,
                     code=code,
                     phone_code_hash=self._auth_code_hash,
                     password=password,
@@ -800,6 +810,7 @@ class AppRuntime:
             )
         if result.get("authorized"):
             self._auth_code_hash = ""
+            self._auth_code_phone = ""
         return result
 
     def logout_auth(self) -> None:
@@ -1537,12 +1548,28 @@ class AppRuntime:
         preferred: ProxyRecord | None = None,
         include_direct: bool = True,
     ) -> Any:
+        no_retry_errors = {
+            "send_code_timeout",
+            "sign_in_timeout",
+            "password_sign_in_timeout",
+            "qr_login_timeout",
+            "qr_wait_timeout",
+            "qr_password_timeout",
+            "send_empty_timeout",
+            "send_chunk_timeout",
+        }
         last_exc: Exception | None = None
         for upstream in self._telegram_api_proxy_candidates(preferred=preferred, include_direct=include_direct):
             try:
                 self._log(f"[telegram-api] {operation} via {self._telegram_proxy_label(upstream)}")
                 return run_async(factory(upstream))
             except Exception as exc:
+                text = str(exc)
+                if text.startswith(TELEGRAM_USER_ERROR_PREFIX):
+                    raise RuntimeError(text[len(TELEGRAM_USER_ERROR_PREFIX):]) from exc
+                if text in no_retry_errors:
+                    self._log(f"[telegram-api] {operation} failed via {self._telegram_proxy_label(upstream)} without retry: {exc}")
+                    raise
                 last_exc = exc
                 self._log(f"[telegram-api] {operation} failed via {self._telegram_proxy_label(upstream)}: {exc}")
         if last_exc is not None:
