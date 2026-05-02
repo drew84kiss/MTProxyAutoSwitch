@@ -544,7 +544,7 @@ def set_autostart_enabled(enabled: bool) -> None:
 def _acquire_single_instance():
     if sys.platform != "win32":
         return object()
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
     if not handle:
         return None
@@ -557,7 +557,7 @@ def _acquire_single_instance():
 def _release_single_instance(handle) -> None:
     if sys.platform == "win32" and handle:
         with contextlib.suppress(Exception):
-            ctypes.windll.kernel32.CloseHandle(handle)
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
 
 
 class UiBridge(QObject):
@@ -575,6 +575,23 @@ class ClickableFrame(QFrame):
             self.clicked.emit()
             event.accept()
             return
+        super().mousePressEvent(event)
+
+
+class DismissibleOverlay(QWidget):
+    dismiss_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.card: QWidget | None = None
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            position = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if self.card is None or not self.card.geometry().contains(position):
+                self.dismiss_requested.emit()
+                event.accept()
+                return
         super().mousePressEvent(event)
 
 
@@ -678,6 +695,7 @@ class MainWindow(QMainWindow):
         self._telegram_auth_known = False
         self._telegram_authorized = False
         self._telegram_auth_stage = "start"
+        self._telegram_auth_busy: str | None = None
 
         self.bridge = UiBridge()
         self.bridge.log.connect(self._append_log)
@@ -919,11 +937,12 @@ class MainWindow(QMainWindow):
         checkbox_text: str | None = None,
     ) -> None:
         self._close_alert_overlay()
-        overlay = QWidget(self.centralWidget())
+        overlay = DismissibleOverlay(self.centralWidget())
         overlay.setObjectName("alertOverlay")
         overlay.setAttribute(Qt.WA_StyledBackground, True)
         overlay.setGeometry(self.centralWidget().rect())
         overlay.setStyleSheet("QWidget#alertOverlay { background: rgba(34, 29, 49, 82); }")
+        overlay.dismiss_requested.connect(self._close_alert_overlay)
 
         shell = QVBoxLayout(overlay)
         shell.setContentsMargins(18, 18, 18, 18)
@@ -978,6 +997,7 @@ class MainWindow(QMainWindow):
 
         shell.addWidget(card, 0, Qt.AlignHCenter)
         shell.addStretch(1)
+        overlay.card = card
         overlay.show()
         overlay.raise_()
         self.alert_overlay = overlay
@@ -1807,6 +1827,7 @@ class MainWindow(QMainWindow):
             return
         authorized = bool(self._telegram_authorized)
         known = bool(self._telegram_auth_known)
+        busy = str(getattr(self, "_telegram_auth_busy", "") or "")
         stage = self._telegram_auth_stage if not authorized else "authorized"
         waiting_for_code = stage == "code"
 
@@ -1822,7 +1843,37 @@ class MainWindow(QMainWindow):
             self.telegram_sources_enabled.setChecked(False)
             self.telegram_sources_enabled.blockSignals(False)
         self.telegram_sources_locked.setVisible(not authorized)
+        self.auth_code_button.setEnabled(not busy)
+        self.auth_login_button.setEnabled(waiting_for_code and not busy)
+        self.auth_check_button.setEnabled(not busy)
+        self.auth_qr_button.setEnabled(not busy)
+        self.auth_send_button.setEnabled(authorized and not busy)
+        self.auth_logout_button.setEnabled(authorized and not busy)
+        self.telegram_password_toggle.setEnabled(not busy)
+        self.telegram_api_id.setEnabled(not busy)
+        self.telegram_api_hash.setEnabled(not busy)
+        self.telegram_api_proxy_enabled.setEnabled(not busy)
+        self.telegram_api_proxy.setEnabled(not busy and self.telegram_api_proxy_enabled.isChecked())
+        self.telegram_phone.setEnabled(not busy)
+        self.telegram_code.setEnabled(waiting_for_code and not busy)
+        self.telegram_password.setEnabled(waiting_for_code and not busy)
+        self.auth_code_button.setText("Запрашиваем..." if busy == "request_code" else "Запросить код")
+        self.auth_login_button.setText("Входим..." if busy == "complete_auth" else "Войти")
+        self.auth_check_button.setText("Проверяем..." if busy == "auth_status" else "Проверить сессию")
+        self.auth_qr_button.setText("Открываем QR..." if busy == "qr_auth" else "QR вход")
+        self.auth_send_button.setText("Отправляем..." if busy == "send_saved" else "Отправить список в Saved")
+        self.auth_logout_button.setText("Выходим..." if busy == "logout_auth" else "Выйти")
         self._update_telegram_sources_enabled()
+
+    def _set_telegram_auth_busy(self, action: str | None, status: str | None = None) -> None:
+        self._telegram_auth_busy = action
+        if status is not None:
+            self.auth_status.setText(status)
+        self._update_telegram_auth_ui()
+
+    def _telegram_auth_failed(self, error: str) -> None:
+        self._set_telegram_auth_busy(None, f"Ошибка Telegram: {error}")
+        self.show_error("Telegram", error)
 
     def _telegram_sources_toggled(self, checked: bool) -> None:
         if checked and not self._telegram_authorized:
@@ -2244,11 +2295,14 @@ class MainWindow(QMainWindow):
             self.show_error("Telegram Web", str(exc))
 
     def refresh_auth_status(self) -> None:
+        if getattr(self, "_telegram_auth_busy", None):
+            return
+        self._set_telegram_auth_busy("auth_status", "Проверяем авторизацию Telegram...")
         self.run_task(
             "auth_status",
             self.runtime.run_auth_status,
-            on_success=self._auth_status_loaded,
-            on_error=self._auth_status_failed,
+            on_success=lambda result: (self._set_telegram_auth_busy(None), self._auth_status_loaded(result)),
+            on_error=lambda error: (self._set_telegram_auth_busy(None), self._auth_status_failed(error)),
         )
 
     def _auth_status_loaded(self, result: object) -> None:
@@ -2284,6 +2338,8 @@ class MainWindow(QMainWindow):
         self.runtime.apply_config(cfg)
 
     def request_auth_code(self) -> None:
+        if getattr(self, "_telegram_auth_busy", None):
+            return
         try:
             self._save_auth_config_inline()
             phone = normalize_telegram_phone(self.telegram_phone.text().strip())
@@ -2292,10 +2348,12 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
+        self._set_telegram_auth_busy("request_code", "Запрашиваем код Telegram...")
         self.run_task(
             "request_code",
             lambda: self.runtime.request_auth_code(phone),
-            on_success=self._auth_code_requested,
+            on_success=lambda result: (self._set_telegram_auth_busy(None), self._auth_code_requested(result)),
+            on_error=self._telegram_auth_failed,
         )
 
     def _auth_code_requested(self, _result: object) -> None:
@@ -2307,6 +2365,8 @@ class MainWindow(QMainWindow):
         self.show_info("Telegram", "Код отправлен")
 
     def complete_auth(self) -> None:
+        if getattr(self, "_telegram_auth_busy", None):
+            return
         try:
             self._save_auth_config_inline()
             phone = normalize_telegram_phone(self.telegram_phone.text().strip())
@@ -2316,10 +2376,12 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
+        self._set_telegram_auth_busy("complete_auth", "Входим в Telegram...")
         self.run_task(
             "complete_auth",
             lambda: self.runtime.complete_auth(phone, code, self.telegram_password.text()),
-            on_success=self._auth_completed,
+            on_success=lambda result: (self._set_telegram_auth_busy(None), self._auth_completed(result)),
+            on_error=self._telegram_auth_failed,
         )
 
     def _auth_completed(self, _result: object) -> None:
@@ -2331,7 +2393,15 @@ class MainWindow(QMainWindow):
         self.show_info("Telegram", "Сессия авторизована")
 
     def logout_auth(self) -> None:
-        self.run_task("logout_auth", self.runtime.logout_auth, on_success=self._auth_logged_out)
+        if getattr(self, "_telegram_auth_busy", None):
+            return
+        self._set_telegram_auth_busy("logout_auth", "Выходим из Telegram...")
+        self.run_task(
+            "logout_auth",
+            self.runtime.logout_auth,
+            on_success=lambda result: (self._set_telegram_auth_busy(None), self._auth_logged_out(result)),
+            on_error=self._telegram_auth_failed,
+        )
 
     def _auth_logged_out(self, _result: object) -> None:
         self._telegram_auth_known = True
@@ -2342,17 +2412,31 @@ class MainWindow(QMainWindow):
         self._update_telegram_auth_ui()
 
     def start_qr_auth(self, password: str = "") -> None:
+        if getattr(self, "_telegram_auth_busy", None) and not password:
+            return
         try:
             self._save_auth_config_inline()
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
+        self._set_telegram_auth_busy("qr_auth", "Готовим QR вход Telegram...")
         self.run_task(
             "qr_auth",
             lambda: self.runtime.run_qr_login(password=password),
-            on_success=lambda _result: self.refresh_auth_status(),
-            on_error=lambda error: self.show_warning("Telegram", error),
+            on_success=self._qr_auth_completed,
+            on_error=lambda error: (self._set_telegram_auth_busy(None, f"Ошибка QR входа: {error}"), self.show_warning("Telegram", error)),
         )
+
+    def _qr_auth_completed(self, result: object) -> None:
+        payload = dict(result or {})
+        self._set_telegram_auth_busy(None)
+        if payload.get("password_required"):
+            self.auth_status.setText("Telegram запросил пароль 2FA. Введите его в QR окне и продолжите.")
+            return
+        if payload.get("timeout"):
+            self.auth_status.setText("QR код истек. Запустите QR вход еще раз.")
+            return
+        self.refresh_auth_status()
 
     def show_qr_dialog(self, url: str) -> None:
         if self.qr_dialog is not None:
@@ -2361,10 +2445,17 @@ class MainWindow(QMainWindow):
         self.qr_dialog.show()
 
     def send_proxy_list_to_saved(self) -> None:
+        if getattr(self, "_telegram_auth_busy", None):
+            return
+        self._set_telegram_auth_busy("send_saved", "Отправляем список в Saved Messages...")
         self.run_task(
             "send_saved",
             self.runtime.send_working_proxies_to_saved_messages,
-            on_success=lambda result: self.show_info("Telegram", f"Отправлено: {dict(result or {}).get('sent', 0)}"),
+            on_success=lambda result: (
+                self._set_telegram_auth_busy(None),
+                self.show_info("Telegram", f"Отправлено: {dict(result or {}).get('sent', 0)}"),
+            ),
+            on_error=self._telegram_auth_failed,
         )
 
     def check_updates_silent(self) -> None:
