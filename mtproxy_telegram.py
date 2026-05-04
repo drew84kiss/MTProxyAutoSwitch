@@ -201,6 +201,7 @@ async def request_login_code(
     config: TelegramAuthConfig,
     *,
     phone: str,
+    force_sms: bool = False,
     upstream_proxy: ProxyRecord | None = None,
 ) -> dict[str, Any]:
     _ensure_auth_config(config)
@@ -209,7 +210,11 @@ async def request_login_code(
     try:
         await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
         try:
-            sent = await _await_timeout(client.send_code_request(normalized_phone), DEFAULT_AUTH_TIMEOUT, "send_code")
+            sent = await _await_timeout(
+                client.send_code_request(normalized_phone, force_sms=force_sms),
+                DEFAULT_AUTH_TIMEOUT,
+                "send_code",
+            )
         except errors.PhoneNumberInvalidError as exc:
             raise _telegram_user_error("Telegram не принял номер телефона. Введите российский номер в формате +7XXXXXXXXXX.") from exc
         except errors.PhoneNumberBannedError as exc:
@@ -229,6 +234,10 @@ async def request_login_code(
         return {
             "phone_code_hash": sent.phone_code_hash,
             "type": type(sent.type).__name__ if sent.type is not None else "",
+            "next_type": type(sent.next_type).__name__ if getattr(sent, "next_type", None) is not None else "",
+            "timeout": int(getattr(sent, "timeout", 0) or 0),
+            "length": int(getattr(getattr(sent, "type", None), "length", 0) or 0),
+            "force_sms": bool(force_sms),
             "phone": normalized_phone,
         }
     finally:

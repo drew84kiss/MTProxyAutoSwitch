@@ -254,7 +254,7 @@ class AppRuntime:
             **_read_env_file(self.install_dir),
             **_read_env_file(self.state_root),
         }
-        self.config_path = self.install_dir / CONFIG_FILE_NAME
+        self.config_path = self.state_root / CONFIG_FILE_NAME
         self.config = self._load_config()
         self._migrate_legacy_telegram_session()
         self.pool = ProxyPool()
@@ -350,8 +350,8 @@ class AppRuntime:
             return
         self.state_root.mkdir(parents=True, exist_ok=True)
         for name in (CONFIG_FILE_NAME, LIST_DIR_NAME, LEGACY_OUT_DIR_NAME, "app_state"):
-            source_path = self.state_root / name
-            target_path = self.install_dir / name
+            source_path = self.install_dir / name
+            target_path = self.state_root / name
             if not source_path.exists() or target_path.exists():
                 continue
             with contextlib.suppress(Exception):
@@ -411,12 +411,6 @@ class AppRuntime:
         normalized.telegram_api_proxy_url = str(
             normalized.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL
         ).strip()
-        if normalized.telegram_api_proxy_url and parse_proxy_link(
-            normalized.telegram_api_proxy_url,
-            "telegram_api_proxy",
-            "telegram_api_proxy",
-        ) is None:
-            normalized.telegram_api_proxy_url = DEFAULT_TELEGRAM_API_PROXY_URL
         normalized.telegram_session_file = Path(
             str(normalized.telegram_session_file or "telegram_user.sec")
         ).name or "telegram_user.sec"
@@ -772,7 +766,7 @@ class AppRuntime:
             result["reason"] = "session_not_authorized"
         return result
 
-    def request_auth_code(self, phone: str) -> dict[str, Any]:
+    def request_auth_code(self, phone: str, *, force_sms: bool = False) -> dict[str, Any]:
         normalized_phone = normalize_telegram_phone(phone)
         self._auth_code_hash = ""
         self._auth_code_phone = normalized_phone
@@ -782,6 +776,7 @@ class AppRuntime:
                 lambda upstream: request_login_code(
                     self.auth_config,
                     phone=normalized_phone,
+                    force_sms=force_sms,
                     upstream_proxy=upstream,
                 ),
             )

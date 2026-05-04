@@ -634,11 +634,14 @@ class MainWindow(QMainWindow):
         self.alert_overlay: QWidget | None = None
         self._quitting = False
         self.tray_menu: QMenu | None = None
+        self._settings_refreshing = False
+        self._settings_baseline: AppConfig | None = None
         self._telegram_auth_known = False
         self._telegram_authorized = False
         self._telegram_auth_stage = "start"
         self._telegram_auth_busy: str | None = None
         self._telegram_code_requested_at = 0.0
+        self._telegram_code_delivery_type = ""
 
         QApplication.instance().installEventFilter(self)
         self.bridge = UiBridge()
@@ -1199,11 +1202,99 @@ class MainWindow(QMainWindow):
         open_list = self._button("Открыть папку list")
         open_list.clicked.connect(self.open_output_folder)
         self.save_settings_button = self._button("Сохранить", accent=True)
-        self.save_settings_button.clicked.connect(self.save_settings)
+        self.save_settings_button.clicked.connect(self.settings_primary_action)
         footer.addWidget(open_list)
         footer.addWidget(self.save_settings_button)
         layout.addLayout(footer)
+        self._connect_settings_dirty_watchers()
         return page
+
+    def _connect_settings_dirty_watchers(self) -> None:
+        if getattr(self, "_settings_dirty_watchers_connected", False):
+            return
+        self._settings_dirty_watchers_connected = True
+
+        for widget in (
+            self.autostart_check,
+            self.start_minimized_check,
+            self.auto_start_local_check,
+            self.auto_update_check,
+            self.telegram_api_proxy_enabled,
+            self.telegram_sources_enabled,
+            self.deep_media_enabled,
+        ):
+            widget.toggled.connect(self._settings_form_changed)
+
+        for widget in (*self.source_checks.values(), *self.telegram_source_checks.values()):
+            widget.toggled.connect(self._settings_form_changed)
+
+        for widget in (
+            self.appearance_combo,
+            self.close_combo,
+            self.strategy_combo,
+        ):
+            widget.currentTextChanged.connect(self._settings_form_changed)
+
+        for widget in (
+            self.local_host,
+            self.local_secret,
+            self.telegram_api_id,
+            self.telegram_api_hash,
+            self.telegram_api_proxy,
+            self.telegram_phone,
+        ):
+            widget.textChanged.connect(self._settings_form_changed)
+
+        for widget in (
+            self.local_port,
+            self.telegram_max_messages,
+            self.telegram_max_proxies,
+            self.duration,
+            self.timeout,
+            self.workers,
+            self.max_latency,
+            self.live_probe_top_n,
+        ):
+            widget.valueChanged.connect(self._settings_form_changed)
+
+    def _settings_form_changed(self, *_args: object) -> None:
+        if self._settings_refreshing:
+            return
+        self._update_settings_primary_button()
+
+    def _settings_current_config(self) -> AppConfig | None:
+        try:
+            return self._collect_config()
+        except Exception:
+            return None
+
+    def _settings_have_changes(self) -> bool:
+        current = self._settings_current_config()
+        if current is None:
+            return True
+        if self._settings_baseline is None:
+            return False
+        return current != self._settings_baseline
+
+    def _reset_settings_baseline(self) -> None:
+        self._settings_baseline = self._settings_current_config()
+        self._update_settings_primary_button()
+
+    def _update_settings_primary_button(self) -> None:
+        if not hasattr(self, "save_settings_button"):
+            return
+        dirty = self._settings_have_changes()
+        self.save_settings_button.setText("Сохранить" if dirty else "Закрыть")
+        self.save_settings_button.setObjectName("accent" if dirty else "soft")
+        self.save_settings_button.style().unpolish(self.save_settings_button)
+        self.save_settings_button.style().polish(self.save_settings_button)
+        self.save_settings_button.update()
+
+    def settings_primary_action(self) -> None:
+        if self._settings_have_changes():
+            self.save_settings()
+        else:
+            self.stack.setCurrentWidget(self.main_page)
 
     def _settings_home(self) -> QWidget:
         page, layout = self._page()
@@ -1329,6 +1420,7 @@ class MainWindow(QMainWindow):
         self.telegram_api_hash = QLineEdit()
         self.telegram_api_hash.setPlaceholderText("API Hash")
         self.telegram_api_proxy = QLineEdit()
+        self.telegram_api_proxy.setPlaceholderText("https://t.me/proxy?... или tg://proxy?...")
         self.telegram_phone = QLineEdit()
         self.telegram_phone.setPlaceholderText("+79991234567")
         self.telegram_code = QLineEdit()
@@ -1389,7 +1481,7 @@ class MainWindow(QMainWindow):
         self.telegram_api_proxy_enabled = QCheckBox("Использовать API proxy")
         self.telegram_api_proxy_enabled.toggled.connect(self._update_telegram_api_proxy_ui)
         setup_layout.addWidget(self.telegram_api_proxy_enabled)
-        setup_layout.addWidget(self._label("Нужно только если авторизация Telegram плохо проходит напрямую.", size=11, soft=True))
+        setup_layout.addWidget(self._label("Ссылку можно вставить заранее. Чекбокс включает использование proxy для авторизации Telegram API.", size=11, soft=True))
         self.telegram_api_proxy_panel = QWidget()
         self.telegram_api_proxy_panel.setObjectName("transparentPanel")
         proxy_layout = QVBoxLayout(self.telegram_api_proxy_panel)
@@ -1715,6 +1807,8 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def _refresh_tray_menu(self) -> None:
+        if self.tray_menu is not None and self.tray_menu.isVisible():
+            return
         old_menu = self.tray_menu
         menu = QMenu(self)
         show_action = QAction("Открыть", self)
@@ -1787,6 +1881,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.proxies_page)
 
     def _refresh_settings_from_config(self) -> None:
+        self._settings_refreshing = True
         cfg = self.runtime.config
         self.autostart_check.setChecked(is_autostart_enabled())
         self.start_minimized_check.setChecked(bool(cfg.start_minimized_to_tray))
@@ -1827,10 +1922,12 @@ class MainWindow(QMainWindow):
         self._update_telegram_api_proxy_ui()
         self._update_telegram_auth_ui()
         self.apply_appearance(cfg.appearance)
+        self._settings_refreshing = False
+        self._reset_settings_baseline()
 
     def _update_telegram_api_proxy_ui(self) -> None:
         if hasattr(self, "telegram_api_proxy_panel"):
-            self.telegram_api_proxy_panel.setVisible(bool(self.telegram_api_proxy_enabled.isChecked()))
+            self.telegram_api_proxy_panel.setVisible(True)
 
     def _update_advanced_probe_ui(self) -> None:
         if hasattr(self, "advanced_probe_panel"):
@@ -1870,7 +1967,7 @@ class MainWindow(QMainWindow):
         self.telegram_api_id.setEnabled(not busy)
         self.telegram_api_hash.setEnabled(not busy)
         self.telegram_api_proxy_enabled.setEnabled(not busy)
-        self.telegram_api_proxy.setEnabled(not busy and self.telegram_api_proxy_enabled.isChecked())
+        self.telegram_api_proxy.setEnabled(not busy)
         self.telegram_phone.setEnabled(not busy)
         self.telegram_code.setEnabled(waiting_for_code and not busy)
         self.telegram_password.setEnabled(waiting_for_code and not busy)
@@ -1879,7 +1976,7 @@ class MainWindow(QMainWindow):
         elif resend_remaining > 0:
             self.auth_code_button.setText(f"Повтор через {resend_remaining}с")
         else:
-            self.auth_code_button.setText("Запросить код" if not waiting_for_code else "Запросить новый код")
+            self.auth_code_button.setText("Запросить код" if not waiting_for_code else "Запросить SMS")
         self.auth_login_button.setText("Входим..." if busy == "complete_auth" else "Войти")
         self.auth_check_button.setText("Проверяем..." if busy == "auth_status" else "Проверить сессию")
         self.auth_send_button.setText("Отправляем..." if busy == "send_saved" else "Отправить список в Saved")
@@ -1924,6 +2021,25 @@ class MainWindow(QMainWindow):
             "send_chunk_timeout": "Telegram не ответил при отправке списка в Saved.",
         }
         return messages.get(text, text or "Неизвестная ошибка")
+
+    @staticmethod
+    def _telegram_code_delivery_text(payload: dict[str, object]) -> str:
+        delivery_type = str(payload.get("type") or "")
+        length = int(payload.get("length") or 0)
+        suffix = f" Код из {length} цифр." if length > 0 else ""
+        messages = {
+            "SentCodeTypeApp": "Код отправлен в приложение Telegram на другом устройстве. Проверьте чат Telegram или системное уведомление.",
+            "SentCodeTypeSms": "Код отправлен по SMS.",
+            "SentCodeTypeSmsWord": "Код отправлен по SMS словом.",
+            "SentCodeTypeSmsPhrase": "Код отправлен по SMS фразой.",
+            "SentCodeTypeCall": "Telegram отправит код звонком.",
+            "SentCodeTypeFlashCall": "Telegram отправит код flash-call.",
+            "SentCodeTypeMissedCall": "Telegram отправит код через пропущенный звонок.",
+            "SentCodeTypeEmailCode": "Код отправлен на email, привязанный к аккаунту Telegram.",
+            "SentCodeTypeFirebaseSms": "Код отправлен через SMS/системную службу Android.",
+            "SentCodeTypeFragmentSms": "Код отправлен через Fragment SMS.",
+        }
+        return messages.get(delivery_type, "Код запрошен у Telegram. Проверьте доступные способы доставки.") + suffix
 
     def _telegram_sources_toggled(self, checked: bool) -> None:
         if checked and not self._telegram_authorized:
@@ -1984,6 +2100,9 @@ class MainWindow(QMainWindow):
     def save_settings(self) -> None:
         try:
             cfg = self._collect_config()
+            if self._settings_baseline is not None and cfg == self._settings_baseline:
+                self.stack.setCurrentWidget(self.main_page)
+                return
             set_autostart_enabled(bool(cfg.autostart_enabled))
         except Exception as exc:
             self.show_error("Настройки не сохранены", str(exc))
@@ -1998,6 +2117,20 @@ class MainWindow(QMainWindow):
         self._refresh_settings_from_config()
         self._refresh_snapshot()
         self.show_info("Настройки", "Параметры сохранены")
+
+    def _apply_pending_settings(self) -> bool:
+        if not self._settings_have_changes():
+            return True
+        try:
+            cfg = self._collect_config()
+            set_autostart_enabled(bool(cfg.autostart_enabled))
+            self.runtime.apply_config(cfg)
+            self._reset_settings_baseline()
+            self._refresh_snapshot()
+            return True
+        except Exception as exc:
+            self.show_error("Настройки не сохранены", str(exc))
+            return False
 
     def toggle_telegram_password(self) -> None:
         self._telegram_password_visible = not bool(getattr(self, "_telegram_password_visible", False))
@@ -2057,6 +2190,8 @@ class MainWindow(QMainWindow):
     def start_refresh(self) -> None:
         if self.refresh_in_progress:
             self.cancel_refresh()
+            return
+        if not self._apply_pending_settings():
             return
         self.refresh_in_progress = True
         self.refresh_cancel_event = threading.Event()
@@ -2381,6 +2516,7 @@ class MainWindow(QMainWindow):
         cfg = self._collect_config()
         set_autostart_enabled(bool(cfg.autostart_enabled))
         self.runtime.apply_config(cfg)
+        self._reset_settings_baseline()
 
     def _normalized_telegram_phone_input(self) -> str:
         phone = normalize_telegram_phone(self.telegram_phone.text().strip())
@@ -2399,10 +2535,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
+        force_sms = self._telegram_auth_stage == "code"
         self._set_telegram_auth_busy("request_code", "Запрашиваем код Telegram...")
         self.run_task(
             "request_code",
-            lambda: self.runtime.request_auth_code(phone),
+            lambda: self.runtime.request_auth_code(phone, force_sms=force_sms),
             on_success=lambda result: (self._set_telegram_auth_busy(None), self._auth_code_requested(result)),
             on_error=self._telegram_auth_failed,
         )
@@ -2413,12 +2550,14 @@ class MainWindow(QMainWindow):
         if phone:
             self.telegram_phone.setText(phone)
         self._telegram_code_requested_at = time.monotonic()
+        self._telegram_code_delivery_type = str(payload.get("type") or "")
         self._telegram_auth_known = True
         self._telegram_authorized = False
         self._telegram_auth_stage = "code"
-        self.auth_status.setText("Код отправлен. Введите код подтверждения.")
+        delivery_text = self._telegram_code_delivery_text(payload)
+        self.auth_status.setText(delivery_text)
         self._update_telegram_auth_ui()
-        self.show_info("Telegram", "Код отправлен")
+        self.show_info("Telegram", delivery_text)
 
     def complete_auth(self) -> None:
         if getattr(self, "_telegram_auth_busy", None):
@@ -2455,6 +2594,7 @@ class MainWindow(QMainWindow):
         self._telegram_authorized = True
         self._telegram_auth_stage = "authorized"
         self._telegram_code_requested_at = 0.0
+        self._telegram_code_delivery_type = ""
         self._update_telegram_auth_ui()
         self.refresh_auth_status()
         self.show_info("Telegram", "Сессия авторизована")
@@ -2475,6 +2615,7 @@ class MainWindow(QMainWindow):
         self._telegram_authorized = False
         self._telegram_auth_stage = "start"
         self._telegram_code_requested_at = 0.0
+        self._telegram_code_delivery_type = ""
         self.telegram_sources_enabled.setChecked(False)
         self.auth_status.setText("Telegram API не авторизован")
         self._update_telegram_auth_ui()

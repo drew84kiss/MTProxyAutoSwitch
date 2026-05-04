@@ -90,8 +90,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'MTProxy AutoSwitch',
         'CFBundleDisplayName': 'MTProxy AutoSwitch',
-        'CFBundleShortVersionString': '1.3',
-        'CFBundleVersion': '1.3',
+        'CFBundleShortVersionString': '1.3.5',
+        'CFBundleVersion': '1.3.5',
         'LSMinimumSystemVersion': '10.15',
         'NSHighResolutionCapable': True,
         'NSAppleEventsUsageDescription':
