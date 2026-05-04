@@ -22,7 +22,6 @@ echo "Using macOS target arch: ${MTPROXY_TARGET_ARCH:-default}"
 python3 -m pip install --upgrade \
     pyinstaller \
     PySide6 \
-    qrcode \
     telethon \
     certifi \
     cryptography \

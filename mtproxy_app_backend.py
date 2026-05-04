@@ -44,7 +44,6 @@ from mtproxy_telegram import (
     light_media_probe,
     logout,
     normalize_telegram_phone,
-    qr_login_flow,
     request_login_code,
     send_proxy_list_to_saved_messages,
 )
@@ -797,17 +796,28 @@ class AppRuntime:
         if self._auth_code_phone and normalized_phone != self._auth_code_phone:
             raise RuntimeError("Запросите новый код для текущего номера телефона.")
         with self.telegram_lock:
-            result = self._run_telegram_api_call(
-                "complete-login",
-                lambda upstream: complete_login(
-                    self.auth_config,
-                    phone=normalized_phone,
-                    code=code,
-                    phone_code_hash=self._auth_code_hash,
-                    password=password,
-                    upstream_proxy=upstream,
-                ),
-            )
+            try:
+                result = self._run_telegram_api_call(
+                    "complete-login",
+                    lambda upstream: complete_login(
+                        self.auth_config,
+                        phone=normalized_phone,
+                        code=code,
+                        phone_code_hash=self._auth_code_hash,
+                        password=password,
+                        upstream_proxy=upstream,
+                    ),
+                )
+            except RuntimeError as exc:
+                text = str(exc)
+                if (
+                    "Код подтверждения истек" in text
+                    or "hash запроса кода" in text
+                    or "активный запрос кода" in text
+                ):
+                    self._auth_code_hash = ""
+                    self._auth_code_phone = ""
+                raise
         if result.get("authorized"):
             self._auth_code_hash = ""
             self._auth_code_phone = ""
@@ -818,18 +828,6 @@ class AppRuntime:
             self._run_telegram_api_call(
                 "logout",
                 lambda upstream: logout(self.auth_config, upstream_proxy=upstream),
-            )
-
-    def run_qr_login(self, *, password: str = "") -> dict[str, Any]:
-        with self.telegram_lock:
-            return self._run_telegram_api_call(
-                "qr-login",
-                lambda upstream: qr_login_flow(
-                    self.auth_config,
-                    upstream_proxy=upstream,
-                    password=password,
-                    qr_ready=lambda payload: self._emit("telegram_qr_ready", payload),
-                ),
             )
 
     def send_working_proxies_to_saved_messages(self) -> dict[str, Any]:
@@ -1552,9 +1550,6 @@ class AppRuntime:
             "send_code_timeout",
             "sign_in_timeout",
             "password_sign_in_timeout",
-            "qr_login_timeout",
-            "qr_wait_timeout",
-            "qr_password_timeout",
             "send_empty_timeout",
             "send_chunk_timeout",
         }

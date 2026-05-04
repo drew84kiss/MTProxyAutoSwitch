@@ -26,7 +26,6 @@ The build script installs these dependencies automatically:
 ```text
 pyinstaller
 PySide6
-qrcode
 telethon
 certifi
 cryptography

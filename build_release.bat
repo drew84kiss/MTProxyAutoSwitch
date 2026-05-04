@@ -6,7 +6,6 @@ cd /d "%~dp0"
 python -m pip install --upgrade ^
     pyinstaller ^
     PySide6 ^
-    qrcode ^
     cryptography ^
     pillow ^
     pywin32

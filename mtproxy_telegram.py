@@ -47,7 +47,6 @@ DEFAULT_SOURCE_MAX_MESSAGES = DEFAULT_THREAD_MAX_MESSAGES
 DEFAULT_SOURCE_MAX_AGE_DAYS = 5
 DEFAULT_SOURCE_MAX_PROXIES = 80
 THREAD_PROGRESS_EVERY = 50
-DEFAULT_QR_TOTAL_TIMEOUT = 90.0
 SESSION_KEY_FILE_NAME = "session_key.bin"
 DPI_WINDOW_MIN_BYTES = 14 * 1024
 DPI_WINDOW_MAX_BYTES = 22 * 1024
@@ -217,6 +216,10 @@ async def request_login_code(
             raise _telegram_user_error("Этот номер заблокирован Telegram и не может быть использован для входа.") from exc
         except errors.PhoneNumberFloodError as exc:
             raise _telegram_user_error("Telegram временно ограничил запросы кода для этого номера. Попробуйте позже.") from exc
+        except errors.SendCodeUnavailableError as exc:
+            raise _telegram_user_error("Telegram сейчас не может отправить код на этот номер. Попробуйте позже.") from exc
+        except errors.SmsCodeCreateFailedError as exc:
+            raise _telegram_user_error("Telegram не смог создать SMS-код. Попробуйте позже.") from exc
         except errors.ApiIdInvalidError as exc:
             raise _telegram_user_error("API ID или API Hash неверные. Проверьте данные с my.telegram.org/apps.") from exc
         except errors.FloodWaitError as exc:
@@ -266,8 +269,14 @@ async def complete_login(
             raise _telegram_user_error("Код подтверждения истек или относится к предыдущему запросу. Запросите новый код и введите последний пришедший код.") from exc
         except errors.PhoneCodeEmptyError as exc:
             raise _telegram_user_error("Введите код подтверждения.") from exc
+        except errors.PhoneCodeHashEmptyError as exc:
+            raise _telegram_user_error("Не найден активный запрос кода. Запросите код заново.") from exc
+        except errors.CodeHashInvalidError as exc:
+            raise _telegram_user_error("Telegram не принял hash запроса кода. Запросите код заново и введите последний пришедший код.") from exc
         except errors.PhoneNumberInvalidError as exc:
             raise _telegram_user_error("Telegram не принял номер телефона. Введите российский номер в формате +7XXXXXXXXXX.") from exc
+        except errors.PhonePasswordFloodError as exc:
+            raise _telegram_user_error("Telegram временно ограничил ввод пароля 2FA. Попробуйте позже.") from exc
         except errors.ApiIdInvalidError as exc:
             raise _telegram_user_error("API ID или API Hash неверные. Проверьте данные с my.telegram.org/apps.") from exc
         except errors.FloodWaitError as exc:
@@ -304,84 +313,6 @@ async def logout(
             await _disconnect_quietly(client)
         finally:
             _delete_session(config.session_path)
-
-
-async def qr_login_flow(
-    config: TelegramAuthConfig,
-    *,
-    upstream_proxy: ProxyRecord | None = None,
-    password: str = "",
-    qr_ready: Any | None = None,
-    total_timeout: float = DEFAULT_QR_TOTAL_TIMEOUT,
-) -> dict[str, Any]:
-    _ensure_auth_config(config)
-    client = build_client(
-        config,
-        upstream_proxy=upstream_proxy,
-        timeout=DEFAULT_AUTH_TIMEOUT,
-        receive_updates=True,
-    )
-    deadline = time.perf_counter() + max(15.0, float(total_timeout))
-
-    try:
-        await _await_timeout(client.connect(), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "connect")
-        if await _await_timeout(client.is_user_authorized(), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "auth_status"):
-            me = await _await_timeout(client.get_me(), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "get_me")
-            return {
-                "authorized": True,
-                "display": getattr(me, "first_name", "") or getattr(me, "username", "") or "",
-                "phone": getattr(me, "phone", "") or "",
-                "already_authorized": True,
-            }
-
-        qr_login = await _await_timeout(client.qr_login(), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "qr_login")
-        expires_at = qr_login.expires.isoformat()
-        qr_payload = {
-            "url": qr_login.url,
-            "expires_at": expires_at,
-        }
-        if callable(qr_ready):
-            qr_ready(qr_payload)
-
-        wait_timeout = min(
-            _remaining(deadline, DEFAULT_QR_TOTAL_TIMEOUT),
-            max(5.0, (qr_login.expires - datetime.datetime.now(tz=datetime.timezone.utc)).total_seconds()),
-        )
-        try:
-            await _await_timeout(qr_login.wait(timeout=wait_timeout), wait_timeout + 3.0, "qr_wait")
-        except errors.SessionPasswordNeededError:
-            if not password.strip():
-                return {
-                    "authorized": False,
-                    "password_required": True,
-                    "qr": True,
-                    "expires_at": expires_at,
-                }
-            try:
-                await _await_timeout(client.sign_in(password=password.strip()), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "qr_password")
-            except errors.PasswordHashInvalidError as exc:
-                raise _telegram_user_error("Неверный пароль 2FA.") from exc
-        except RuntimeError as exc:
-            if str(exc) == "qr_wait_timeout":
-                return {
-                    "authorized": False,
-                    "timeout": True,
-                    "qr": True,
-                    "expires_at": expires_at,
-                }
-            raise
-
-        me = await _await_timeout(client.get_me(), _remaining(deadline, DEFAULT_AUTH_TIMEOUT), "get_me")
-        return {
-            "authorized": True,
-            "display": getattr(me, "first_name", "") or getattr(me, "username", "") or "",
-            "phone": getattr(me, "phone", "") or "",
-            "qr": True,
-            "expires_at": expires_at,
-        }
-    finally:
-        _save_session(config.session_path, client)
-        await _disconnect_quietly(client)
 
 
 async def collect_thread_proxies(

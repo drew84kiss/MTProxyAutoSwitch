@@ -17,13 +17,12 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QIcon, QIntValidator, QPalette, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QIcon, QIntValidator, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
-    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -69,6 +68,7 @@ from mtproxy_updater import (
 APP_NAME = "MTProxy AutoSwitch"
 APP_ICON_PATH = Path(__file__).resolve().parent / "img" / "icon.ico"
 SINGLE_INSTANCE_MUTEX_NAME = "Global\\MTProxyAutoSwitch.Singleton"
+TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS = 60
 HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
 HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Telegram Web Begin"
 HOSTS_BLOCK_END = "# MTProxy AutoSwitch Telegram Web End"
@@ -613,64 +613,6 @@ class LinkButton(QPushButton):
         self.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.url)))
 
 
-class QRDialog(QDialog):
-    def __init__(self, parent: QWidget, url: str, on_password: Callable[[str], None]) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("QR вход Telegram")
-        self.setModal(False)
-        self.on_password = on_password
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        title = QLabel("QR вход Telegram")
-        title.setStyleSheet("font-size: 18px; font-weight: 700;")
-        layout.addWidget(title)
-        hint = QLabel("Отсканируйте QR-код в Telegram. Если включена 2FA, введите пароль ниже.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #6E667F;")
-        layout.addWidget(hint)
-
-        image = QLabel()
-        image.setAlignment(Qt.AlignCenter)
-        pixmap = self._make_qr_pixmap(url)
-        if not pixmap.isNull():
-            image.setPixmap(pixmap.scaled(260, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            image.setText(url)
-            image.setWordWrap(True)
-        layout.addWidget(image)
-
-        self.password = QLineEdit()
-        self.password.setPlaceholderText("Пароль 2FA, если нужен")
-        self.password.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.password)
-        row = QHBoxLayout()
-        copy = QPushButton("Скопировать ссылку")
-        copy.setObjectName("soft")
-        copy.clicked.connect(lambda: QApplication.clipboard().setText(url))
-        submit = QPushButton("Продолжить")
-        submit.setObjectName("accent")
-        submit.clicked.connect(lambda: self.on_password(self.password.text()))
-        row.addWidget(copy)
-        row.addWidget(submit)
-        layout.addLayout(row)
-        self.resize(360, 470)
-
-    @staticmethod
-    def _make_qr_pixmap(url: str) -> QPixmap:
-        try:
-            import io
-            import qrcode
-
-            image = qrcode.make(url)
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            pixmap = QPixmap()
-            pixmap.loadFromData(buffer.getvalue(), "PNG")
-            return pixmap
-        except Exception:
-            return QPixmap()
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -689,13 +631,14 @@ class MainWindow(QMainWindow):
         self.last_upload_kbps: float | None = None
         self.last_download_kbps: float | None = None
         self.update_release: Any | None = None
-        self.qr_dialog: QRDialog | None = None
         self.alert_overlay: QWidget | None = None
         self._quitting = False
+        self.tray_menu: QMenu | None = None
         self._telegram_auth_known = False
         self._telegram_authorized = False
         self._telegram_auth_stage = "start"
         self._telegram_auth_busy: str | None = None
+        self._telegram_code_requested_at = 0.0
 
         QApplication.instance().installEventFilter(self)
         self.bridge = UiBridge()
@@ -717,6 +660,10 @@ class MainWindow(QMainWindow):
         self.snapshot_timer.setInterval(1000)
         self.snapshot_timer.timeout.connect(self._refresh_snapshot)
         self.snapshot_timer.start()
+
+        self.telegram_code_timer = QTimer(self)
+        self.telegram_code_timer.setInterval(1000)
+        self.telegram_code_timer.timeout.connect(self._update_telegram_auth_ui)
 
         QTimer.singleShot(350, self.refresh_auth_status)
         QTimer.singleShot(900, self._auto_refresh_initial)
@@ -1448,7 +1395,7 @@ class MainWindow(QMainWindow):
         proxy_layout = QVBoxLayout(self.telegram_api_proxy_panel)
         proxy_layout.setContentsMargins(0, 0, 0, 0)
         proxy_layout.setSpacing(6)
-        proxy_layout.addWidget(self._label("MTProxy для авторизации Telegram API. Обычно не нужен, включайте только если логин/QR не проходят напрямую.", size=11, soft=True))
+        proxy_layout.addWidget(self._label("MTProxy для авторизации Telegram API. Обычно не нужен, включайте только если логин не проходит напрямую.", size=11, soft=True))
         proxy_layout.addWidget(self._form_row_widget("API proxy", self.telegram_api_proxy))
         setup_layout.addWidget(self.telegram_api_proxy_panel)
         form.addWidget(self.telegram_setup_panel)
@@ -1461,11 +1408,8 @@ class MainWindow(QMainWindow):
         alt_buttons = QGridLayout(self.telegram_alt_actions)
         alt_buttons.setContentsMargins(0, 0, 0, 0)
         self.auth_check_button = self._button("Проверить сессию", soft=True)
-        self.auth_qr_button = self._button("QR вход", soft=True)
         self.auth_check_button.clicked.connect(self.refresh_auth_status)
-        self.auth_qr_button.clicked.connect(self.start_qr_auth)
         alt_buttons.addWidget(self.auth_check_button, 0, 0)
-        alt_buttons.addWidget(self.auth_qr_button, 0, 1)
         form.addWidget(self.telegram_alt_actions)
 
         self.telegram_authorized_actions = QWidget()
@@ -1771,7 +1715,8 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def _refresh_tray_menu(self) -> None:
-        menu = QMenu()
+        old_menu = self.tray_menu
+        menu = QMenu(self)
         show_action = QAction("Открыть", self)
         show_action.triggered.connect(self.show_from_tray)
         menu.addAction(show_action)
@@ -1796,7 +1741,10 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Выход", self)
         quit_action.triggered.connect(lambda: self.quit_application(force=True))
         menu.addAction(quit_action)
-        self.tray.setContextMenu(menu)
+        self.tray_menu = menu
+        self.tray.setContextMenu(self.tray_menu)
+        if old_menu is not None:
+            old_menu.deleteLater()
 
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
@@ -1896,6 +1844,10 @@ class MainWindow(QMainWindow):
         busy = str(getattr(self, "_telegram_auth_busy", "") or "")
         stage = self._telegram_auth_stage if not authorized else "authorized"
         waiting_for_code = stage == "code"
+        resend_remaining = 0
+        if waiting_for_code and not authorized:
+            elapsed = time.monotonic() - float(getattr(self, "_telegram_code_requested_at", 0.0) or 0.0)
+            resend_remaining = max(0, int(TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS - elapsed + 0.999))
 
         self.telegram_setup_panel.setVisible(not authorized)
         self.telegram_code_panel.setVisible(waiting_for_code and not authorized)
@@ -1909,10 +1861,9 @@ class MainWindow(QMainWindow):
             self.telegram_sources_enabled.setChecked(False)
             self.telegram_sources_enabled.blockSignals(False)
         self.telegram_sources_locked.setVisible(not authorized)
-        self.auth_code_button.setEnabled(not busy)
+        self.auth_code_button.setEnabled(not busy and resend_remaining <= 0)
         self.auth_login_button.setEnabled(waiting_for_code and not busy)
         self.auth_check_button.setEnabled(not busy)
-        self.auth_qr_button.setEnabled(not busy)
         self.auth_send_button.setEnabled(authorized and not busy)
         self.auth_logout_button.setEnabled(authorized and not busy)
         self.telegram_password_toggle.setEnabled(not busy)
@@ -1923,12 +1874,21 @@ class MainWindow(QMainWindow):
         self.telegram_phone.setEnabled(not busy)
         self.telegram_code.setEnabled(waiting_for_code and not busy)
         self.telegram_password.setEnabled(waiting_for_code and not busy)
-        self.auth_code_button.setText("Запрашиваем..." if busy == "request_code" else "Запросить код")
+        if busy == "request_code":
+            self.auth_code_button.setText("Запрашиваем...")
+        elif resend_remaining > 0:
+            self.auth_code_button.setText(f"Повтор через {resend_remaining}с")
+        else:
+            self.auth_code_button.setText("Запросить код" if not waiting_for_code else "Запросить новый код")
         self.auth_login_button.setText("Входим..." if busy == "complete_auth" else "Войти")
         self.auth_check_button.setText("Проверяем..." if busy == "auth_status" else "Проверить сессию")
-        self.auth_qr_button.setText("Открываем QR..." if busy == "qr_auth" else "QR вход")
         self.auth_send_button.setText("Отправляем..." if busy == "send_saved" else "Отправить список в Saved")
         self.auth_logout_button.setText("Выходим..." if busy == "logout_auth" else "Выйти")
+        if hasattr(self, "telegram_code_timer"):
+            if resend_remaining > 0 and not self.telegram_code_timer.isActive():
+                self.telegram_code_timer.start()
+            elif resend_remaining <= 0 and self.telegram_code_timer.isActive():
+                self.telegram_code_timer.stop()
         self._update_telegram_sources_enabled()
 
     def _set_telegram_auth_busy(self, action: str | None, status: str | None = None) -> None:
@@ -1939,6 +1899,12 @@ class MainWindow(QMainWindow):
 
     def _telegram_auth_failed(self, error: str) -> None:
         message = self._format_telegram_error(error)
+        if (
+            "Код подтверждения истек" in message
+            or "hash запроса кода" in message
+            or "активный запрос кода" in message
+        ):
+            self._telegram_code_requested_at = 0.0
         self._set_telegram_auth_busy(None, f"Ошибка Telegram: {message}")
         self.show_error("Telegram", message)
 
@@ -1953,9 +1919,6 @@ class MainWindow(QMainWindow):
             "sign_in_timeout": "Telegram не ответил при проверке кода. Проверьте подключение или попробуйте еще раз.",
             "password_sign_in_timeout": "Telegram не ответил при проверке пароля 2FA. Проверьте подключение или попробуйте еще раз.",
             "auth_status_timeout": "Telegram не ответил на проверку сессии. Проверьте подключение или API proxy.",
-            "qr_login_timeout": "Telegram не выдал QR-код вовремя. Проверьте подключение или API proxy.",
-            "qr_wait_timeout": "QR-код истек. Запустите QR вход еще раз.",
-            "qr_password_timeout": "Telegram не ответил при проверке пароля 2FA для QR входа.",
             "logout_timeout": "Telegram не ответил на запрос выхода. Проверьте подключение.",
             "send_empty_timeout": "Telegram не ответил при отправке сообщения в Saved.",
             "send_chunk_timeout": "Telegram не ответил при отправке списка в Saved.",
@@ -2227,11 +2190,6 @@ class MainWindow(QMainWindow):
             )
         elif event_name == "local_server_state":
             self._refresh_snapshot()
-        elif event_name == "telegram_qr_ready":
-            url = str(payload.get("url") or "")
-            if url:
-                self.show_qr_dialog(url)
-
     def _append_log(self, message: str) -> None:
         line = str(message)
         self.log_lines.append(line)
@@ -2454,6 +2412,7 @@ class MainWindow(QMainWindow):
         phone = str(payload.get("phone") or "")
         if phone:
             self.telegram_phone.setText(phone)
+        self._telegram_code_requested_at = time.monotonic()
         self._telegram_auth_known = True
         self._telegram_authorized = False
         self._telegram_auth_stage = "code"
@@ -2466,7 +2425,9 @@ class MainWindow(QMainWindow):
             return
         try:
             phone = self._normalized_telegram_phone_input()
-            code = self.telegram_code.text().strip()
+            code = "".join(ch for ch in self.telegram_code.text().strip() if ch.isdigit())
+            if code:
+                self.telegram_code.setText(code)
             if not phone or not code:
                 raise RuntimeError("Нужны телефон и код подтверждения")
             self._save_auth_config_inline()
@@ -2493,6 +2454,7 @@ class MainWindow(QMainWindow):
         self._telegram_auth_known = True
         self._telegram_authorized = True
         self._telegram_auth_stage = "authorized"
+        self._telegram_code_requested_at = 0.0
         self._update_telegram_auth_ui()
         self.refresh_auth_status()
         self.show_info("Telegram", "Сессия авторизована")
@@ -2512,45 +2474,10 @@ class MainWindow(QMainWindow):
         self._telegram_auth_known = True
         self._telegram_authorized = False
         self._telegram_auth_stage = "start"
+        self._telegram_code_requested_at = 0.0
         self.telegram_sources_enabled.setChecked(False)
         self.auth_status.setText("Telegram API не авторизован")
         self._update_telegram_auth_ui()
-
-    def start_qr_auth(self, password: str = "") -> None:
-        if getattr(self, "_telegram_auth_busy", None):
-            return
-        try:
-            self._save_auth_config_inline()
-        except Exception as exc:
-            self.show_error("Telegram", str(exc))
-            return
-        self._set_telegram_auth_busy("qr_auth", "Готовим QR вход Telegram...")
-        self.run_task(
-            "qr_auth",
-            lambda: self.runtime.run_qr_login(password=password),
-            on_success=self._qr_auth_completed,
-            on_error=lambda error: (
-                self._set_telegram_auth_busy(None, f"Ошибка QR входа: {self._format_telegram_error(error)}"),
-                self.show_warning("Telegram", self._format_telegram_error(error)),
-            ),
-        )
-
-    def _qr_auth_completed(self, result: object) -> None:
-        payload = dict(result or {})
-        self._set_telegram_auth_busy(None)
-        if payload.get("password_required"):
-            self.auth_status.setText("Telegram запросил пароль 2FA. Введите его в QR окне и продолжите.")
-            return
-        if payload.get("timeout"):
-            self.auth_status.setText("QR код истек. Запустите QR вход еще раз.")
-            return
-        self.refresh_auth_status()
-
-    def show_qr_dialog(self, url: str) -> None:
-        if self.qr_dialog is not None:
-            self.qr_dialog.close()
-        self.qr_dialog = QRDialog(self, url, lambda password: self.start_qr_auth(password=password))
-        self.qr_dialog.show()
 
     def send_proxy_list_to_saved(self) -> None:
         if getattr(self, "_telegram_auth_busy", None):
