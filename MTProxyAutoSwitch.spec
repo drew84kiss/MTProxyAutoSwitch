@@ -1,15 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+
+datas = [
+    ('img/icon.ico', 'img'),
+    ('mtproxy_seed.json', '.'),
+]
+if os.path.isdir('bin'):
+    datas.append(('bin', 'bin'))
 
 a = Analysis(
     ['mtproxy_gui.py'],
     pathex=[],
     binaries=[],
-    datas=(
-        [
-            ('img/icon.ico', 'img'),
-            ('mtproxy_seed.json', '.'),
-        ]
-    ),
+    datas=datas,
     hiddenimports=(
         [
             'PySide6',
@@ -18,6 +21,11 @@ a = Analysis(
             'PySide6.QtWidgets',
             'telethon',
             'cryptography',
+            'mtproxy_tg_ws',
+            'mtproxy_tg_ws.tg_ws_proxy',
+            'mtproxy_tg_ws.raw_websocket',
+            'mtproxy_tg_ws.fake_tls',
+            'mtproxy_tg_ws.bridge',
             'PIL',
             'PIL.Image',
             'win32crypt',

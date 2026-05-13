@@ -50,8 +50,8 @@
 - `mtproxy_collector.py` — веб-парсинг и первичная проверка прокси
 - `mtproxy_telegram.py` — Telegram API, авторизация, Telegram-источники, media-check
 - `mtproxy_updater.py` — автообновление приложения
-- `config.json` — текущий конфиг
 - `config.template.json` — шаблон конфига для релизной сборки
+- `config.json` — локальный конфиг, создается приложением и не хранится в репозитории
 - `list/` — экспортированные списки и отчеты
 
 ## Как пользоваться
@@ -182,7 +182,6 @@ release-macos/MTProxyAutoSwitch.pkg
 
 - Python 3.11+
 - `pip install -r requirements.txt`
-- `pip install pyinstaller`
 
 Windows:
 

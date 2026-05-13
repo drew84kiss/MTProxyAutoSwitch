@@ -27,6 +27,8 @@ from mtproxy_collector import (
     run_async,
 )
 from mtproxy_local_proxy import LocalMTProxyServer, ProxyPool
+from mtproxy_tg_ws.stats import stats as tg_ws_stats
+from mtproxy_tg_ws_runtime import TgWsProxyRuntimeConfig, TgWsProxyServer
 from mtproxy_telegram import (
     DEFAULT_SOURCE_MAX_AGE_DAYS,
     DEFAULT_SOURCE_MAX_PROXIES,
@@ -47,6 +49,7 @@ from mtproxy_telegram import (
     request_login_code,
     send_proxy_list_to_saved_messages,
 )
+from mtproxy_xray_runtime import DEFAULT_XRAY_SUBSCRIPTIONS, XrayCoreRuntime, XrayRuntimeConfig
 
 
 def runtime_root() -> Path:
@@ -120,19 +123,43 @@ def persistent_state_root(install_dir: Path) -> Path:
     return root
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    text = "".join(ch for ch in str(value or "") if ch.isdigit())
+    try:
+        return int(text or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _clean_api_hash(value: object) -> str:
+    return "".join(str(value or "").split())
+
+
 DEFAULT_MAX_PROXIES = 500
 DEFAULT_DEEP_MEDIA_TOP_N = 0
 DEFAULT_FAST_LIST_LIMIT = 24
+XRAY_AUTO_REFRESH_LATENCY_MS = 200.0
+XRAY_HEALTH_INTERVAL_SEC = 20.0
+XRAY_AUTO_REFRESH_COOLDOWN_SEC = 90.0
 FAST_LIST_FILE_NAME = "fast_list.txt"
 DEFAULT_LOCAL_SECRET = "274763e0d711fd394e833938dd93c8c3"
-DEFAULT_TELEGRAM_API_PROXY_URL = (
+OLD_DEFAULT_TELEGRAM_API_PROXY_URL = (
     "https://t.me/proxy?server=max.ru.rightarion.ru&port=443"
     "&secret=eedcaae509a2455bbfc6165f1708fd5c586d61782e7275"
+)
+DEFAULT_TELEGRAM_API_PROXY_URL = (
+    "https://t.me/proxy?server=myrka.bronstein.ar&port=8443"
+    "&secret=eea37385d8a4bbf632eabc9091fdc95a9c6d79726b612e62726f6e737465696e2e6172"
 )
 BALANCER_STRATEGIES = {
     "round_robin",
     "consistent_hash",
     "sticky_session",
+}
+APP_MODES = {
+    "mtproxy_picker",
+    "xray_core",
+    "tg_ws_proxy",
 }
 REMOVED_WEB_SOURCES = {
     "https://mtpro.xyz/socks5-ru",
@@ -141,6 +168,7 @@ REMOVED_WEB_SOURCES = {
 
 @dataclass
 class AppConfig:
+    active_mode: str = "mtproxy_picker"
     sources: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCES))
     out_dir: str = "list"
     duration: float = 35.0
@@ -184,6 +212,26 @@ class AppConfig:
     telegram_api_proxy_url: str = DEFAULT_TELEGRAM_API_PROXY_URL
     telegram_phone: str = ""
     telegram_session_file: str = "telegram_user.sec"
+    xray_subscription_urls: list[str] = field(default_factory=lambda: list(DEFAULT_XRAY_SUBSCRIPTIONS))
+    xray_socks_host: str = "127.0.0.1"
+    xray_socks_port: int = 10808
+    xray_probe_workers: int = 4
+    xray_probe_timeout_sec: float = 8.0
+    xray_max_servers: int = 250
+    xray_binary_path: str = ""
+    sing_box_binary_path: str = ""
+    xray_manual_upstream_url: str = ""
+    tg_ws_host: str = "127.0.0.1"
+    tg_ws_port: int = 1443
+    tg_ws_secret: str = DEFAULT_LOCAL_SECRET
+    tg_ws_dc_ip: list[str] = field(default_factory=lambda: ["2:149.154.167.220", "4:149.154.167.220"])
+    tg_ws_buf_kb: int = 256
+    tg_ws_pool_size: int = 4
+    tg_ws_cfproxy_enabled: bool = True
+    tg_ws_cfproxy_priority: bool = True
+    tg_ws_cfproxy_user_domain: str = ""
+    tg_ws_fake_tls_domain: str = ""
+    tg_ws_proxy_protocol: bool = False
 
 
 LIST_DIR_NAME = "list"
@@ -269,6 +317,8 @@ class AppRuntime:
             log_sink=self._log,
             event_sink=self._emit,
         )
+        self.tg_ws_server = self._build_tg_ws_server()
+        self.xray_runtime = self._build_xray_runtime()
         self.last_result: CollectorRunResult | None = None
         self.last_outcomes: list[ProbeOutcome] = []
         self.last_working: list[ProbeOutcome] = []
@@ -297,29 +347,65 @@ class AppRuntime:
         self._last_media_activity_at: float = 0.0
         self._last_heavy_upload_at: float = 0.0
         self._last_media_accel_probe_at: float = 0.0
+        self._last_xray_health_at: float = 0.0
+        self._last_xray_auto_refresh_at: float = 0.0
+        self._xray_high_latency_streak: int = 0
+        self._xray_restart_attempted_at: float = 0.0
         self._health_cycle_lock = threading.Lock()
         self.live_probe_thread = threading.Thread(target=self._live_probe_loop, daemon=True, name="mtproxy-live-probe")
         self.live_probe_thread.start()
         self._auth_code_hash: str = ""
         self._auth_code_phone: str = ""
-        if self.config.auto_start_local and self.pool.count() > 0:
-            self.start_local_server(
-                raise_on_verify_failure=False,
-                pre_probe=False,
-                verify=False,
-            )
+        self.start_active_mode(initial=True)
 
     @property
     def auth_config(self) -> TelegramAuthConfig:
         env_api_id = str(self.env_values.get("MTPROXY_TELEGRAM_API_ID") or os.environ.get("MTPROXY_TELEGRAM_API_ID") or "").strip()
-        env_api_hash = str(self.env_values.get("MTPROXY_TELEGRAM_API_HASH") or os.environ.get("MTPROXY_TELEGRAM_API_HASH") or "").strip()
-        config_api_id = int(self.config.telegram_api_id or 0)
-        config_api_hash = self.config.telegram_api_hash.strip()
+        env_api_hash = _clean_api_hash(self.env_values.get("MTPROXY_TELEGRAM_API_HASH") or os.environ.get("MTPROXY_TELEGRAM_API_HASH") or "")
+        config_api_id = _safe_int(self.config.telegram_api_id)
+        config_api_hash = _clean_api_hash(self.config.telegram_api_hash)
         return TelegramAuthConfig(
-            api_id=int(env_api_id or config_api_id or 0),
+            api_id=_safe_int(env_api_id or config_api_id or 0),
             api_hash=(env_api_hash or config_api_hash or ""),
             session_path=self.telegram_session_path,
             phone=self.config.telegram_phone.strip(),
+        )
+
+    def _build_tg_ws_server(self) -> TgWsProxyServer:
+        cfg = TgWsProxyRuntimeConfig(
+            host=self.config.tg_ws_host,
+            port=int(self.config.tg_ws_port),
+            secret=self.config.tg_ws_secret,
+            dc_ip=list(self.config.tg_ws_dc_ip or []),
+            buf_kb=int(self.config.tg_ws_buf_kb or 256),
+            pool_size=int(self.config.tg_ws_pool_size or 4),
+            cfproxy_enabled=bool(self.config.tg_ws_cfproxy_enabled),
+            cfproxy_priority=bool(self.config.tg_ws_cfproxy_priority),
+            cfproxy_user_domain=str(self.config.tg_ws_cfproxy_user_domain or ""),
+            fake_tls_domain=str(self.config.tg_ws_fake_tls_domain or ""),
+            proxy_protocol=bool(self.config.tg_ws_proxy_protocol),
+        )
+        return TgWsProxyServer(cfg, log_sink=self._log, event_sink=self._emit)
+
+    def _build_xray_runtime(self) -> XrayCoreRuntime:
+        cfg = XrayRuntimeConfig(
+            subscription_urls=list(self.config.xray_subscription_urls or []),
+            socks_host=self.config.xray_socks_host,
+            socks_port=int(self.config.xray_socks_port),
+            probe_workers=int(self.config.xray_probe_workers or 4),
+            probe_timeout_sec=float(self.config.xray_probe_timeout_sec or 8.0),
+            max_servers=int(self.config.xray_max_servers or 250),
+            xray_binary_path=str(self.config.xray_binary_path or ""),
+            sing_box_binary_path=str(self.config.sing_box_binary_path or ""),
+            selection_strategy=str(self.config.balancer_strategy or "sticky_session"),
+            manual_upstream_url=str(self.config.xray_manual_upstream_url or ""),
+        )
+        return XrayCoreRuntime(
+            cfg,
+            root_dir=self.install_dir,
+            out_dir=(self.install_dir / self.config.out_dir).resolve(),
+            log_sink=self._log,
+            event_sink=self._emit,
         )
 
     @property
@@ -331,7 +417,7 @@ class AppRuntime:
         self.live_probe_stop.set()
         if self.live_probe_thread.is_alive():
             self.live_probe_thread.join(timeout=3.0)
-        self.stop_local_server()
+        self.stop_all_modes()
 
     def save_config(self) -> None:
         payload = self._config_payload(self.config)
@@ -396,6 +482,8 @@ class AppRuntime:
     @staticmethod
     def _normalize_config(config: AppConfig) -> AppConfig:
         normalized = AppConfig(**asdict(config))
+        if str(normalized.active_mode or "").strip() not in APP_MODES:
+            normalized.active_mode = "mtproxy_picker"
         if int(normalized.max_proxies or 0) <= 0:
             normalized.max_proxies = DEFAULT_MAX_PROXIES
         if int(normalized.fast_list_limit or 0) <= 0:
@@ -403,14 +491,16 @@ class AppRuntime:
         if str(normalized.balancer_strategy or "").strip() not in BALANCER_STRATEGIES:
             normalized.balancer_strategy = "sticky_session"
         normalized.manual_upstream_url = str(normalized.manual_upstream_url or "").strip()
+        normalized.xray_manual_upstream_url = str(normalized.xray_manual_upstream_url or "").strip()
         normalized.local_secret = str(normalized.local_secret or DEFAULT_LOCAL_SECRET).strip().lower()
         try:
             bytes.fromhex(normalized.local_secret[2:] if normalized.local_secret.startswith(("dd", "ee")) else normalized.local_secret)
         except ValueError:
             normalized.local_secret = DEFAULT_LOCAL_SECRET
-        normalized.telegram_api_proxy_url = str(
-            normalized.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL
-        ).strip()
+        normalized.auto_start_local = True
+        normalized.telegram_api_proxy_url = str(normalized.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL).strip()
+        if normalized.telegram_api_proxy_url == OLD_DEFAULT_TELEGRAM_API_PROXY_URL:
+            normalized.telegram_api_proxy_url = DEFAULT_TELEGRAM_API_PROXY_URL
         normalized.telegram_session_file = Path(
             str(normalized.telegram_session_file or "telegram_user.sec")
         ).name or "telegram_user.sec"
@@ -422,6 +512,28 @@ class AppRuntime:
             normalized.telegram_source_max_proxies = DEFAULT_SOURCE_MAX_PROXIES
         if int(normalized.deep_media_top_n or 0) < 0:
             normalized.deep_media_top_n = DEFAULT_DEEP_MEDIA_TOP_N
+        if not normalized.xray_subscription_urls:
+            normalized.xray_subscription_urls = list(DEFAULT_XRAY_SUBSCRIPTIONS)
+        normalized.xray_socks_host = str(normalized.xray_socks_host or "127.0.0.1").strip() or "127.0.0.1"
+        normalized.xray_socks_port = max(1, min(65535, int(normalized.xray_socks_port or 10808)))
+        normalized.xray_probe_workers = max(1, int(normalized.xray_probe_workers or 4))
+        normalized.xray_probe_timeout_sec = max(2.0, float(normalized.xray_probe_timeout_sec or 8.0))
+        normalized.xray_max_servers = max(1, int(normalized.xray_max_servers or 250))
+        normalized.tg_ws_host = str(normalized.tg_ws_host or "127.0.0.1").strip() or "127.0.0.1"
+        normalized.tg_ws_port = max(1, min(65535, int(normalized.tg_ws_port or 1443)))
+        normalized.tg_ws_secret = str(normalized.tg_ws_secret or DEFAULT_LOCAL_SECRET).strip().lower()
+        try:
+            bytes.fromhex(normalized.tg_ws_secret)
+            if len(normalized.tg_ws_secret) != 32:
+                raise ValueError
+        except ValueError:
+            normalized.tg_ws_secret = DEFAULT_LOCAL_SECRET
+        if not normalized.tg_ws_dc_ip:
+            normalized.tg_ws_dc_ip = ["2:149.154.167.220", "4:149.154.167.220"]
+        normalized.tg_ws_buf_kb = max(4, int(normalized.tg_ws_buf_kb or 256))
+        normalized.tg_ws_pool_size = max(0, int(normalized.tg_ws_pool_size or 4))
+        normalized.tg_ws_cfproxy_user_domain = str(normalized.tg_ws_cfproxy_user_domain or "").strip()
+        normalized.tg_ws_fake_tls_domain = str(normalized.tg_ws_fake_tls_domain or "").strip()
         return normalized
 
     @staticmethod
@@ -430,6 +542,35 @@ class AppRuntime:
             config.local_host,
             int(config.local_port),
             config.local_secret,
+        )
+
+    @staticmethod
+    def _tg_ws_signature(config: AppConfig) -> tuple[object, ...]:
+        return (
+            config.tg_ws_host,
+            int(config.tg_ws_port),
+            config.tg_ws_secret,
+            tuple(config.tg_ws_dc_ip or []),
+            int(config.tg_ws_buf_kb),
+            int(config.tg_ws_pool_size),
+            bool(config.tg_ws_cfproxy_enabled),
+            bool(config.tg_ws_cfproxy_priority),
+            config.tg_ws_cfproxy_user_domain,
+            config.tg_ws_fake_tls_domain,
+            bool(config.tg_ws_proxy_protocol),
+        )
+
+    @staticmethod
+    def _xray_signature(config: AppConfig) -> tuple[object, ...]:
+        return (
+            tuple(config.xray_subscription_urls or []),
+            config.xray_socks_host,
+            int(config.xray_socks_port),
+            int(config.xray_probe_workers),
+            float(config.xray_probe_timeout_sec),
+            int(config.xray_max_servers),
+            config.xray_binary_path,
+            config.sing_box_binary_path,
         )
 
     def apply_config(self, config: AppConfig) -> bool:
@@ -441,6 +582,14 @@ class AppRuntime:
             return False
 
         restart_local_server = self._local_server_signature(normalized) != self._local_server_signature(current)
+        restart_tg_ws = self._tg_ws_signature(normalized) != self._tg_ws_signature(current)
+        restart_xray = self._xray_signature(normalized) != self._xray_signature(current)
+        active_mode_changed = normalized.active_mode != current.active_mode
+        xray_selection_changed = (
+            normalized.balancer_strategy != current.balancer_strategy
+            or normalized.xray_manual_upstream_url != current.xray_manual_upstream_url
+        )
+        restart_active_runtime = active_mode_changed
         self.config = normalized
         self.save_config()
         was_running = self.local_server.is_running()
@@ -456,12 +605,124 @@ class AppRuntime:
                 log_sink=self._log,
                 event_sink=self._emit,
             )
-            if was_running and self.config.auto_start_local and self.pool.count() > 0:
-                self.start_local_server(raise_on_verify_failure=False)
+            if was_running and self.config.active_mode == "mtproxy_picker":
+                restart_active_runtime = True
         else:
             self.local_server.set_selection_strategy(self.config.balancer_strategy)
+        if restart_tg_ws:
+            was_tg_ws = self.tg_ws_server.is_running()
+            self.tg_ws_server.stop()
+            self.tg_ws_server = self._build_tg_ws_server()
+            if was_tg_ws and self.config.active_mode == "tg_ws_proxy":
+                restart_active_runtime = True
+        if restart_xray:
+            was_xray = self.xray_runtime.is_running()
+            self.xray_runtime.stop()
+            self.xray_runtime = self._build_xray_runtime()
+            if was_xray and self.config.active_mode == "xray_core":
+                restart_active_runtime = True
+        else:
+            try:
+                self.xray_runtime.update_selection(
+                    self.config.balancer_strategy,
+                    self.config.xray_manual_upstream_url,
+                    restart=False,
+                )
+            except ValueError:
+                self.config.xray_manual_upstream_url = ""
+                self.xray_runtime.update_selection(self.config.balancer_strategy, "", restart=False)
+                self.save_config()
+            if xray_selection_changed and self.config.active_mode == "xray_core" and self.xray_runtime.is_running():
+                restart_active_runtime = True
         self._apply_manual_override_from_config()
+        if restart_active_runtime:
+            self.start_active_mode()
         return True
+
+    def stop_all_modes(self) -> None:
+        with contextlib.suppress(Exception):
+            self.stop_local_server()
+        with contextlib.suppress(Exception):
+            self.tg_ws_server.stop()
+        with contextlib.suppress(Exception):
+            self.xray_runtime.stop()
+
+    def stop_active_mode(self) -> None:
+        if self.config.active_mode == "tg_ws_proxy":
+            self.tg_ws_server.stop()
+        elif self.config.active_mode == "xray_core":
+            self.xray_runtime.stop()
+        else:
+            self.stop_local_server()
+
+    def start_active_mode(self, *, initial: bool = False) -> bool:
+        mode = self.config.active_mode if self.config.active_mode in APP_MODES else "mtproxy_picker"
+        self.stop_all_modes()
+
+        if mode == "tg_ws_proxy":
+            self.tg_ws_server.start()
+            return self.tg_ws_server.is_running()
+        if mode == "xray_core":
+            if initial and self.xray_runtime.active_result is None:
+                self._log("[mode] sing-box waiting for refresh")
+                return False
+            return self.xray_runtime.start()
+
+        if self.pool.count() > 0:
+            return self.start_local_server(
+                raise_on_verify_failure=False,
+                pre_probe=not initial,
+                verify=not initial,
+            )
+        self._log("[mode] mtproxy picker waiting for working pool")
+        return False
+
+    def restart_active_mode(self) -> bool:
+        mode = self.config.active_mode
+        self.stop_all_modes()
+        if mode == "tg_ws_proxy":
+            self.tg_ws_server.start()
+            return self.tg_ws_server.is_running()
+        if mode == "xray_core":
+            return self.xray_runtime.start()
+        return self.start_active_mode()
+
+    def set_active_mode(self, mode: str) -> None:
+        if mode not in APP_MODES:
+            raise ValueError(f"Unknown mode: {mode}")
+        if self.config.active_mode == mode:
+            self.start_active_mode()
+            return
+        self.config.active_mode = mode
+        self.save_config()
+        self.start_active_mode()
+
+    def refresh_active_mode(self, cancel_event: threading.Event | None = None) -> None:
+        if self.config.active_mode == "xray_core":
+            self._refresh_in_progress.set()
+            self.last_refresh_started_at = time.time()
+            try:
+                self.xray_runtime.refresh(cancel_event=cancel_event)
+                self.last_refresh_finished_at = time.time()
+            finally:
+                self._refresh_in_progress.clear()
+            return
+        if self.config.active_mode == "tg_ws_proxy":
+            self.restart_active_mode()
+            return
+        self.run_refresh(cancel_event=cancel_event)
+
+    def quick_sort_active_mode(self, cancel_event: threading.Event | None = None) -> int:
+        if self.config.active_mode == "xray_core":
+            self._refresh_in_progress.set()
+            try:
+                return self.xray_runtime.quick_sort_by_ping(cancel_event=cancel_event)
+            finally:
+                self._refresh_in_progress.clear()
+        if self.config.active_mode == "tg_ws_proxy":
+            self.restart_active_mode()
+            return 1 if self.tg_ws_server.is_running() else 0
+        return self.quick_probe_pool(limit=self.config.live_probe_top_n, reason="manual")
 
     def start_local_server(
         self,
@@ -730,7 +991,7 @@ class AppRuntime:
             self.last_refresh_finished_at = time.time()
 
             self._raise_if_cancelled(cancel_event)
-            if self.config.auto_start_local and combined_working:
+            if self.config.active_mode == "mtproxy_picker" and combined_working:
                 self.start_local_server(raise_on_verify_failure=False)
 
             self._emit(
@@ -760,15 +1021,18 @@ class AppRuntime:
             result = self._run_telegram_api_call(
                 "auth-status",
                 lambda upstream: get_auth_status(cfg, upstream_proxy=upstream),
+                include_pool=False,
             )
         result["credentials_configured"] = True
         if result.get("session_exists") and not result.get("authorized"):
             result["reason"] = "session_not_authorized"
         return result
 
-    def request_auth_code(self, phone: str, *, force_sms: bool = False) -> dict[str, Any]:
+    def request_auth_code(self, phone: str, *, resend: bool = False) -> dict[str, Any]:
         normalized_phone = normalize_telegram_phone(phone)
-        self._auth_code_hash = ""
+        previous_hash = self._auth_code_hash if resend and normalized_phone == self._auth_code_phone else ""
+        if not previous_hash:
+            self._auth_code_hash = ""
         self._auth_code_phone = normalized_phone
         with self.telegram_lock:
             result = self._run_telegram_api_call(
@@ -776,10 +1040,24 @@ class AppRuntime:
                 lambda upstream: request_login_code(
                     self.auth_config,
                     phone=normalized_phone,
-                    force_sms=force_sms,
+                    resend_code_hash=previous_hash,
+                    reset_unauthorized_session=not bool(previous_hash),
                     upstream_proxy=upstream,
                 ),
+                include_pool=False,
             )
+        self._log(
+            "[telegram-api] code request accepted: "
+            f"phone={result.get('phone') or normalized_phone} "
+            f"request_phone={result.get('request_phone') or '-'} "
+            f"type={result.get('type') or '-'} "
+            f"type_details={result.get('type_details') or '-'} "
+            f"next={result.get('next_type') or '-'} "
+            f"next_details={result.get('next_type_details') or '-'} "
+            f"timeout={result.get('timeout') or 0} "
+            f"hash_present={bool(result.get('phone_code_hash_present'))} "
+            f"resend={bool(result.get('resend'))}"
+        )
         self._auth_code_hash = result.get("phone_code_hash", "")
         self._auth_code_phone = str(result.get("phone") or normalized_phone)
         return result
@@ -802,6 +1080,7 @@ class AppRuntime:
                         password=password,
                         upstream_proxy=upstream,
                     ),
+                    include_pool=False,
                 )
             except RuntimeError as exc:
                 text = str(exc)
@@ -823,6 +1102,7 @@ class AppRuntime:
             self._run_telegram_api_call(
                 "logout",
                 lambda upstream: logout(self.auth_config, upstream_proxy=upstream),
+                include_pool=False,
             )
 
     def send_working_proxies_to_saved_messages(self) -> dict[str, Any]:
@@ -838,9 +1118,59 @@ class AppRuntime:
             )
 
     def snapshot(self) -> dict[str, Any]:
+        if self.config.active_mode == "xray_core":
+            snapshot = self.xray_runtime.snapshot()
+            snapshot.update(
+                {
+                    "active_mode": self.config.active_mode,
+                    "thread_status": self.thread_status,
+                    "thread_proxy_count": self.thread_proxy_count,
+                    "background_refreshing": self._refresh_in_progress.is_set(),
+                    "exports": {
+                        "xray_working": str((self.install_dir / self.config.out_dir / "xray_working.json").resolve()),
+                        "xray_rejected": str((self.install_dir / self.config.out_dir / "xray_rejected.json").resolve()),
+                    },
+                }
+            )
+            return snapshot
+        if self.config.active_mode == "tg_ws_proxy":
+            running = self.tg_ws_server.is_running()
+            return {
+                "mode": "tg_ws_proxy",
+                "active_mode": self.config.active_mode,
+                "running": running,
+                "local_running": running,
+                "local_url": self.tg_ws_server.local_proxy_url,
+                "local_tg_url": self.tg_ws_server.local_tg_url,
+                "endpoint": self.tg_ws_server.config.endpoint,
+                "best_proxy": "Telegram WebSocket bridge",
+                "status_text": "Локальный прокси активен" if running else (self.tg_ws_server.last_error or "Локальный прокси остановлен"),
+                "pool_rows": [],
+                "working_count": 1 if running else 0,
+                "rejected_count": 0,
+                "unique_count": 1 if running else 0,
+                "bytes_up": int(getattr(tg_ws_stats, "bytes_up", 0) or 0),
+                "bytes_down": int(getattr(tg_ws_stats, "bytes_down", 0) or 0),
+                "connections_active": int(getattr(tg_ws_stats, "connections_active", 0) or 0),
+                "balancer_strategy": self.config.balancer_strategy,
+                "manual_upstream_url": "",
+                "telegram_api_proxy_url": self.config.telegram_api_proxy_url,
+                "last_refresh_started_at": self.last_refresh_started_at,
+                "last_refresh_finished_at": self.last_refresh_finished_at,
+                "exports": {},
+                "seed_source": self.seed_source,
+                "seed_loaded_at": self.seed_loaded_at,
+                "thread_status": self.thread_status,
+                "thread_proxy_count": self.thread_proxy_count,
+            }
         working_rows = self.pool.snapshot()
         current_best = self.pool.best()
         return {
+            "mode": "mtproxy_picker",
+            "active_mode": self.config.active_mode,
+            "running": self.local_server.is_running(),
+            "endpoint": f"{self.config.local_host}:{self.config.local_port}",
+            "status_text": "Local MTProto proxy active" if self.local_server.is_running() else "Local MTProto proxy stopped",
             "working_count": len(self.last_working),
             "rejected_count": len(self.last_rejected),
             "unique_count": len({item.proxy.key for item in self.last_outcomes}),
@@ -907,6 +1237,7 @@ class AppRuntime:
             auth_status = self._run_telegram_api_call(
                 "media-auth-status",
                 lambda upstream: get_auth_status(self.auth_config, upstream_proxy=upstream),
+                include_pool=False,
             )
         if not auth_status.get("authorized"):
             reason = "rf_whitelist" if strict else "deep_media"
@@ -995,12 +1326,77 @@ class AppRuntime:
 
     def _live_probe_loop(self) -> None:
         while not self.live_probe_stop.wait(timeout=5.0):
-            if self.pool.count() <= 0:
-                continue
             try:
+                if self.config.active_mode == "xray_core":
+                    self._run_xray_health_cycle()
+                    continue
+                if self.pool.count() <= 0:
+                    continue
                 self._run_background_health_cycle()
             except Exception as exc:
                 self._log(f"[live] probe loop error: {exc}")
+
+    def _run_xray_health_cycle(self) -> None:
+        if self.config.active_mode != "xray_core":
+            return
+        if self._refresh_in_progress.is_set():
+            return
+        now = time.time()
+        if (now - self._last_xray_health_at) < XRAY_HEALTH_INTERVAL_SEC:
+            return
+        self._last_xray_health_at = now
+        if not self._health_cycle_lock.acquire(blocking=False):
+            return
+        try:
+            if self._refresh_in_progress.is_set() or self.config.active_mode != "xray_core":
+                return
+            if not self.xray_runtime.is_running():
+                if self.xray_runtime.active_result is not None and (now - self._xray_restart_attempted_at) >= 20.0:
+                    self._xray_restart_attempted_at = now
+                    self._log("[sing-box] core is not running, restarting active node")
+                    self.xray_runtime.start()
+                return
+            latency = self.xray_runtime.probe_active_latency(timeout=min(5.0, float(self.config.xray_probe_timeout_sec or 8.0)))
+            if latency is None:
+                self._xray_high_latency_streak += 1
+                self._log("[sing-box] active node health probe failed")
+            else:
+                self._emit("xray_health", latency_ms=latency, threshold_ms=XRAY_AUTO_REFRESH_LATENCY_MS)
+                if latency > XRAY_AUTO_REFRESH_LATENCY_MS:
+                    self._xray_high_latency_streak += 1
+                    self._log(f"[sing-box] high latency {latency:.0f} ms, streak={self._xray_high_latency_streak}")
+                else:
+                    self._xray_high_latency_streak = 0
+                    return
+            if self._xray_high_latency_streak <= 0:
+                return
+            if (now - self._last_xray_auto_refresh_at) < XRAY_AUTO_REFRESH_COOLDOWN_SEC:
+                return
+            self._last_xray_auto_refresh_at = now
+            self._xray_high_latency_streak = 0
+            self._run_xray_background_refresh(reason="latency")
+        finally:
+            self._health_cycle_lock.release()
+
+    def _run_xray_background_refresh(self, *, reason: str) -> None:
+        if self._refresh_in_progress.is_set():
+            return
+        self._refresh_in_progress.set()
+        self.last_refresh_started_at = time.time()
+        self._emit(
+            "xray_background_refresh_started",
+            reason=reason,
+            threshold_ms=XRAY_AUTO_REFRESH_LATENCY_MS,
+        )
+        try:
+            self._log(f"[sing-box] background refresh started ({reason})")
+            self.xray_runtime.refresh()
+        except Exception as exc:
+            self._log(f"[sing-box] background refresh failed: {exc}")
+            self._emit("xray_background_refresh_failed", error=str(exc))
+        finally:
+            self.last_refresh_finished_at = time.time()
+            self._refresh_in_progress.clear()
 
     def _run_background_health_cycle(self) -> None:
         if not self._health_cycle_lock.acquire(blocking=False):
@@ -1432,6 +1828,22 @@ class AppRuntime:
         self._restart_local_server_if_running(reason="auto balance selected")
         self._emit("manual_upstream_changed", url="")
 
+    def select_xray_upstream(self, node_url: str) -> None:
+        raw_url = str(node_url or "").strip()
+        if not raw_url:
+            raise ValueError("invalid xray node url")
+        self.xray_runtime.update_selection(self.config.balancer_strategy, raw_url, restart=self.config.active_mode == "xray_core")
+        self.config.xray_manual_upstream_url = raw_url
+        self.save_config()
+        self._emit("xray_upstream_changed", url=raw_url)
+
+    def clear_xray_upstream(self) -> None:
+        if self.config.xray_manual_upstream_url:
+            self.config.xray_manual_upstream_url = ""
+            self.save_config()
+        self.xray_runtime.update_selection(self.config.balancer_strategy, "", restart=self.config.active_mode == "xray_core")
+        self._emit("xray_upstream_changed", url="")
+
     def quick_probe_pool(self, *, limit: int = 8, reason: str = "manual") -> int:
         if self.pool.count() <= 0:
             return 0
@@ -1506,6 +1918,7 @@ class AppRuntime:
         *,
         preferred: ProxyRecord | None = None,
         include_direct: bool = True,
+        include_pool: bool = True,
     ) -> list[ProxyRecord | None]:
         candidates: list[ProxyRecord | None] = []
         seen: set[tuple[str, int, str] | None] = set()
@@ -1522,7 +1935,8 @@ class AppRuntime:
         if bool(getattr(self.config, "telegram_api_proxy_enabled", False)):
             add(self._configured_telegram_api_proxy())
         add(preferred)
-        add(self._best_proxy())
+        if include_pool:
+            add(self._best_proxy())
         if include_direct:
             add(None, allow_none=True)
         return candidates
@@ -1540,8 +1954,10 @@ class AppRuntime:
         *,
         preferred: ProxyRecord | None = None,
         include_direct: bool = True,
+        include_pool: bool = True,
     ) -> Any:
         no_retry_errors = {
+            "resend_code_timeout",
             "send_code_timeout",
             "sign_in_timeout",
             "password_sign_in_timeout",
@@ -1549,7 +1965,11 @@ class AppRuntime:
             "send_chunk_timeout",
         }
         last_exc: Exception | None = None
-        for upstream in self._telegram_api_proxy_candidates(preferred=preferred, include_direct=include_direct):
+        for upstream in self._telegram_api_proxy_candidates(
+            preferred=preferred,
+            include_direct=include_direct,
+            include_pool=include_pool,
+        ):
             try:
                 self._log(f"[telegram-api] {operation} via {self._telegram_proxy_label(upstream)}")
                 return run_async(factory(upstream))
@@ -1868,6 +2288,8 @@ class AppRuntime:
             )
             return config
         data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        valid_keys = set(asdict(AppConfig()).keys())
+        data = {key: value for key, value in data.items() if key in valid_keys}
         normalized = False
         if data.get("out_dir") in ("", LEGACY_OUT_DIR_NAME, None):
             data["out_dir"] = LIST_DIR_NAME
@@ -1940,14 +2362,27 @@ class AppRuntime:
         if "telegram_api_proxy_enabled" not in data:
             data["telegram_api_proxy_enabled"] = False
             normalized = True
+        cleaned_api_id = _safe_int(data.get("telegram_api_id"))
+        if data.get("telegram_api_id") != cleaned_api_id:
+            data["telegram_api_id"] = cleaned_api_id
+            normalized = True
+        cleaned_api_hash = _clean_api_hash(data.get("telegram_api_hash"))
+        if data.get("telegram_api_hash") != cleaned_api_hash:
+            data["telegram_api_hash"] = cleaned_api_hash
+            normalized = True
         persistent_auth = self._load_persistent_telegram_auth() or self._load_legacy_telegram_auth(legacy_paths)
         if persistent_auth:
             for key, value in persistent_auth.items():
                 if key == "telegram_api_id":
-                    if int(data.get(key) or 0) <= 0 and int(value or 0) > 0:
-                        data[key] = int(value)
+                    if _safe_int(data.get(key)) <= 0 and _safe_int(value) > 0:
+                        data[key] = _safe_int(value)
                         normalized = True
-                elif key in {"telegram_api_hash", "telegram_phone", "telegram_api_proxy_url", "telegram_session_file"}:
+                elif key == "telegram_api_hash":
+                    cleaned_value = _clean_api_hash(value)
+                    if not _clean_api_hash(data.get(key)) and cleaned_value:
+                        data[key] = cleaned_value
+                        normalized = True
+                elif key in {"telegram_phone", "telegram_api_proxy_url", "telegram_session_file"}:
                     if not str(data.get(key) or "").strip() and str(value or "").strip():
                         data[key] = str(value).strip()
                         normalized = True
@@ -1994,7 +2429,7 @@ class AppRuntime:
                 self.config_path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         defaults = asdict(AppConfig())
         defaults.update(data)
-        config = AppConfig(**defaults)
+        config = self._normalize_config(AppConfig(**defaults))
         self._save_persistent_telegram_auth(self._config_payload(config))
         return config
 
@@ -2031,8 +2466,8 @@ class AppRuntime:
                 continue
             if not isinstance(payload, dict):
                 continue
-            api_id = int(payload.get("telegram_api_id") or 0)
-            api_hash = str(payload.get("telegram_api_hash") or "").strip()
+            api_id = _safe_int(payload.get("telegram_api_id"))
+            api_hash = _clean_api_hash(payload.get("telegram_api_hash"))
             if api_id <= 0 or not api_hash:
                 continue
             return {
@@ -2047,8 +2482,8 @@ class AppRuntime:
 
     def _save_persistent_telegram_auth(self, payload: dict[str, Any]) -> None:
         auth_payload = {
-            "telegram_api_id": int(payload.get("telegram_api_id") or 0),
-            "telegram_api_hash": str(payload.get("telegram_api_hash") or "").strip(),
+            "telegram_api_id": _safe_int(payload.get("telegram_api_id")),
+            "telegram_api_hash": _clean_api_hash(payload.get("telegram_api_hash")),
             "telegram_phone": str(payload.get("telegram_phone") or "").strip(),
             "telegram_api_proxy_enabled": bool(payload.get("telegram_api_proxy_enabled", False)),
             "telegram_api_proxy_url": str(payload.get("telegram_api_proxy_url") or DEFAULT_TELEGRAM_API_PROXY_URL).strip(),

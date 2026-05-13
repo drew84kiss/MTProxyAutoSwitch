@@ -72,6 +72,17 @@ TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS = 60
 HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
 HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Telegram Web Begin"
 HOSTS_BLOCK_END = "# MTProxy AutoSwitch Telegram Web End"
+GITHUB_HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Github Begin"
+GITHUB_HOSTS_BLOCK_END = "# MTProxy AutoSwitch Github End"
+GITHUB_HOSTS_LINES = [
+    "# Github",
+    "144.31.14.104 api.github.com",
+    "185.199.109.133 raw.githubusercontent.com",
+    "185.199.109.133 release-assets.githubusercontent.com",
+    "185.199.108.133 private-user-images.githubusercontent.com",
+    "185.199.108.133 gist.githubusercontent.com",
+    "185.199.108.133 avatars.githubusercontent.com",
+]
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE = "MTProxyAutoSwitch"
 
@@ -93,6 +104,22 @@ CLOSE_LABELS = {
     "exit": "Закрывать приложение",
 }
 CLOSE_BY_LABEL = {value: key for key, value in CLOSE_LABELS.items()}
+MODE_LABELS = {
+    "mtproxy_picker": "Подбор прокси",
+    "xray_core": "sing-box",
+    "tg_ws_proxy": "Локальный прокси",
+}
+MODE_BY_LABEL = {value: key for key, value in MODE_LABELS.items()}
+RUNTIME_BUSY_TASKS = {
+    "change_mode",
+    "tray_mode",
+    "restart_mode",
+    "start_local",
+    "stop_local",
+    "save_settings",
+    "quick_sort_mode",
+    "quick_probe",
+}
 
 BALANCER_HELP = (
     "Round robin: новые сессии идут по очереди между лучшими proxy.\n\n"
@@ -212,7 +239,7 @@ QPushButton#primary {
     background: #D95B75;
     color: #FFFFFF;
     border: none;
-    font-size: 22px;
+    font-size: 28px;
     font-weight: 700;
 }
 QPushButton#primary[started="false"] {
@@ -284,8 +311,17 @@ QListWidget#cardList {
 QListWidget#cardList::item {
     border: none;
     background: transparent;
+    color: #221D31;
     padding: 0;
     margin: 0;
+}
+QListWidget#cardList::item:selected {
+    background: #E6DFF6;
+    color: #221D31;
+}
+QListWidget#cardList::item:hover {
+    background: #F0ECFF;
+    color: #221D31;
 }
 """
 
@@ -408,6 +444,8 @@ def _format_latency(value: object) -> str:
     number = _safe_float(value)
     if number is None or number <= 0:
         return "n/a"
+    if number < 1:
+        return "<1 ms"
     return f"{int(round(number))} ms"
 
 
@@ -420,6 +458,19 @@ def _format_rate(value: object) -> str:
     return f"{int(round(number))} KB/s"
 
 
+def _format_rate_pair(upload: object, download: object) -> str:
+    up = _format_rate(upload)
+    down = _format_rate(download)
+    if up == "n/a" and down == "n/a":
+        return "n/a"
+    return f"↑ {up}\n↓ {down}"
+
+
+def _format_download_rate(value: object) -> str:
+    rate = _format_rate(value)
+    return "n/a" if rate == "n/a" else f"↓ {rate}"
+
+
 def _trim_middle(text: str, limit: int = 56) -> str:
     text = str(text or "")
     if len(text) <= limit:
@@ -429,20 +480,71 @@ def _trim_middle(text: str, limit: int = 56) -> str:
     return f"{text[:left]}…{text[-right:]}"
 
 
+def _format_reason_counts(counts: object, *, limit: int = 3) -> str:
+    if not isinstance(counts, dict) or not counts:
+        return ""
+    items = sorted(((str(key), int(value or 0)) for key, value in counts.items()), key=lambda item: item[1], reverse=True)
+    return ", ".join(f"{reason}: {count}" for reason, count in items[:limit])
+
+
+def _runtime_task_status(name: str) -> str:
+    return {
+        "change_mode": "Переключение режима...",
+        "tray_mode": "Переключение режима...",
+        "restart_mode": "Перезапуск режима...",
+        "start_local": "Запуск выбранного режима...",
+        "stop_local": "Остановка выбранного режима...",
+        "save_settings": "Сохранение настроек...",
+        "quick_sort_mode": "Быстрая сортировка по пингу...",
+        "quick_probe": "Быстрая проверка прокси...",
+    }.get(name, "Выполняется операция...")
+
+
 def _telegram_web_hosts_block() -> str:
     return "\n".join([HOSTS_BLOCK_BEGIN, *TELEGRAM_WEB_HOSTS_LINES, HOSTS_BLOCK_END])
 
 
-def _strip_hosts_block(text: str) -> str:
-    start = text.find(HOSTS_BLOCK_BEGIN)
+def _github_hosts_block() -> str:
+    return "\n".join([GITHUB_HOSTS_BLOCK_BEGIN, *GITHUB_HOSTS_LINES, GITHUB_HOSTS_BLOCK_END])
+
+
+def _strip_managed_hosts_block(text: str, begin_marker: str, end_marker: str) -> str:
+    start = text.find(begin_marker)
     if start < 0:
         return text
-    end = text.find(HOSTS_BLOCK_END, start)
+    end = text.find(end_marker, start)
     if end < 0:
         return text[:start].rstrip() + "\n"
-    end += len(HOSTS_BLOCK_END)
+    end += len(end_marker)
     stripped = (text[:start] + text[end:]).strip()
     return stripped + ("\n" if stripped else "")
+
+
+def _strip_hosts_block(text: str) -> str:
+    return _strip_managed_hosts_block(text, HOSTS_BLOCK_BEGIN, HOSTS_BLOCK_END)
+
+
+def _strip_github_hosts_block(text: str) -> str:
+    return _strip_managed_hosts_block(text, GITHUB_HOSTS_BLOCK_BEGIN, GITHUB_HOSTS_BLOCK_END)
+
+
+def _hosts_line_key(line: str) -> str:
+    return " ".join(str(line or "").split()).lower()
+
+
+def _hosts_lines_installed(text: str, lines: list[str]) -> bool:
+    present = {_hosts_line_key(line) for line in str(text or "").splitlines() if _hosts_line_key(line)}
+    required = [
+        _hosts_line_key(line)
+        for line in lines
+        if str(line or "").strip() and not str(line or "").lstrip().startswith("#")
+    ]
+    return bool(required) and all(line in present for line in required)
+
+
+def _managed_hosts_installed(text: str, begin_marker: str, end_marker: str, lines: list[str]) -> bool:
+    text = str(text or "")
+    return (begin_marker in text and end_marker in text) or _hosts_lines_installed(text, lines)
 
 
 def _autostart_command() -> str:
@@ -618,13 +720,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(_asset_icon())
-        self.resize(438, 720)
-        self.setMinimumSize(438, 720)
+        self.resize(406, 680)
+        self.setMinimumSize(360, 560)
         self.setMaximumSize(560, 860)
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
 
         self.log_lines: list[str] = []
         self.task_callbacks: dict[str, tuple[Callable[[Any], None] | None, Callable[[str], None] | None]] = {}
+        self.busy_task_names: set[str] = set()
         self.refresh_in_progress = False
         self.refresh_cancel_event = threading.Event()
         self.last_snapshot: dict[str, Any] = {}
@@ -634,14 +737,21 @@ class MainWindow(QMainWindow):
         self.alert_overlay: QWidget | None = None
         self._quitting = False
         self.tray_menu: QMenu | None = None
+        self._tray_menu_state: tuple[object, ...] | None = None
         self._settings_refreshing = False
         self._settings_baseline: AppConfig | None = None
+        self._last_proxy_page_refresh_at = 0.0
+        self._last_progress_ui_at = 0.0
+        self._last_log_flush_at = 0.0
+        self._log_flush_pending = False
+        self._last_tgws_speed_sample: tuple[float, int, int] | None = None
         self._telegram_auth_known = False
         self._telegram_authorized = False
         self._telegram_auth_stage = "start"
         self._telegram_auth_busy: str | None = None
         self._telegram_code_requested_at = 0.0
         self._telegram_code_delivery_type = ""
+        self._telegram_code_resend_timeout = TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS
 
         QApplication.instance().installEventFilter(self)
         self.bridge = UiBridge()
@@ -735,7 +845,7 @@ class MainWindow(QMainWindow):
 
     def _paste_into_line_edit(self, field: QLineEdit) -> None:
         if field is getattr(self, "telegram_api_id", None):
-            text = "".join(ch for ch in QApplication.clipboard().text() if ch.isdigit())
+            text = self._digits_only(QApplication.clipboard().text())
             if text:
                 field.insert(text)
             return
@@ -746,6 +856,10 @@ class MainWindow(QMainWindow):
             return
         field.paste()
 
+    @staticmethod
+    def _digits_only(value: object) -> str:
+        return "".join(ch for ch in str(value or "") if ch.isdigit())
+
     def _build_ui(self) -> None:
         central = QWidget()
         root = QHBoxLayout(central)
@@ -753,7 +867,7 @@ class MainWindow(QMainWindow):
         root.addStretch(1)
         self.stack = QStackedWidget()
         self.stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self.stack.setFixedWidth(406)
+        self.stack.setFixedWidth(374)
         root.addWidget(self.stack)
         root.addStretch(1)
         self.setCentralWidget(central)
@@ -768,7 +882,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
-        width = min(520, max(406, self.width() - 32))
+        width = min(520, max(340, self.width() - 20))
         self.stack.setFixedWidth(width)
         self._refresh_wraps(width)
         self._refresh_main_density()
@@ -777,46 +891,43 @@ class MainWindow(QMainWindow):
 
     def _refresh_wraps(self, width: int | None = None) -> None:
         width = width or self.stack.width()
-        wrap = max(250, width - 70)
+        wrap = max(220, width - 56)
         for label in getattr(self, "_wrapping_labels", []):
             label.setMaximumWidth(wrap)
 
     def _refresh_main_density(self) -> None:
         if not hasattr(self, "primary_button"):
             return
-        height = max(540, int(self.height() or 720))
+        height = max(520, int(self.height() or 680))
         if height < 620:
-            primary_size = 138
-            spacing = 4
-            hero_margins = (10, 8, 10, 8)
-            active_height = 92
-            stat_height = 78
+            spacing = 3
+            hero_margins = (12, 10, 12, 8)
+            active_height = 76
+            stat_height = 68
             show_thread = False
             show_active_hint = False
             show_footer = False
             show_hero_hint = False
         elif height < 760:
-            primary_size = 198
-            spacing = 6
-            hero_margins = (14, 10, 14, 8)
-            active_height = 116
-            stat_height = 78
+            spacing = 5
+            hero_margins = (14, 12, 14, 10)
+            active_height = 98
+            stat_height = 72
             show_thread = False
             show_active_hint = True
             show_footer = False
-            show_hero_hint = True
+            show_hero_hint = False
         else:
-            primary_size = 234
-            spacing = 8
-            hero_margins = (16, 12, 16, 10)
-            active_height = 128
-            stat_height = 90
+            spacing = 6
+            hero_margins = (16, 14, 16, 12)
+            active_height = 112
+            stat_height = 82
             show_thread = True
             show_active_hint = True
             show_footer = False
-            show_hero_hint = True
+            show_hero_hint = False
         self.main_layout.setSpacing(spacing)
-        margin = 10 if height < 620 else 12 if height < 760 else 16
+        margin = 8 if height < 620 else 10 if height < 760 else 12
         self.main_layout.setContentsMargins(margin, margin, margin, margin)
         if hasattr(self, "thread_text"):
             self.thread_text.setVisible(show_thread)
@@ -826,13 +937,17 @@ class MainWindow(QMainWindow):
             self.primary_hint.setVisible(show_hero_hint)
         if hasattr(self, "footer_info"):
             self.footer_info.setVisible(show_footer)
-        self._primary_button_size = primary_size
+        if hasattr(self, "choose_proxy_button"):
+            self.choose_proxy_button.setVisible(height >= 760)
+        primary_size = 108 if height < 620 else 126 if height < 760 else 148
+        self._primary_size = primary_size
         self.primary_button.setFixedSize(primary_size, primary_size)
+        self.primary_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         if hasattr(self, "hero_layout"):
             self.hero_layout.setContentsMargins(*hero_margins)
             self.hero_layout.setSpacing(max(6, spacing))
         if hasattr(self, "hero_card"):
-            hero_height = primary_size + (108 if show_hero_hint else 70)
+            hero_height = 218 if height < 620 else 250 if height < 760 else 280
             self.hero_card.setFixedHeight(hero_height)
             self.hero_card.updateGeometry()
         for card in getattr(self, "_stat_cards", []):
@@ -848,20 +963,18 @@ class MainWindow(QMainWindow):
     def _apply_primary_style(self) -> None:
         if not hasattr(self, "primary_button"):
             return
-        size = int(getattr(self, "_primary_button_size", 144))
-        radius = size // 2
         running = bool(getattr(self, "_local_running", False))
         theme = THEMES[getattr(self, "_theme_name", "light")]
         color = theme["primary_on"] if running else theme["primary_off"]
         hover = theme["primary_on_hover"] if running else theme["primary_off_hover"]
-        font_size = 20 if size < 150 else 24 if size < 210 else 28
         self.primary_button.setStyleSheet(
             f"QPushButton#primary {{"
-            f"min-width:{size}px;max-width:{size}px;min-height:{size}px;max-height:{size}px;"
-            f"border-radius:{radius}px;background:{color};color:#FFFFFF;border:none;"
-            f"font-size:{font_size}px;font-weight:700;padding:0px;"
+            f"border-radius:{self.primary_button.height() // 2}px;background:{color};color:#FFFFFF;border:none;"
+            f"font-size:{20 if self.primary_button.height() < 120 else 22 if self.primary_button.height() < 140 else 24}px;font-weight:700;padding:0px;"
             f"}} QPushButton#primary:hover {{ background:{hover}; }}"
         )
+        primary_size = int(getattr(self, "_primary_size", 84) or 84)
+        self.primary_button.setFixedSize(primary_size, primary_size)
 
     def _page(self) -> tuple[QWidget, QVBoxLayout]:
         scroll = QScrollArea()
@@ -869,6 +982,8 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         body = QWidget()
+        body.setMinimumWidth(0)
+        body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
@@ -1075,6 +1190,7 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
+        self.progress.setVisible(False)
         layout.addWidget(self.progress)
         self.progress_text = self._label("Готов к обновлению", soft=True)
         layout.addWidget(self.progress_text)
@@ -1092,8 +1208,19 @@ class MainWindow(QMainWindow):
         self.primary_button.setObjectName("primary")
         self.primary_button.setProperty("started", "false")
         self.primary_button.clicked.connect(self.primary_action)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
+        mode_row.addWidget(self._label("Режим работы", size=15, bold=True))
+        self.mode_combo = self._combo([MODE_LABELS[key] for key in ("mtproxy_picker", "xray_core", "tg_ws_proxy")])
+        self.mode_combo.currentTextChanged.connect(self.change_active_mode)
+        mode_row.addWidget(self.mode_combo, 1)
+        hero_layout.addLayout(mode_row)
         hero_layout.addWidget(self.primary_button, 0, Qt.AlignHCenter)
-        self.primary_hint = self._label("Стартовый список загрузится сразу, полный refresh пройдет в фоне.", soft=True)
+        self.restart_mode_button = self._button("Перезапустить режим", soft=True)
+        self.restart_mode_button.clicked.connect(self.restart_active_mode)
+        hero_layout.addWidget(self.restart_mode_button)
+        self.restart_mode_button.setVisible(False)
+        self.primary_hint = self._label("Запускает или останавливает только выбранный режим.", soft=True)
         self.primary_hint.setAlignment(Qt.AlignCenter)
         hero_layout.addWidget(self.primary_hint)
         hero_actions = QHBoxLayout()
@@ -1163,7 +1290,10 @@ class MainWindow(QMainWindow):
         card.setMaximumHeight(96)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(12, 10, 12, 10)
-        card_layout.addWidget(self._label(title, size=10, soft=True))
+        title_label = self._label(title, size=10, soft=True)
+        card_layout.addWidget(title_label)
+        if title == "Скорость":
+            self.speed_title = title_label
         value = self._label("n/a", size=value_size, bold=True)
         card_layout.addWidget(value)
         grid.addWidget(card, 0, column)
@@ -1188,6 +1318,8 @@ class MainWindow(QMainWindow):
             "home": self.settings_home,
             "general": self._settings_general(),
             "routing": self._settings_routing(),
+            "xray": self._settings_xray(),
+            "tgws": self._settings_tg_ws(),
             "telegram": self._settings_telegram(),
             "sources": self._settings_sources(),
             "pool": self._settings_pool(),
@@ -1219,6 +1351,9 @@ class MainWindow(QMainWindow):
             self.start_minimized_check,
             self.auto_start_local_check,
             self.auto_update_check,
+            self.tg_ws_cfproxy_enabled,
+            self.tg_ws_cfproxy_priority,
+            self.tg_ws_proxy_protocol,
             self.telegram_api_proxy_enabled,
             self.telegram_sources_enabled,
             self.deep_media_enabled,
@@ -1242,6 +1377,16 @@ class MainWindow(QMainWindow):
             self.telegram_api_hash,
             self.telegram_api_proxy,
             self.telegram_phone,
+            self.xray_socks_host,
+            self.tg_ws_host,
+            self.tg_ws_secret,
+            self.tg_ws_cfproxy_user_domain,
+            self.tg_ws_fake_tls_domain,
+        ):
+            widget.textChanged.connect(self._settings_form_changed)
+
+        for widget in (
+            self.tg_ws_dc_ip,
         ):
             widget.textChanged.connect(self._settings_form_changed)
 
@@ -1254,6 +1399,13 @@ class MainWindow(QMainWindow):
             self.workers,
             self.max_latency,
             self.live_probe_top_n,
+            self.xray_socks_port,
+            self.xray_probe_workers,
+            self.xray_probe_timeout,
+            self.xray_max_servers,
+            self.tg_ws_port,
+            self.tg_ws_buf_kb,
+            self.tg_ws_pool_size,
         ):
             widget.valueChanged.connect(self._settings_form_changed)
 
@@ -1299,13 +1451,50 @@ class MainWindow(QMainWindow):
     def _settings_home(self) -> QWidget:
         page, layout = self._page()
         layout.setSpacing(8)
+        layout.addWidget(self._label("Основные", size=11, soft=True))
         for key, title, subtitle in [
             ("general", "Общие", "Приложение и обновления"),
             ("routing", "Маршрутизация", "Local frontend и balancer"),
-            ("telegram", "Telegram", "Авторизация и Telegram-источники"),
             ("sources", "Источники", "Web-списки и проверка"),
+            ("telegram", "Telegram", "Авторизация и Telegram-источники"),
             ("pool", "Пул", "Рабочие upstream"),
             ("logs", "Логи", "Последние события"),
+        ]:
+            row = ClickableFrame()
+            row.setObjectName("rowCard")
+            row.setCursor(QCursor(Qt.PointingHandCursor))
+            row.setFixedHeight(68)
+            row.clicked.connect(lambda checked=False, page_key=key: self.show_settings_page(page_key))
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(16, 8, 16, 8)
+            top = QHBoxLayout()
+            top.addWidget(self._label(title, size=16, bold=True))
+            top.addStretch(1)
+            top.addWidget(self._label("›", size=22, soft=True))
+            row_layout.addLayout(top)
+            row_layout.addWidget(self._label(subtitle, size=11, soft=True))
+            layout.addWidget(row)
+        layout.addWidget(self._label("Режимы", size=11, soft=True))
+        for key, title, subtitle in [
+            ("xray", "sing-box", "VPN-подписки и локальный SOCKS"),
+            ("tgws", "Локальный прокси", "WebSocket bridge, Cloudflare и Fake TLS"),
+        ]:
+            row = ClickableFrame()
+            row.setObjectName("rowCard")
+            row.setCursor(QCursor(Qt.PointingHandCursor))
+            row.setFixedHeight(68)
+            row.clicked.connect(lambda checked=False, page_key=key: self.show_settings_page(page_key))
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(16, 8, 16, 8)
+            top = QHBoxLayout()
+            top.addWidget(self._label(title, size=16, bold=True))
+            top.addStretch(1)
+            top.addWidget(self._label("›", size=22, soft=True))
+            row_layout.addLayout(top)
+            row_layout.addWidget(self._label(subtitle, size=11, soft=True))
+            layout.addWidget(row)
+        layout.addWidget(self._label("Дополнительно", size=11, soft=True))
+        for key, title, subtitle in [
             ("about", "О приложении", "Ссылки и информация"),
         ]:
             row = ClickableFrame()
@@ -1330,32 +1519,73 @@ class MainWindow(QMainWindow):
         card = self._card()
         form = QVBoxLayout(card)
         form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
         form.addWidget(self._label("Поведение приложения", size=16, bold=True))
         self.autostart_check = QCheckBox("Запускать вместе с Windows")
         self.start_minimized_check = QCheckBox("Стартовать свернутым в трей")
         self.auto_start_local_check = QCheckBox("Автостарт локального proxy frontend")
-        self.auto_update_check = QCheckBox("Проверять обновления при запуске")
-        for widget in (self.autostart_check, self.start_minimized_check, self.auto_start_local_check, self.auto_update_check):
+        self.auto_start_local_check.setVisible(False)
+        self.auto_update_check = QCheckBox("Обновления при запуске")
+        self.autostart_check.setToolTip("Добавляет приложение в автозагрузку Windows.")
+        self.start_minimized_check.setToolTip("После запуска прячет окно в трей. По умолчанию выключено.")
+        self.auto_update_check.setToolTip("При запуске проверяет новую версию на GitHub.")
+        for widget in (self.autostart_check, self.start_minimized_check, self.auto_update_check):
             form.addWidget(widget)
         self.appearance_combo = self._combo(list(APPEARANCE_LABELS.values()))
+        self.appearance_combo.setToolTip("Авто следует системной теме; светлая и темная фиксируют оформление.")
         self.appearance_combo.currentTextChanged.connect(
             lambda text: self.apply_appearance(APPEARANCE_BY_LABEL.get(text, "auto"))
         )
         self.close_combo = self._combo(list(CLOSE_LABELS.values()))
+        self.close_combo.setToolTip("Определяет действие при закрытии окна: спросить, свернуть в трей или выйти.")
         form.addLayout(self._form_row("Тема", self.appearance_combo))
         form.addLayout(self._form_row("При закрытии окна", self.close_combo))
-        self.update_status = self._label(f"Версия {APP_PUBLIC_VERSION}", size=11, soft=True)
-        form.addWidget(self.update_status)
+        layout.addWidget(card)
+
+        updates = self._card()
+        updates_form = QVBoxLayout(updates)
+        updates_form.setContentsMargins(16, 16, 16, 16)
+        updates_form.setSpacing(10)
+        updates_form.addWidget(self._label("Обновления", size=16, bold=True))
+        self.update_status = self._label(f"Установлена версия {APP_PUBLIC_VERSION}", size=11, soft=True)
+        updates_form.addWidget(self.update_status)
         row = QHBoxLayout()
         self.check_updates_button = self._button("Проверить", soft=True)
         self.check_updates_button.clicked.connect(self.check_updates)
         self.install_update_button = self._button("Установить", accent=True)
         self.install_update_button.clicked.connect(self.install_update)
         self.install_update_button.setEnabled(False)
+        self.install_update_button.setVisible(False)
         row.addWidget(self.check_updates_button)
         row.addWidget(self.install_update_button)
-        form.addLayout(row)
-        layout.addWidget(card)
+        updates_form.addLayout(row)
+        updates_form.addWidget(self._label("GitHub hosts", size=14, bold=True))
+        updates_form.addWidget(self._label("Правила для доступа к GitHub API и release assets.", size=11, soft=True))
+        github_hosts_row = QHBoxLayout()
+        self.copy_github_hosts_button = self._button("Копировать", soft=True)
+        self.apply_github_hosts_button = self._button("Применить")
+        self.copy_github_hosts_button.setToolTip("Копирует hosts-записи для доступа к GitHub API и assets.")
+        self.apply_github_hosts_button.setToolTip("Добавляет managed-блок GitHub в системный hosts. Нужны права администратора.")
+        self.copy_github_hosts_button.clicked.connect(self.copy_github_hosts_block)
+        self.apply_github_hosts_button.clicked.connect(self.apply_github_hosts_block)
+        github_hosts_row.addWidget(self.copy_github_hosts_button)
+        github_hosts_row.addWidget(self.apply_github_hosts_button)
+        updates_form.addLayout(github_hosts_row)
+        self.github_hosts_status = self._label("", size=10, soft=True)
+        updates_form.addWidget(self.github_hosts_status)
+        updates_form.addWidget(self._label("Telegram Web hosts", size=14, bold=True))
+        updates_form.addWidget(self._label("Правила для работы Telegram в браузере.", size=11, soft=True))
+        telegram_hosts_row = QHBoxLayout()
+        self.copy_hosts_button = self._button("Копировать", soft=True)
+        self.apply_hosts_button = self._button("Применить")
+        self.copy_hosts_button.clicked.connect(self.copy_hosts_block)
+        self.apply_hosts_button.clicked.connect(self.apply_hosts_block)
+        telegram_hosts_row.addWidget(self.copy_hosts_button)
+        telegram_hosts_row.addWidget(self.apply_hosts_button)
+        updates_form.addLayout(telegram_hosts_row)
+        self.telegram_hosts_status = self._label("", size=10, soft=True)
+        updates_form.addWidget(self.telegram_hosts_status)
+        layout.addWidget(updates)
         layout.addStretch(1)
         return page
 
@@ -1364,43 +1594,147 @@ class MainWindow(QMainWindow):
         card = self._card()
         form = QVBoxLayout(card)
         form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self._label("Режим приложения", size=16, bold=True), 1)
+        mode_help = self._button("?", soft=True)
+        mode_help.setFixedWidth(42)
+        mode_help.clicked.connect(
+            lambda: self.show_info(
+                "Режим приложения",
+                "Подбор прокси: текущий MTProto режим.\n\n"
+                "sing-box: VPN-подписки через локальный SOCKS для Telegram.\n\n"
+                "Локальный прокси: локальный TG WebSocket MTProto proxy.",
+            )
+        )
+        mode_row.addWidget(mode_help)
+        form.addLayout(mode_row)
+        self.routing_mode_combo = self._combo([MODE_LABELS[key] for key in ("mtproxy_picker", "xray_core", "tg_ws_proxy")])
+        self.routing_mode_combo.currentTextChanged.connect(self.change_active_mode)
+        form.addWidget(self.routing_mode_combo)
         form.addWidget(self._label("Локальный frontend", size=16, bold=True))
+        form.addWidget(self._label("Адрес локального proxy, к которому подключается Telegram.", size=11, soft=True))
         self.local_host = QLineEdit()
         self.local_port = self._spin(1, 65535)
         self.local_secret = QLineEdit()
         form.addLayout(self._form_row("Host", self.local_host))
         form.addLayout(self._form_row("Port", self.local_port))
         self.local_secret.hide()
-        form.addWidget(self._label("Secret используется внутренне и автоматически добавляется в ссылку подключения.", size=11, soft=True))
         strategy_row = QHBoxLayout()
         strategy_row.addWidget(self._label("Стратегия выбора upstream", size=16, bold=True), 1)
-        help_btn = self._button("? ", soft=True)
+        help_btn = self._button("?", soft=True)
         help_btn.setFixedWidth(42)
         help_btn.clicked.connect(lambda: self.show_info("Стратегии Balancer", BALANCER_HELP))
         strategy_row.addWidget(help_btn)
         form.addLayout(strategy_row)
         self.strategy_combo = self._combo([BALANCER_LABELS[key] for key in sorted(BALANCER_STRATEGIES)])
         form.addWidget(self.strategy_combo)
-        note = self._label(
-            "Файл list/fast_list.txt собирается автоматически из лучших proxy после обновления. "
-            "При старте приложение сначала берет upstream именно оттуда.",
-            soft=True,
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
+
+    def _settings_xray(self) -> QWidget:
+        page, layout = self._page()
+        card = self._card()
+        form = QVBoxLayout(card)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+        form.addWidget(self._label("sing-box", size=16, bold=True))
+        form.addWidget(self._label("Подписки", soft=True))
+        xray_editor, self.xray_subscription_list, self.xray_subscription_input = self._list_editor(
+            placeholder="https://example.com/subscription",
+            min_height=150,
         )
-        form.addWidget(note)
-        form.addWidget(self._label("Telegram Web", size=16, bold=True))
-        web_note = self._label("Hosts-правила помогают Telegram Web и web-парсингу Telegram-доменов.", soft=True)
-        form.addWidget(web_note)
-        hosts_row = QHBoxLayout()
-        copy_hosts = self._button("Копировать", soft=True)
-        apply_hosts = self._button("Применить", soft=True)
-        remove_hosts = self._button("Удалить", soft=True)
-        copy_hosts.clicked.connect(self.copy_hosts_block)
-        apply_hosts.clicked.connect(self.apply_hosts_block)
-        remove_hosts.clicked.connect(self.remove_hosts_block)
-        hosts_row.addWidget(copy_hosts)
-        hosts_row.addWidget(apply_hosts)
-        hosts_row.addWidget(remove_hosts)
-        form.addLayout(hosts_row)
+        form.addWidget(xray_editor)
+        self.xray_socks_host = QLineEdit()
+        self.xray_socks_port = self._spin(1, 65535)
+        self.xray_probe_workers = self._spin(1, 64)
+        self.xray_probe_timeout = self._spin(2, 60)
+        self.xray_max_servers = self._spin(1, 5000)
+        self.xray_subscription_list.setToolTip("Список URL подписок. Поддерживаются raw и base64 subscription bodies.")
+        self.xray_socks_host.setToolTip("Локальный SOCKS host, который Telegram будет использовать для подключения.")
+        self.xray_socks_port.setToolTip("Локальный SOCKS port для Telegram. Обычно 10808.")
+        self.xray_probe_workers.setToolTip("Сколько VPN-нод проверять параллельно.")
+        self.xray_probe_timeout.setToolTip("Таймаут проверки одной ноды в секундах.")
+        self.xray_max_servers.setToolTip("Максимум нод, которые берутся из подписок за один полный refresh.")
+        self._enable_help_marker(
+            self.xray_socks_host,
+            self.xray_socks_port,
+            self.xray_probe_workers,
+            self.xray_probe_timeout,
+            self.xray_max_servers,
+        )
+        for label, widget in [
+            ("SOCKS host", self.xray_socks_host),
+            ("SOCKS port", self.xray_socks_port),
+            ("Probe workers", self.xray_probe_workers),
+            ("Probe timeout, sec", self.xray_probe_timeout),
+            ("Max servers", self.xray_max_servers),
+        ]:
+            form.addWidget(self._form_row_widget(label, widget))
+        self.xray_binary_path = QLineEdit()
+        self.sing_box_binary_path = QLineEdit()
+        self.xray_binary_path.hide()
+        self.sing_box_binary_path.hide()
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
+
+    def _settings_tg_ws(self) -> QWidget:
+        page, layout = self._page()
+        card = self._card()
+        form = QVBoxLayout(card)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+        form.addWidget(self._label("Локальный прокси", size=16, bold=True))
+        self.tg_ws_host = QLineEdit()
+        self.tg_ws_port = self._spin(1, 65535)
+        self.tg_ws_secret = QLineEdit()
+        self.tg_ws_dc_ip = QPlainTextEdit()
+        self.tg_ws_dc_ip.setMinimumHeight(76)
+        self.tg_ws_buf_kb = self._spin(4, 8192)
+        self.tg_ws_pool_size = self._spin(0, 64)
+        self.tg_ws_cfproxy_enabled = QCheckBox("Cloudflare fallback")
+        self.tg_ws_cfproxy_priority = QCheckBox("Cloudflare first")
+        self.tg_ws_cfproxy_user_domain = QLineEdit()
+        self.tg_ws_fake_tls_domain = QLineEdit()
+        self.tg_ws_proxy_protocol = QCheckBox("PROXY protocol v1")
+        self.tg_ws_host.setToolTip("Локальный адрес прокси.")
+        self.tg_ws_port.setToolTip("Локальный порт прокси.")
+        self.tg_ws_secret.setToolTip("32 hex символа MTProto secret. Если неверно, будет нормализован.")
+        self.tg_ws_dc_ip.setToolTip("Список DC:IP, по одному на строку.")
+        self.tg_ws_buf_kb.setToolTip("Размер socket buffer в KB.")
+        self.tg_ws_pool_size.setToolTip("Размер пула WebSocket подключений на DC.")
+        self.tg_ws_cfproxy_enabled.setToolTip("Включает Cloudflare WebSocket fallback.")
+        self.tg_ws_cfproxy_priority.setToolTip("Пробовать Cloudflare fallback перед прямым TCP.")
+        self.tg_ws_cfproxy_user_domain.setToolTip("Свой Cloudflare-proxied домен для fallback.")
+        self.tg_ws_fake_tls_domain.setToolTip("Домен для Fake TLS ee-secret ссылки.")
+        self.tg_ws_proxy_protocol.setToolTip("Принимать PROXY protocol v1 от nginx/haproxy.")
+        self._enable_help_marker(
+            self.tg_ws_secret,
+            self.tg_ws_buf_kb,
+            self.tg_ws_pool_size,
+            self.tg_ws_cfproxy_user_domain,
+            self.tg_ws_fake_tls_domain,
+        )
+        for label, widget in [
+            ("Host", self.tg_ws_host),
+            ("Port", self.tg_ws_port),
+            ("Secret", self.tg_ws_secret),
+        ]:
+            form.addWidget(self._form_row_widget(label, widget))
+        form.addWidget(self._label("DC -> IP", soft=True))
+        form.addWidget(self.tg_ws_dc_ip)
+        for label, widget in [
+            ("Buffer, KB", self.tg_ws_buf_kb),
+            ("WS pool size", self.tg_ws_pool_size),
+        ]:
+            form.addWidget(self._form_row_widget(label, widget))
+        form.addWidget(self.tg_ws_cfproxy_enabled)
+        form.addWidget(self.tg_ws_cfproxy_priority)
+        form.addWidget(self._form_row_widget("User CF domain", self.tg_ws_cfproxy_user_domain))
+        form.addWidget(self._form_row_widget("Fake TLS domain", self.tg_ws_fake_tls_domain))
+        form.addWidget(self.tg_ws_proxy_protocol)
         layout.addWidget(card)
         layout.addStretch(1)
         return page
@@ -1412,15 +1746,14 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(10)
         form.addWidget(self._label("Авторизация Telegram", size=16, bold=True))
-        intro = self._label("Для Telegram API нужны собственные API ID и API Hash. Сессия хранится только в AppData.", soft=True)
-        form.addWidget(intro)
+        form.addWidget(self._label("Нужна для Telegram-источников и отправки списка в Saved Messages.", size=11, soft=True))
         self.telegram_api_id = QLineEdit()
         self.telegram_api_id.setValidator(QIntValidator(1, 2_147_483_647, self.telegram_api_id))
         self.telegram_api_id.setPlaceholderText("API ID")
         self.telegram_api_hash = QLineEdit()
         self.telegram_api_hash.setPlaceholderText("API Hash")
         self.telegram_api_proxy = QLineEdit()
-        self.telegram_api_proxy.setPlaceholderText("https://t.me/proxy?... или tg://proxy?...")
+        self.telegram_api_proxy.setPlaceholderText("tg://proxy?...")
         self.telegram_phone = QLineEdit()
         self.telegram_phone.setPlaceholderText("+79991234567")
         self.telegram_code = QLineEdit()
@@ -1440,14 +1773,14 @@ class MainWindow(QMainWindow):
             ("API Hash", self.telegram_api_hash),
         ]:
             setup_layout.addWidget(self._form_row_widget(label, widget))
-        setup_layout.addWidget(LinkButton("Получить API ID и API Hash на my.telegram.org/apps", "https://my.telegram.org/apps"))
+        setup_layout.addWidget(LinkButton("my.telegram.org/apps", "https://my.telegram.org/apps"))
 
         setup_layout.addWidget(self._label("Вход по телефону", size=14, bold=True))
-        setup_layout.addWidget(self._label("Телефон", soft=True))
         phone_row = QHBoxLayout()
         phone_row.setSpacing(8)
         phone_row.addWidget(self.telegram_phone, 1)
         self.auth_code_button = self._button("Запросить код", accent=True)
+        self.auth_code_button.setFixedWidth(128)
         self.auth_code_button.clicked.connect(self.request_auth_code)
         phone_row.addWidget(self.auth_code_button)
         setup_layout.addLayout(phone_row)
@@ -1478,17 +1811,16 @@ class MainWindow(QMainWindow):
         code_layout.addWidget(self.telegram_code_actions)
         setup_layout.addWidget(self.telegram_code_panel)
 
-        self.telegram_api_proxy_enabled = QCheckBox("Использовать API proxy")
+        self.telegram_api_proxy_enabled = QCheckBox("Прокси для авторизации")
         self.telegram_api_proxy_enabled.toggled.connect(self._update_telegram_api_proxy_ui)
+        self.telegram_api_proxy_enabled.setToolTip("Использовать proxy только для входа в Telegram.")
         setup_layout.addWidget(self.telegram_api_proxy_enabled)
-        setup_layout.addWidget(self._label("Ссылку можно вставить заранее. Чекбокс включает использование proxy для авторизации Telegram API.", size=11, soft=True))
         self.telegram_api_proxy_panel = QWidget()
         self.telegram_api_proxy_panel.setObjectName("transparentPanel")
         proxy_layout = QVBoxLayout(self.telegram_api_proxy_panel)
         proxy_layout.setContentsMargins(0, 0, 0, 0)
         proxy_layout.setSpacing(6)
-        proxy_layout.addWidget(self._label("MTProxy для авторизации Telegram API. Обычно не нужен, включайте только если логин не проходит напрямую.", size=11, soft=True))
-        proxy_layout.addWidget(self._form_row_widget("API proxy", self.telegram_api_proxy))
+        proxy_layout.addWidget(self._form_row_widget("Прокси", self.telegram_api_proxy))
         setup_layout.addWidget(self.telegram_api_proxy_panel)
         form.addWidget(self.telegram_setup_panel)
 
@@ -1521,18 +1853,25 @@ class MainWindow(QMainWindow):
         src = QVBoxLayout(sources)
         src.setContentsMargins(16, 16, 16, 16)
         src.addWidget(self._label("Telegram-источники", size=16, bold=True))
+        src.addWidget(self._label("Каналы, из которых приложение берет proxy-ссылки.", size=11, soft=True))
         self.telegram_sources_enabled = QCheckBox("Использовать Telegram-источники")
         self.telegram_sources_enabled.toggled.connect(self._telegram_sources_toggled)
+        self.telegram_sources_enabled.setToolTip("Парсить ссылки proxy из указанных Telegram-каналов после входа.")
         src.addWidget(self.telegram_sources_enabled)
-        self.telegram_sources_locked = self._label("Источники включаются только после успешной авторизации Telegram API.", soft=True)
+        self.telegram_sources_locked = self._label("Требуется авторизация Telegram.", soft=True)
         src.addWidget(self.telegram_sources_locked)
         self.telegram_source_checks: dict[str, QCheckBox] = {}
-        for source in DEFAULT_TELEGRAM_SOURCE_URLS:
-            check = QCheckBox(source)
-            self.telegram_source_checks[source] = check
-            src.addWidget(check)
+        telegram_sources_editor, self.telegram_source_list, self.telegram_source_input = self._list_editor(
+            placeholder="https://t.me/channel",
+            min_height=130,
+        )
+        src.addWidget(telegram_sources_editor)
         self.telegram_max_messages = self._spin(1, 5000)
         self.telegram_max_proxies = self._spin(1, 5000)
+        self.telegram_source_list.setToolTip("Список Telegram-каналов или ссылок, из которых парсятся proxy.")
+        self.telegram_max_messages.setToolTip("Сколько последних сообщений читать из каждого Telegram-источника.")
+        self.telegram_max_proxies.setToolTip("Максимум proxy-ссылок из Telegram-источников.")
+        self._enable_help_marker(self.telegram_max_messages, self.telegram_max_proxies)
         src.addLayout(self._form_row("Сообщений на источник", self.telegram_max_messages))
         src.addLayout(self._form_row("Proxy из Telegram", self.telegram_max_proxies))
         layout.addWidget(sources)
@@ -1547,14 +1886,16 @@ class MainWindow(QMainWindow):
         form = QVBoxLayout(card)
         form.setContentsMargins(16, 16, 16, 16)
         form.addWidget(self._label("Web-источники", size=16, bold=True))
+        form.addWidget(self._label("Списки MTProto proxy, которые проверяются при обновлении.", size=11, soft=True))
         enable_all = self._button("Включить все источники", soft=True)
-        enable_all.clicked.connect(lambda: [check.setChecked(True) for check in self.source_checks.values()])
+        enable_all.clicked.connect(lambda: (self._set_list_values(self.source_list, list(DEFAULT_SOURCES)), self._settings_form_changed()))
         form.addWidget(enable_all)
         self.source_checks: dict[str, QCheckBox] = {}
-        for source in DEFAULT_SOURCES:
-            check = QCheckBox(source)
-            self.source_checks[source] = check
-            form.addWidget(check)
+        source_editor, self.source_list, self.source_input = self._list_editor(
+            placeholder="https://example.com/proxy-list",
+            min_height=170,
+        )
+        form.addWidget(source_editor)
         layout.addWidget(card)
 
         probe = self._card()
@@ -1562,12 +1903,16 @@ class MainWindow(QMainWindow):
         p.setContentsMargins(16, 16, 16, 16)
         p.setSpacing(10)
         p.addWidget(self._label("Параметры проверки", size=16, bold=True))
+        p.addWidget(self._label("Настройки сетевой проверки proxy.", size=11, soft=True))
         self.deep_media_enabled = QCheckBox("Deep media check через Telegram API")
-        p.addWidget(self.deep_media_enabled)
+        self.deep_media_enabled.setToolTip("Дополнительная проверка proxy через Telegram API/media path.")
+        deep_row = QHBoxLayout()
+        deep_row.addWidget(self.deep_media_enabled, 1)
+        deep_row.addWidget(self._help_marker(self.deep_media_enabled.toolTip()))
+        p.addLayout(deep_row)
         self.advanced_probe_enabled = QCheckBox("Показать параметры проверки")
         self.advanced_probe_enabled.toggled.connect(self._update_advanced_probe_ui)
         p.addWidget(self.advanced_probe_enabled)
-        p.addWidget(self._label("Менять только при необходимости: неверные значения могут сильно замедлить refresh или ухудшить отбор.", size=11, soft=True))
         self.advanced_probe_panel = QWidget()
         self.advanced_probe_panel.setObjectName("transparentPanel")
         advanced_layout = QVBoxLayout(self.advanced_probe_panel)
@@ -1578,6 +1923,13 @@ class MainWindow(QMainWindow):
         self.workers = self._spin(1, 200)
         self.max_latency = self._spin(50, 10000)
         self.live_probe_top_n = self._spin(1, 200)
+        self.source_list.setToolTip("Web-источники, из которых собираются MTProto proxy.")
+        self.duration.setToolTip("Длительность проверки proxy в секундах.")
+        self.timeout.setToolTip("Таймаут сетевого подключения при проверке.")
+        self.workers.setToolTip("Количество параллельных проверок.")
+        self.max_latency.setToolTip("Максимальная допустимая latency для accepted proxy.")
+        self.live_probe_top_n.setToolTip("Сколько лучших proxy быстро перепроверять вручную.")
+        self._enable_help_marker(self.duration, self.timeout, self.workers, self.max_latency, self.live_probe_top_n)
         for label, widget in [
             ("Длительность, сек", self.duration),
             ("Timeout, сек", self.timeout),
@@ -1627,8 +1979,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(
             self._about_card(
                 f"{APP_NAME} · v{APP_PUBLIC_VERSION}",
-                "Приложение собирает MTProto-прокси, проверяет их доступность, выбирает быстрые upstream "
-                "и держит локальный frontend для Telegram.",
+                "Собирает и проверяет proxy, переключает upstream и держит локальное подключение для Telegram.",
                 None,
                 None,
             )
@@ -1636,15 +1987,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(
             self._about_card(
                 "Оригинальный проект Flowseal",
-                "Базовый локальный MTProto frontend, на основе которого сделан этот форк.",
+                "Источник логики TG WebSocket MTProto proxy.",
                 "Открыть GitHub Flowseal",
                 "https://github.com/Flowseal/tg-ws-proxy",
             )
         )
         layout.addWidget(
             self._about_card(
+                "MIFA",
+                "Источник стандартных подписок для режима sing-box.",
+                "Открыть mifa.world",
+                "https://mifa.world/",
+            )
+        )
+        layout.addWidget(
+            self._about_card(
                 "Telegram автора",
-                "Если приложение оказалось полезным, подписка на канал будет большой поддержкой.",
+                "Канал автора проекта.",
                 "Открыть Telegram автора",
                 "https://t.me/peppe_poppo",
             )
@@ -1652,7 +2011,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(
             self._about_card(
                 "Репозиторий этого форка",
-                "Здесь лежат исходники, публичные сборки, история изменений и задачи по развитию приложения.",
+                "Исходный код, релизы и история изменений.",
                 "Открыть репозиторий",
                 "https://github.com/pengvench/MTProxyAutoSwitch",
             )
@@ -1666,7 +2025,8 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(16, 14, 16, 14)
         form.setSpacing(8)
         form.addWidget(self._label(title, size=15, bold=True))
-        form.addWidget(self._label(body, soft=True))
+        if body:
+            form.addWidget(self._label(body, soft=True))
         if button_text and url:
             form.addWidget(LinkButton(button_text, url))
         return card
@@ -1683,11 +2043,14 @@ class MainWindow(QMainWindow):
         top.addWidget(back)
         top.addStretch(1)
         top.addWidget(quick)
+        self.proxy_quick_button = quick
         layout.addLayout(top)
         layout.addWidget(self._label("Прокси", size=24, bold=True))
         self.proxy_mode_text = self._label("Режим: Auto balance", soft=True)
         layout.addWidget(self.proxy_mode_text)
-        balancer_row = QHBoxLayout()
+        self.proxy_balancer_widget = QWidget()
+        balancer_row = QHBoxLayout(self.proxy_balancer_widget)
+        balancer_row.setContentsMargins(0, 0, 0, 0)
         balancer_row.addWidget(self._label("Balancer", soft=True))
         self.proxy_strategy_combo = self._combo([BALANCER_LABELS[key] for key in sorted(BALANCER_STRATEGIES)])
         self.proxy_strategy_combo.currentTextChanged.connect(self.change_strategy_from_proxy_page)
@@ -1696,7 +2059,7 @@ class MainWindow(QMainWindow):
         help_btn.clicked.connect(lambda: self.show_info("Стратегии Balancer", BALANCER_HELP))
         balancer_row.addWidget(self.proxy_strategy_combo, 1)
         balancer_row.addWidget(help_btn)
-        layout.addLayout(balancer_row)
+        layout.addWidget(self.proxy_balancer_widget)
         self.proxy_count_text = self._label("В пуле 0 рабочих proxy", soft=True)
         layout.addWidget(self.proxy_count_text)
         self.proxy_list = QListWidget()
@@ -1720,9 +2083,23 @@ class MainWindow(QMainWindow):
         spin.setRange(minimum, maximum)
         return spin
 
+    def _enable_help_marker(self, *widgets: QWidget) -> None:
+        for widget in widgets:
+            widget.setProperty("showHelp", True)
+
+    def _help_marker(self, text: str) -> QLabel:
+        marker = self._label("?", size=11, soft=True)
+        marker.setToolTip(text)
+        marker.setFixedWidth(18)
+        marker.setAlignment(Qt.AlignCenter)
+        return marker
+
     def _form_row(self, label: str, widget: QWidget) -> QHBoxLayout:
         row = QHBoxLayout()
         row.addWidget(self._label(label, soft=True), 0)
+        tooltip = str(widget.toolTip() or "").strip()
+        if tooltip and bool(widget.property("showHelp")):
+            row.addWidget(self._help_marker(tooltip), 0)
         row.addWidget(widget, 1)
         return row
 
@@ -1734,6 +2111,87 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(self._form_row(label, widget))
         return holder
+
+    def _list_editor(
+        self,
+        *,
+        placeholder: str,
+        add_text: str = "+",
+        remove_text: str = "-",
+        min_height: int = 130,
+    ) -> tuple[QWidget, QListWidget, QLineEdit]:
+        holder = QWidget()
+        holder.setObjectName("transparentPanel")
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        list_widget = QListWidget()
+        list_widget.setObjectName("cardList")
+        list_widget.setMinimumHeight(min_height)
+        list_widget.setAlternatingRowColors(False)
+        list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(list_widget)
+        row = QHBoxLayout()
+        input_field = QLineEdit()
+        input_field.setPlaceholderText(placeholder)
+        add_button = self._button(add_text, soft=True)
+        remove_button = self._button(remove_text)
+        add_button.setToolTip("Добавить введенную строку в список.")
+        remove_button.setToolTip("Удалить выбранные строки из списка.")
+        add_button.setFixedWidth(40)
+        remove_button.setFixedWidth(40)
+        row.addWidget(input_field, 1)
+        row.addWidget(add_button)
+        row.addWidget(remove_button)
+        layout.addLayout(row)
+
+        def add_current() -> None:
+            value = input_field.text().strip()
+            if not value:
+                return
+            values = self._list_values(list_widget)
+            if value not in values:
+                self._append_list_value(list_widget, value)
+                self._settings_form_changed()
+            input_field.clear()
+
+        add_button.clicked.connect(add_current)
+        input_field.returnPressed.connect(add_current)
+        remove_button.clicked.connect(lambda: self._remove_selected_list_values(list_widget))
+        return holder, list_widget, input_field
+
+    def _append_list_value(self, list_widget: QListWidget, value: str) -> None:
+        item = QListWidgetItem(str(value))
+        item.setData(Qt.UserRole, str(value))
+        item.setSizeHint(QSize(1, 34))
+        list_widget.addItem(item)
+
+    def _set_list_values(self, list_widget: QListWidget, values: list[str]) -> None:
+        list_widget.clear()
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            self._append_list_value(list_widget, text)
+
+    def _list_values(self, list_widget: QListWidget) -> list[str]:
+        values: list[str] = []
+        for index in range(list_widget.count()):
+            value = str(list_widget.item(index).data(Qt.UserRole) or list_widget.item(index).text() or "").strip()
+            if value:
+                values.append(value)
+        return values
+
+    def _remove_selected_list_values(self, list_widget: QListWidget) -> None:
+        rows = sorted((index.row() for index in list_widget.selectedIndexes()), reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            list_widget.takeItem(row)
+        self._settings_form_changed()
 
     def _proxy_card_widget(
         self,
@@ -1806,7 +2264,11 @@ class MainWindow(QMainWindow):
         self._refresh_tray_menu()
         self.tray.show()
 
-    def _refresh_tray_menu(self) -> None:
+    def _refresh_tray_menu(self, *, force: bool = False) -> None:
+        snapshot = self.runtime.snapshot()
+        menu_state = (bool(snapshot.get("local_running")), bool(self.refresh_in_progress), str(self.runtime.config.active_mode))
+        if not force and self._tray_menu_state == menu_state:
+            return
         if self.tray_menu is not None and self.tray_menu.isVisible():
             return
         old_menu = self.tray_menu
@@ -1817,14 +2279,22 @@ class MainWindow(QMainWindow):
         copy_action = QAction("Скопировать ссылку", self)
         copy_action.triggered.connect(self.copy_local_link)
         menu.addAction(copy_action)
-        snapshot = self.runtime.snapshot()
-        if snapshot.get("local_running"):
-            action = QAction("Остановить", self)
-            action.triggered.connect(self.stop_local_proxy)
-        else:
-            action = QAction("Запустить", self)
-            action.triggered.connect(self.start_local_proxy)
-        menu.addAction(action)
+        connect_action = QAction("Подключиться", self)
+        connect_action.triggered.connect(self.connect_local_proxy)
+        menu.addAction(connect_action)
+        modes_menu = QMenu("Режим", self)
+        for mode in ("mtproxy_picker", "xray_core", "tg_ws_proxy"):
+            mode_action = QAction(MODE_LABELS.get(mode, mode), self)
+            mode_action.setCheckable(True)
+            mode_action.setChecked(self.runtime.config.active_mode == mode)
+            mode_action.triggered.connect(
+                lambda checked=False, selected=mode: self.change_active_mode(MODE_LABELS.get(selected, selected))
+            )
+            modes_menu.addAction(mode_action)
+        menu.addMenu(modes_menu)
+        restart_action = QAction("Перезапустить текущий режим", self)
+        restart_action.triggered.connect(self.restart_active_mode)
+        menu.addAction(restart_action)
         if self.refresh_in_progress:
             refresh = QAction("Отменить обновление", self)
             refresh.triggered.connect(self.cancel_refresh)
@@ -1836,6 +2306,7 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(lambda: self.quit_application(force=True))
         menu.addAction(quit_action)
         self.tray_menu = menu
+        self._tray_menu_state = menu_state
         self.tray.setContextMenu(self.tray_menu)
         if old_menu is not None:
             old_menu.deleteLater()
@@ -1853,6 +2324,8 @@ class MainWindow(QMainWindow):
         widget = self.settings_pages.get(key, self.settings_home)
         self.settings_stack.setCurrentWidget(widget)
         titles = {
+            "xray": "sing-box",
+            "tgws": "Локальный прокси",
             "home": "Настройки",
             "general": "Общие",
             "routing": "Маршрутизация",
@@ -1869,6 +2342,8 @@ class MainWindow(QMainWindow):
         elif key == "telegram":
             self._update_telegram_auth_ui()
             self.refresh_auth_status()
+        elif key == "logs":
+            self._flush_logs()
 
     def settings_back_action(self) -> None:
         if self.settings_stack.currentWidget() is self.settings_home:
@@ -1889,11 +2364,15 @@ class MainWindow(QMainWindow):
         self.auto_update_check.setChecked(bool(cfg.auto_update_enabled))
         self.appearance_combo.setCurrentText(APPEARANCE_LABELS.get(cfg.appearance, "Авто"))
         self.close_combo.setCurrentText(CLOSE_LABELS.get(cfg.close_behavior, "Всегда спрашивать"))
+        self.routing_mode_combo.blockSignals(True)
+        self.routing_mode_combo.setCurrentText(MODE_LABELS.get(cfg.active_mode, MODE_LABELS["mtproxy_picker"]))
+        self.routing_mode_combo.blockSignals(False)
         self.local_host.setText(str(cfg.local_host))
         self.local_port.setValue(int(cfg.local_port))
         self.local_secret.setText(str(cfg.local_secret))
         self.strategy_combo.setCurrentText(BALANCER_LABELS.get(cfg.balancer_strategy, "Sticky session"))
-        self.telegram_api_id.setText(str(cfg.telegram_api_id) if int(cfg.telegram_api_id or 0) > 0 else "")
+        api_id_text = self._digits_only(cfg.telegram_api_id)
+        self.telegram_api_id.setText(api_id_text if int(api_id_text or 0) > 0 else "")
         self.telegram_api_hash.setText(str(cfg.telegram_api_hash or ""))
         self.telegram_api_proxy_enabled.setChecked(bool(getattr(cfg, "telegram_api_proxy_enabled", False)))
         self.telegram_api_proxy.setText(str(cfg.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL))
@@ -1903,12 +2382,8 @@ class MainWindow(QMainWindow):
             bool(cfg.telegram_sources_enabled) and (not self._telegram_auth_known or self._telegram_authorized)
         )
         self.telegram_sources_enabled.blockSignals(False)
-        active_sources = set(cfg.sources or [])
-        for source, check in self.source_checks.items():
-            check.setChecked(source in active_sources)
-        active_tg = set(cfg.telegram_sources or [])
-        for source, check in self.telegram_source_checks.items():
-            check.setChecked(source in active_tg)
+        self._set_list_values(self.source_list, [str(item) for item in (cfg.sources or [])])
+        self._set_list_values(self.telegram_source_list, [str(item) for item in (cfg.telegram_sources or [])])
         self.telegram_max_messages.setValue(int(cfg.telegram_source_max_messages or 1))
         self.telegram_max_proxies.setValue(int(cfg.telegram_source_max_proxies or 1))
         self.duration.setValue(int(round(float(cfg.duration or 35))))
@@ -1917,17 +2392,37 @@ class MainWindow(QMainWindow):
         self.max_latency.setValue(int(round(float(cfg.max_latency_ms or 300))))
         self.live_probe_top_n.setValue(int(cfg.live_probe_top_n or 12))
         self.deep_media_enabled.setChecked(bool(cfg.deep_media_enabled))
+        self._set_list_values(self.xray_subscription_list, [str(item) for item in (cfg.xray_subscription_urls or [])])
+        self.xray_socks_host.setText(str(cfg.xray_socks_host or "127.0.0.1"))
+        self.xray_socks_port.setValue(int(cfg.xray_socks_port or 10808))
+        self.xray_probe_workers.setValue(int(cfg.xray_probe_workers or 4))
+        self.xray_probe_timeout.setValue(int(round(float(cfg.xray_probe_timeout_sec or 8))))
+        self.xray_max_servers.setValue(int(cfg.xray_max_servers or 250))
+        self.xray_binary_path.setText(str(cfg.xray_binary_path or ""))
+        self.sing_box_binary_path.setText(str(cfg.sing_box_binary_path or ""))
+        self.tg_ws_host.setText(str(cfg.tg_ws_host or "127.0.0.1"))
+        self.tg_ws_port.setValue(int(cfg.tg_ws_port or 1443))
+        self.tg_ws_secret.setText(str(cfg.tg_ws_secret or DEFAULT_LOCAL_SECRET))
+        self.tg_ws_dc_ip.setPlainText("\n".join(str(item) for item in (cfg.tg_ws_dc_ip or [])))
+        self.tg_ws_buf_kb.setValue(int(cfg.tg_ws_buf_kb or 256))
+        self.tg_ws_pool_size.setValue(int(cfg.tg_ws_pool_size or 4))
+        self.tg_ws_cfproxy_enabled.setChecked(bool(cfg.tg_ws_cfproxy_enabled))
+        self.tg_ws_cfproxy_priority.setChecked(bool(cfg.tg_ws_cfproxy_priority))
+        self.tg_ws_cfproxy_user_domain.setText(str(cfg.tg_ws_cfproxy_user_domain or ""))
+        self.tg_ws_fake_tls_domain.setText(str(cfg.tg_ws_fake_tls_domain or ""))
+        self.tg_ws_proxy_protocol.setChecked(bool(cfg.tg_ws_proxy_protocol))
         self.advanced_probe_enabled.setChecked(False)
         self._update_advanced_probe_ui()
         self._update_telegram_api_proxy_ui()
         self._update_telegram_auth_ui()
+        self._update_hosts_buttons()
         self.apply_appearance(cfg.appearance)
         self._settings_refreshing = False
         self._reset_settings_baseline()
 
     def _update_telegram_api_proxy_ui(self) -> None:
         if hasattr(self, "telegram_api_proxy_panel"):
-            self.telegram_api_proxy_panel.setVisible(True)
+            self.telegram_api_proxy_panel.setVisible(bool(self.telegram_api_proxy_enabled.isChecked()))
 
     def _update_advanced_probe_ui(self) -> None:
         if hasattr(self, "advanced_probe_panel"):
@@ -1944,7 +2439,11 @@ class MainWindow(QMainWindow):
         resend_remaining = 0
         if waiting_for_code and not authorized:
             elapsed = time.monotonic() - float(getattr(self, "_telegram_code_requested_at", 0.0) or 0.0)
-            resend_remaining = max(0, int(TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS - elapsed + 0.999))
+            resend_timeout = int(
+                getattr(self, "_telegram_code_resend_timeout", TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS)
+                or TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS
+            )
+            resend_remaining = max(0, int(resend_timeout - elapsed + 0.999))
 
         self.telegram_setup_panel.setVisible(not authorized)
         self.telegram_code_panel.setVisible(waiting_for_code and not authorized)
@@ -1976,7 +2475,7 @@ class MainWindow(QMainWindow):
         elif resend_remaining > 0:
             self.auth_code_button.setText(f"Повтор через {resend_remaining}с")
         else:
-            self.auth_code_button.setText("Запросить код" if not waiting_for_code else "Запросить SMS")
+            self.auth_code_button.setText("Запросить код" if not waiting_for_code else "Повторить код")
         self.auth_login_button.setText("Входим..." if busy == "complete_auth" else "Войти")
         self.auth_check_button.setText("Проверяем..." if busy == "auth_status" else "Проверить сессию")
         self.auth_send_button.setText("Отправляем..." if busy == "send_saved" else "Отправить список в Saved")
@@ -2011,11 +2510,12 @@ class MainWindow(QMainWindow):
         messages = {
             "telegram_api_credentials_missing": "Укажите API ID и API Hash.",
             "phone_code_hash_missing": "Сначала запросите код Telegram.",
-            "connect_timeout": "Не удалось подключиться к Telegram API: истекло время ожидания. Проверьте интернет или API proxy.",
-            "send_code_timeout": "Telegram не ответил на запрос кода. Проверьте подключение или попробуйте другой API proxy.",
+            "connect_timeout": "Не удалось подключиться к Telegram: истекло время ожидания. Проверьте интернет или прокси авторизации.",
+            "send_code_timeout": "Telegram не ответил на запрос кода. Проверьте подключение или попробуйте другой прокси авторизации.",
+            "resend_code_timeout": "Telegram не ответил на повторный запрос кода. Проверьте подключение или запросите новый код позже.",
             "sign_in_timeout": "Telegram не ответил при проверке кода. Проверьте подключение или попробуйте еще раз.",
             "password_sign_in_timeout": "Telegram не ответил при проверке пароля 2FA. Проверьте подключение или попробуйте еще раз.",
-            "auth_status_timeout": "Telegram не ответил на проверку сессии. Проверьте подключение или API proxy.",
+            "auth_status_timeout": "Telegram не ответил на проверку сессии. Проверьте подключение или прокси авторизации.",
             "logout_timeout": "Telegram не ответил на запрос выхода. Проверьте подключение.",
             "send_empty_timeout": "Telegram не ответил при отправке сообщения в Saved.",
             "send_chunk_timeout": "Telegram не ответил при отправке списка в Saved.",
@@ -2024,9 +2524,18 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _telegram_code_delivery_text(payload: dict[str, object]) -> str:
+        if payload.get("already_authorized"):
+            display = str(payload.get("display") or payload.get("phone") or "Telegram")
+            return f"Сессия уже авторизована: {display}."
         delivery_type = str(payload.get("type") or "")
+        next_type = str(payload.get("next_type") or "")
+        timeout = int(payload.get("timeout") or 0)
         length = int(payload.get("length") or 0)
         suffix = f" Код из {length} цифр." if length > 0 else ""
+        if next_type:
+            suffix += f" Следующий способ: {next_type}."
+        if timeout > 0:
+            suffix += f" Повтор можно запросить примерно через {timeout} сек."
         messages = {
             "SentCodeTypeApp": "Код отправлен в приложение Telegram на другом устройстве. Проверьте чат Telegram или системное уведомление.",
             "SentCodeTypeSms": "Код отправлен по SMS.",
@@ -2045,7 +2554,7 @@ class MainWindow(QMainWindow):
         if checked and not self._telegram_authorized:
             self.show_warning(
                 "Telegram-источники",
-                "Сначала авторизуйтесь в Telegram API. После успешного входа эти источники можно будет включить.",
+                "Сначала войдите в Telegram.",
             )
             self.telegram_sources_enabled.blockSignals(True)
             self.telegram_sources_enabled.setChecked(False)
@@ -2056,18 +2565,31 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "telegram_sources_enabled"):
             return
         enabled = bool(self._telegram_authorized and self.telegram_sources_enabled.isChecked())
-        for check in self.telegram_source_checks.values():
-            check.setEnabled(True)
+        if hasattr(self, "telegram_source_list"):
+            self.telegram_source_list.setEnabled(True)
+        if hasattr(self, "telegram_source_input"):
+            self.telegram_source_input.setEnabled(enabled)
         for widget in (self.telegram_max_messages, self.telegram_max_proxies):
             widget.setEnabled(enabled)
 
     def _collect_config(self) -> AppConfig:
+        api_id_text = self._digits_only(self.telegram_api_id.text())
+        if api_id_text != self.telegram_api_id.text():
+            self.telegram_api_id.blockSignals(True)
+            self.telegram_api_id.setText(api_id_text)
+            self.telegram_api_id.blockSignals(False)
+        api_hash_text = "".join(self.telegram_api_hash.text().split())
+        if api_hash_text != self.telegram_api_hash.text():
+            self.telegram_api_hash.blockSignals(True)
+            self.telegram_api_hash.setText(api_hash_text)
+            self.telegram_api_hash.blockSignals(False)
         payload = asdict(self.runtime.config)
         payload.update(
             {
                 "autostart_enabled": bool(self.autostart_check.isChecked()),
                 "start_minimized_to_tray": bool(self.start_minimized_check.isChecked()),
-                "auto_start_local": bool(self.auto_start_local_check.isChecked()),
+                "auto_start_local": True,
+                "active_mode": self.runtime.config.active_mode,
                 "auto_update_enabled": bool(self.auto_update_check.isChecked()),
                 "appearance": APPEARANCE_BY_LABEL.get(self.appearance_combo.currentText(), "auto"),
                 "close_behavior": CLOSE_BY_LABEL.get(self.close_combo.currentText(), "ask"),
@@ -2075,15 +2597,15 @@ class MainWindow(QMainWindow):
                 "local_port": int(self.local_port.value()),
                 "local_secret": self.local_secret.text().strip() or DEFAULT_LOCAL_SECRET,
                 "balancer_strategy": BALANCER_BY_LABEL.get(self.strategy_combo.currentText(), "sticky_session"),
-                "telegram_api_id": int(self.telegram_api_id.text().strip() or 0),
-                "telegram_api_hash": self.telegram_api_hash.text().strip(),
+                "telegram_api_id": int(api_id_text or 0),
+                "telegram_api_hash": api_hash_text,
                 "telegram_api_proxy_enabled": bool(self.telegram_api_proxy_enabled.isChecked()),
                 "telegram_api_proxy_url": self.telegram_api_proxy.text().strip() or DEFAULT_TELEGRAM_API_PROXY_URL,
                 "telegram_phone": normalize_telegram_phone(self.telegram_phone.text().strip()) or self.telegram_phone.text().strip(),
                 "telegram_sources_enabled": bool(self.telegram_sources_enabled.isChecked())
                 and (not self._telegram_auth_known or self._telegram_authorized),
-                "telegram_sources": [source for source, check in self.telegram_source_checks.items() if check.isChecked()],
-                "sources": [source for source, check in self.source_checks.items() if check.isChecked()],
+                "telegram_sources": self._list_values(self.telegram_source_list),
+                "sources": self._list_values(self.source_list),
                 "telegram_source_max_messages": int(self.telegram_max_messages.value()),
                 "telegram_source_max_proxies": int(self.telegram_max_proxies.value()),
                 "duration": float(self.duration.value()),
@@ -2093,11 +2615,40 @@ class MainWindow(QMainWindow):
                 "live_probe_top_n": int(self.live_probe_top_n.value()),
                 "deep_media_enabled": bool(self.deep_media_enabled.isChecked()),
                 "rf_whitelist_check_enabled": False,
+                "xray_subscription_urls": [
+                    value.strip()
+                    for value in self._list_values(self.xray_subscription_list)
+                    if value.strip()
+                ],
+                "xray_socks_host": self.xray_socks_host.text().strip() or "127.0.0.1",
+                "xray_socks_port": int(self.xray_socks_port.value()),
+                "xray_probe_workers": int(self.xray_probe_workers.value()),
+                "xray_probe_timeout_sec": float(self.xray_probe_timeout.value()),
+                "xray_max_servers": int(self.xray_max_servers.value()),
+                "xray_binary_path": "",
+                "sing_box_binary_path": "",
+                "tg_ws_host": self.tg_ws_host.text().strip() or "127.0.0.1",
+                "tg_ws_port": int(self.tg_ws_port.value()),
+                "tg_ws_secret": self.tg_ws_secret.text().strip() or DEFAULT_LOCAL_SECRET,
+                "tg_ws_dc_ip": [
+                    line.strip()
+                    for line in self.tg_ws_dc_ip.toPlainText().splitlines()
+                    if line.strip()
+                ],
+                "tg_ws_buf_kb": int(self.tg_ws_buf_kb.value()),
+                "tg_ws_pool_size": int(self.tg_ws_pool_size.value()),
+                "tg_ws_cfproxy_enabled": bool(self.tg_ws_cfproxy_enabled.isChecked()),
+                "tg_ws_cfproxy_priority": bool(self.tg_ws_cfproxy_priority.isChecked()),
+                "tg_ws_cfproxy_user_domain": self.tg_ws_cfproxy_user_domain.text().strip(),
+                "tg_ws_fake_tls_domain": self.tg_ws_fake_tls_domain.text().strip(),
+                "tg_ws_proxy_protocol": bool(self.tg_ws_proxy_protocol.isChecked()),
             }
         )
         return AppConfig(**payload)
 
     def save_settings(self) -> None:
+        if self._warn_runtime_busy():
+            return
         try:
             cfg = self._collect_config()
             if self._settings_baseline is not None and cfg == self._settings_baseline:
@@ -2145,6 +2696,16 @@ class MainWindow(QMainWindow):
         on_success: Callable[[Any], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
+        tracked = name in RUNTIME_BUSY_TASKS
+        if tracked and name in self.busy_task_names:
+            self.show_warning("Операция уже выполняется", "Дождитесь завершения текущего действия.")
+            return
+        if tracked:
+            self.busy_task_names.add(name)
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            self.progress_text.setText(_runtime_task_status(name))
+            self._update_busy_controls()
         token = f"{name}:{time.monotonic_ns()}"
         self.task_callbacks[token] = (on_success, on_error)
 
@@ -2158,51 +2719,126 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_task_done(self, token: str, result: object) -> None:
+        task_name = token.split(":", 1)[0]
+        tracked = task_name in self.busy_task_names
+        self.busy_task_names.discard(task_name)
         callbacks = self.task_callbacks.pop(token, (None, None))
         if callbacks[0] is not None:
             callbacks[0](result)
+        if tracked and not self.refresh_in_progress:
+            self.progress.setValue(1000)
+            QTimer.singleShot(700, lambda: self.progress.setVisible(False) if not self._runtime_busy() else None)
+        self._update_busy_controls()
         self._refresh_snapshot()
 
     def _on_task_failed(self, token: str, error: str) -> None:
+        task_name = token.split(":", 1)[0]
+        tracked = task_name in self.busy_task_names
+        self.busy_task_names.discard(task_name)
         callbacks = self.task_callbacks.pop(token, (None, None))
         if callbacks[1] is not None:
             callbacks[1](error)
         else:
             self.show_error("Ошибка", error)
+        if tracked and not self.refresh_in_progress:
+            self.progress.setValue(0)
+            QTimer.singleShot(700, lambda: self.progress.setVisible(False) if not self._runtime_busy() else None)
+        self._update_busy_controls()
         self._refresh_snapshot()
 
+    def _runtime_busy(self) -> bool:
+        return bool(self.refresh_in_progress or self.busy_task_names)
+
+    def _warn_runtime_busy(self) -> bool:
+        if not self._runtime_busy():
+            return False
+        self.show_warning("Приложение занято", "Сейчас выполняется обновление или переключение режима. Дождитесь завершения или отмените обновление.")
+        return True
+
+    def _update_busy_controls(self) -> None:
+        busy = self._runtime_busy()
+        for widget_name in (
+            "primary_button",
+            "mode_combo",
+            "routing_mode_combo",
+            "restart_mode_button",
+            "strategy_combo",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(not busy)
+        if hasattr(self, "refresh_button"):
+            self.refresh_button.setEnabled(True)
+        if hasattr(self, "copy_button"):
+            self.copy_button.setEnabled(True)
+        if hasattr(self, "connect_button"):
+            self.connect_button.setEnabled(True)
+
     def primary_action(self) -> None:
+        if self._warn_runtime_busy():
+            return
         if self.runtime.snapshot().get("local_running"):
             self.stop_local_proxy()
         else:
             self.start_local_proxy()
 
+    def change_active_mode(self, label: str) -> None:
+        if self._warn_runtime_busy():
+            self._refresh_snapshot()
+            return
+        mode = MODE_BY_LABEL.get(label, "mtproxy_picker")
+        if mode == self.runtime.config.active_mode:
+            return
+        self.run_task(
+            "change_mode",
+            lambda: self.runtime.set_active_mode(mode),
+            on_error=lambda error: self.show_error("Режим не запущен", error),
+        )
+
+    def restart_active_mode(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        self.run_task(
+            "restart_mode",
+            self.runtime.restart_active_mode,
+            on_error=lambda error: self.show_error("Режим не перезапущен", error),
+        )
+
     def start_local_proxy(self) -> None:
+        if self._warn_runtime_busy():
+            return
         self.run_task(
             "start_local",
-            lambda: self.runtime.start_local_server(raise_on_verify_failure=True),
+            self.runtime.start_active_mode,
             on_error=lambda error: self.show_error("Запуск не выполнен", error),
         )
 
     def stop_local_proxy(self) -> None:
-        self.run_task("stop_local", self.runtime.stop_local_server)
+        if self._warn_runtime_busy():
+            return
+        self.run_task("stop_local", self.runtime.stop_active_mode)
 
     def start_refresh(self) -> None:
         if self.refresh_in_progress:
             self.cancel_refresh()
             return
+        if self.busy_task_names:
+            self.show_warning("Приложение занято", "Дождитесь завершения текущего действия перед обновлением.")
+            return
         if not self._apply_pending_settings():
             return
         self.refresh_in_progress = True
         self.refresh_cancel_event = threading.Event()
+        self.progress.setVisible(True)
         self.progress.setValue(20)
         self.progress_text.setText("Подготовка к обновлению списка")
         self.refresh_button.setText("Отмена")
+        self._update_busy_controls()
         self._refresh_tray_menu()
 
         def worker() -> None:
             try:
-                self.runtime.run_refresh(cancel_event=self.refresh_cancel_event)
+                self.runtime.refresh_active_mode(cancel_event=self.refresh_cancel_event)
                 self.bridge.task_done.emit("refresh", True)
             except Exception as exc:
                 self.bridge.task_failed.emit("refresh", str(exc))
@@ -2219,25 +2855,33 @@ class MainWindow(QMainWindow):
         self.refresh_in_progress = False
         self.refresh_button.setText("Обновить")
         self.progress.setValue(1000)
+        self._update_busy_controls()
+        QTimer.singleShot(700, lambda: self.progress.setVisible(False) if not self.refresh_in_progress else None)
         self._refresh_tray_menu()
         self._refresh_snapshot()
 
     def _refresh_failed(self, error: str) -> None:
         self.refresh_in_progress = False
         self.refresh_button.setText("Обновить")
+        self._update_busy_controls()
         if "cancel" in error.lower() or "refresh_cancelled" in error:
             self.progress_text.setText("Обновление отменено")
         else:
             self.progress_text.setText(f"Ошибка обновления: {error}")
             self.show_error("Обновление не выполнено", error)
+        QTimer.singleShot(700, lambda: self.progress.setVisible(False) if not self.refresh_in_progress else None)
         self._refresh_tray_menu()
         self._refresh_snapshot()
 
     def _auto_refresh_initial(self) -> None:
         snapshot = self.runtime.snapshot()
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            if not snapshot.get("local_running"):
+                self.restart_active_mode()
+            return
         if int(snapshot.get("working_count") or 0) <= 0 and not self.refresh_in_progress:
             self.start_refresh()
-        elif self.runtime.config.auto_start_local and snapshot.get("pool_rows") and not snapshot.get("local_running"):
+        elif snapshot.get("pool_rows") and not snapshot.get("local_running"):
             self.start_local_proxy()
 
     def _refresh_snapshot(self) -> None:
@@ -2245,8 +2889,18 @@ class MainWindow(QMainWindow):
         self.last_snapshot = snapshot
         rows = list(snapshot.get("pool_rows") or [])
         running = bool(snapshot.get("local_running"))
+        mode = str(snapshot.get("active_mode") or self.runtime.config.active_mode or "mtproxy_picker")
+        if hasattr(self, "mode_combo"):
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentText(MODE_LABELS.get(mode, MODE_LABELS["mtproxy_picker"]))
+            self.mode_combo.blockSignals(False)
+        if hasattr(self, "routing_mode_combo"):
+            self.routing_mode_combo.blockSignals(True)
+            self.routing_mode_combo.setCurrentText(MODE_LABELS.get(mode, MODE_LABELS["mtproxy_picker"]))
+            self.routing_mode_combo.blockSignals(False)
         self._local_running = running
-        self.status_chip.setText("Локальный прокси активен" if running else "Локальный прокси остановлен")
+        mode_title = MODE_LABELS.get(mode, mode)
+        self.status_chip.setText(f"{mode_title}: активен" if running else f"{mode_title}: не запущен")
         theme = THEMES[getattr(self, "_theme_name", "light")]
         self.status_chip.setStyleSheet(
             (
@@ -2259,44 +2913,107 @@ class MainWindow(QMainWindow):
         self.primary_button.setText("Стоп" if running else "Пуск")
         self.primary_button.setProperty("started", "true" if running else "false")
         self._apply_primary_style()
-        local_endpoint = f"{self.runtime.config.local_host}:{self.runtime.config.local_port}"
+        local_endpoint = str(snapshot.get("endpoint") or f"{self.runtime.config.local_host}:{self.runtime.config.local_port}")
         self.primary_hint.setText(
             f"Локальный адрес для Telegram: {local_endpoint}"
             if running
-            else "Нажмите Пуск, чтобы поднять локальный frontend."
+            else str(snapshot.get("status_text") or "Режим ожидает запуска.")
         )
         self.pool_value.setText(str(len(rows)))
         best_row = rows[0] if rows else {}
-        latency = best_row.get("live_latency_ms") or best_row.get("base_latency_ms") or best_row.get("connect_latency_ms")
+        latency = best_row.get("latency_ms") or best_row.get("live_latency_ms") or best_row.get("base_latency_ms") or best_row.get("connect_latency_ms")
         self.ping_value.setText(_format_latency(latency))
-        upload = best_row.get("recent_media_upload_kbps") or best_row.get("deep_media_upload_kbps")
-        download = best_row.get("recent_media_download_kbps") or best_row.get("deep_media_download_kbps")
-        if _safe_float(upload):
-            self.last_upload_kbps = _safe_float(upload)
-        if _safe_float(download):
-            self.last_download_kbps = _safe_float(download)
-        self.speed_value.setText(f"↑ {_format_rate(self.last_upload_kbps)}\n↓ {_format_rate(self.last_download_kbps)}")
+        if hasattr(self, "speed_title"):
+            self.speed_title.setText("Скорость")
+        if mode == "mtproxy_picker":
+            self._last_tgws_speed_sample = None
+            upload = (
+                best_row.get("live_media_upload_kbps")
+                or best_row.get("recent_media_upload_kbps")
+                or best_row.get("deep_media_upload_kbps")
+            )
+            download = (
+                best_row.get("live_media_download_kbps")
+                or best_row.get("recent_media_download_kbps")
+                or best_row.get("deep_media_download_kbps")
+            )
+            if _safe_float(upload):
+                self.last_upload_kbps = _safe_float(upload)
+            if _safe_float(download):
+                self.last_download_kbps = _safe_float(download)
+            self.speed_value.setText(_format_rate_pair(self.last_upload_kbps, self.last_download_kbps))
+        elif mode == "xray_core":
+            self._last_tgws_speed_sample = None
+            self.speed_title.setText("Скорость")
+            active_node = dict(snapshot.get("active_node") or {})
+            download_kbps = active_node.get("download_kbps") or best_row.get("download_kbps")
+            self.speed_value.setText(_format_download_rate(download_kbps))
+        else:
+            if hasattr(self, "speed_title"):
+                self.speed_title.setText("Трафик")
+            now = time.monotonic()
+            up_bytes = int(snapshot.get("bytes_up") or 0)
+            down_bytes = int(snapshot.get("bytes_down") or 0)
+            previous = self._last_tgws_speed_sample
+            if previous is not None and now > previous[0]:
+                elapsed = max(0.001, now - previous[0])
+                up_kbps = max(0.0, (up_bytes - previous[1]) / elapsed / 1024.0)
+                down_kbps = max(0.0, (down_bytes - previous[2]) / elapsed / 1024.0)
+                self.speed_value.setText(_format_rate_pair(up_kbps, down_kbps))
+            else:
+                self.speed_value.setText("n/a")
+            self._last_tgws_speed_sample = (now, up_bytes, down_bytes)
         active = snapshot.get("manual_upstream_url") or snapshot.get("best_proxy") or "Еще не выбран"
         self.active_proxy.setText(_trim_middle(str(active), 72))
-        if not self.refresh_in_progress:
-            self.progress_text.setText(
-                f"Обновление завершено: {len(rows)} рабочих из {snapshot.get('unique_count', 0)}"
-                if snapshot.get("last_refresh_finished_at")
-                else "Готов к обновлению"
-            )
+        if not self.refresh_in_progress and not self.busy_task_names and not snapshot.get("background_refreshing"):
+            if mode == "xray_core":
+                reason_tail = _format_reason_counts(snapshot.get("reason_counts"))
+                if not snapshot.get("xray_binary_found", True):
+                    reason_tail = "xray binary not found"
+                elif not snapshot.get("sing_box_binary_found", True):
+                    reason_tail = "sing-box binary not found"
+                self.progress_text.setText(
+                    f"sing-box: {snapshot.get('working_count', 0)} рабочих из {len(rows)} найденных"
+                    if snapshot.get("last_refresh_finished_at")
+                    else str(snapshot.get("status_text") or "Готов к обновлению подписок")
+                )
+                if snapshot.get("last_refresh_finished_at") and int(snapshot.get("working_count") or 0) <= 0 and reason_tail:
+                    self.progress_text.setText(f"{self.progress_text.text()} ({reason_tail})")
+            elif mode == "tg_ws_proxy":
+                self.progress_text.setText(str(snapshot.get("status_text") or "Локальный прокси готов"))
+            else:
+                self.progress_text.setText(
+                    f"Обновление завершено: {snapshot.get('working_count', len(rows))} рабочих из {snapshot.get('unique_count', 0)}"
+                    if snapshot.get("last_refresh_finished_at")
+                    else "Готов к обновлению"
+                )
         thread_status = str(snapshot.get("thread_status") or "disabled")
         if thread_status == "disabled":
             self.thread_text.setText("Telegram-источники выключены и ожидают следующего обновления")
         else:
             self.thread_text.setText(f"Загружено из Telegram-источников: {snapshot.get('thread_proxy_count', 0)}")
-        self.footer_info.setText("Загружен стартовый пул. Полный refresh запустится автоматически." if rows else "Рабочий пул пока пуст.")
+        if mode == "xray_core":
+            reason_tail = _format_reason_counts(snapshot.get("reason_counts"))
+            suffix = f" Причины: {reason_tail}." if reason_tail and int(snapshot.get("working_count") or 0) <= 0 else ""
+            self.footer_info.setText(f"Найдено серверов: {len(rows)}. Рабочих: {snapshot.get('working_count', 0)}.{suffix}")
+        elif mode == "tg_ws_proxy":
+            self.footer_info.setText("Активен локальный TG WS frontend." if running else "TG WS frontend остановлен.")
+        else:
+            self.footer_info.setText("Загружен стартовый пул. Полный refresh запустится автоматически." if rows else "Рабочий пул пока пуст.")
         self._refresh_proxy_page(only_if_visible=True)
-        self._refresh_pool_table()
+        if hasattr(self, "pool_list") and self.stack.currentWidget() is self.settings_page and self.settings_stack.currentWidget() is self.settings_pages.get("pool"):
+            self._refresh_pool_table()
+        self._update_busy_controls()
         self._refresh_tray_menu()
 
     def _handle_runtime_event(self, event_name: str, payload: object) -> None:
+        if not hasattr(self, "runtime"):
+            return
         payload = dict(payload or {})
+        now = time.monotonic()
         if event_name == "phase":
+            self.progress.setVisible(True)
+            self._last_progress_ui_at = now
             phase = payload.get("phase")
             if phase == "scraping":
                 total = int(payload.get("total_sources") or 0)
@@ -2309,20 +3026,68 @@ class MainWindow(QMainWindow):
         elif event_name == "source_started":
             total = max(1, int(payload.get("total") or 1))
             index = max(1, int(payload.get("index") or 1))
+            if now - self._last_progress_ui_at < 0.25 and index < total:
+                return
+            self._last_progress_ui_at = now
+            self.progress.setVisible(True)
             self.progress.setValue(int(40 + ((index - 1) / total) * 300))
             self.progress_text.setText(f"Сбор сайтов: {index}/{total}")
         elif event_name == "probe_result":
             total = max(1, int(payload.get("total") or 1))
             completed = max(0, int(payload.get("completed") or 0))
+            if now - self._last_progress_ui_at < 0.12 and completed < total:
+                return
+            self._last_progress_ui_at = now
+            self.progress.setVisible(True)
             self.progress.setValue(int(380 + (completed / total) * 480))
             self.progress_text.setText(f"Проверка прокси: {completed}/{total}")
         elif event_name == "runtime_refresh_waiting":
             self.progress_text.setText("Ждем окончания пользовательской media-сессии Telegram")
         elif event_name == "runtime_refresh_complete":
+            self.progress.setVisible(True)
             self.progress.setValue(1000)
             self.progress_text.setText(
                 f"Обновление завершено: {payload.get('working', 0)} рабочих из {payload.get('unique', 0)}"
             )
+        elif event_name == "xray_probe_progress":
+            total = max(1, int(payload.get("total") or 1))
+            index = max(0, int(payload.get("index") or 0))
+            if now - self._last_progress_ui_at < 0.25 and index < total:
+                return
+            self._last_progress_ui_at = now
+            self.progress.setVisible(True)
+            self.progress.setValue(int(120 + (index / total) * 820))
+            self.progress_text.setText(f"sing-box: проверка серверов {index}/{total}")
+            if now - self._last_proxy_page_refresh_at >= 2.0:
+                self._last_proxy_page_refresh_at = now
+                self._refresh_proxy_page(only_if_visible=True)
+        elif event_name == "xray_background_refresh_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            threshold = int(float(payload.get("threshold_ms") or 200))
+            self.progress_text.setText(f"sing-box: пинг выше {threshold} ms, обновляю список в фоне")
+        elif event_name == "xray_background_refresh_failed":
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+            self.progress_text.setText(f"sing-box: фоновое обновление не выполнено: {payload.get('error') or 'ошибка'}")
+        elif event_name == "xray_health":
+            if not self.refresh_in_progress and not self.busy_task_names:
+                latency = _format_latency(payload.get("latency_ms"))
+                self.progress_text.setText(f"sing-box: текущий пинг {latency}")
+        elif event_name == "xray_refresh_complete":
+            self.progress.setVisible(True)
+            total = int(payload.get("total") or 0)
+            working = int(payload.get("working") or 0)
+            self.progress.setValue(1000)
+            text = f"sing-box: {working} рабочих из {total} найденных"
+            reason_tail = _format_reason_counts(payload.get("reason_counts"))
+            if working <= 0 and reason_tail:
+                text = f"{text} ({reason_tail})"
+            self.progress_text.setText(text)
+            QTimer.singleShot(700, lambda: self.progress.setVisible(False) if not self.refresh_in_progress else None)
+            self._refresh_snapshot()
+        elif event_name in {"xray_state", "tg_ws_state"}:
+            self._refresh_snapshot()
         elif event_name == "local_server_state":
             self._refresh_snapshot()
     def _append_log(self, message: str) -> None:
@@ -2330,6 +3095,18 @@ class MainWindow(QMainWindow):
         self.log_lines.append(line)
         if len(self.log_lines) > 500:
             self.log_lines = self.log_lines[-500:]
+        if hasattr(self, "logs") and self.stack.currentWidget() is self.settings_page and self.settings_stack.currentWidget() is self.settings_pages.get("logs"):
+            now = time.monotonic()
+            if now - self._last_log_flush_at < 0.25:
+                if not self._log_flush_pending:
+                    self._log_flush_pending = True
+                    QTimer.singleShot(300, self._flush_logs)
+                return
+            self._flush_logs()
+
+    def _flush_logs(self) -> None:
+        self._log_flush_pending = False
+        self._last_log_flush_at = time.monotonic()
         if hasattr(self, "logs"):
             self.logs.setPlainText("\n".join(self.log_lines))
             self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
@@ -2339,6 +3116,55 @@ class MainWindow(QMainWindow):
             return
         snapshot = self.runtime.snapshot()
         rows = list(snapshot.get("pool_rows") or [])
+        mode = str(snapshot.get("active_mode") or self.runtime.config.active_mode or "mtproxy_picker")
+        if hasattr(self, "proxy_balancer_widget"):
+            self.proxy_balancer_widget.setVisible(mode in {"mtproxy_picker", "xray_core"})
+        if hasattr(self, "proxy_quick_button"):
+            self.proxy_quick_button.setText("Проверить" if mode == "mtproxy_picker" else "Сортировать")
+        if mode == "xray_core":
+            strategy = str(snapshot.get("balancer_strategy") or "sticky_session")
+            manual = str(snapshot.get("manual_upstream_url") or "")
+            label = BALANCER_LABELS.get(strategy, strategy)
+            self.proxy_strategy_combo.blockSignals(True)
+            self.proxy_strategy_combo.setCurrentText(label)
+            self.proxy_strategy_combo.blockSignals(False)
+            self.proxy_mode_text.setText(f"Режим: {'Ручной upstream' if manual else f'sing-box auto balance ({label})'}")
+            self.proxy_count_text.setText(f"Найдено серверов: {len(rows)}")
+            active_node = dict(snapshot.get("active_node") or {})
+            self.proxy_footer.setText(
+                f"Текущий upstream: {_trim_middle(str(snapshot.get('best_proxy') or ''), 72)}"
+                if active_node
+                else f"Текущий режим: Auto balance · {label}"
+            )
+            self.proxy_list.clear()
+            auto_widget = self._proxy_card_widget(
+                badge="B",
+                title="balance",
+                subtitle=f"sing-box balancer ({label})",
+                metric="AUTO",
+                selected=not manual,
+                on_click=lambda: self._apply_proxy_url(""),
+            )
+            self._add_card_item(self.proxy_list, auto_widget, "")
+            for index, row in enumerate(rows):
+                url = str(row.get("url") or "")
+                host = f"{row.get('host')}:{row.get('port')}"
+                latency = _format_latency(row.get("latency_ms"))
+                api_latency = _format_latency(row.get("api_latency_ms"))
+                speed = _format_download_rate(row.get("download_kbps"))
+                tag = "Manual" if manual and url == manual else "Accepted" if row.get("accepted") else "Rejected"
+                subtitle = f"{tag} | {row.get('protocol') or 'node'} via {row.get('runtime') or 'core'} | {speed} | api {api_latency} | {row.get('reason') or 'ready'}"
+                widget = self._proxy_card_widget(
+                    badge=str(index + 1),
+                    title=_trim_middle(f"{row.get('name') or host}", 34),
+                    subtitle=subtitle,
+                    metric=latency,
+                    selected=bool(manual and url == manual),
+                    active=bool(active_node and url == active_node.get("url")),
+                    on_click=(lambda proxy_url=url: self._apply_proxy_url(proxy_url)) if row.get("accepted") else None,
+                )
+                self._add_card_item(self.proxy_list, widget, url if row.get("accepted") else "__disabled__")
+            return
         strategy = str(snapshot.get("balancer_strategy") or "sticky_session")
         manual = str(snapshot.get("manual_upstream_url") or "")
         label = BALANCER_LABELS.get(strategy, strategy)
@@ -2381,16 +3207,28 @@ class MainWindow(QMainWindow):
             self._add_card_item(self.proxy_list, widget, url)
 
     def proxy_item_clicked(self, item: QListWidgetItem) -> None:
+        if self.runtime.config.active_mode not in {"mtproxy_picker", "xray_core"}:
+            return
         url = str(item.data(Qt.UserRole) or "")
+        if url == "__disabled__":
+            return
         self._apply_proxy_url(url)
 
     def _apply_proxy_url(self, url: str) -> None:
+        if self.runtime.config.active_mode == "xray_core":
+            if url:
+                self.run_task("xray_manual_proxy", lambda: self.runtime.select_xray_upstream(url))
+            else:
+                self.run_task("xray_auto_proxy", self.runtime.clear_xray_upstream)
+            return
         if url:
             self.run_task("manual_proxy", lambda: self.runtime.select_manual_upstream(url))
         else:
             self.run_task("auto_proxy", self.runtime.clear_manual_upstream)
 
     def change_strategy_from_proxy_page(self, label: str) -> None:
+        if self.runtime.config.active_mode not in {"mtproxy_picker", "xray_core"}:
+            return
         strategy = BALANCER_BY_LABEL.get(label, "sticky_session")
         if strategy == self.runtime.config.balancer_strategy:
             return
@@ -2407,10 +3245,13 @@ class MainWindow(QMainWindow):
         self.pool_list.clear()
         for index, row in enumerate(rows):
             host = f"{row.get('host')}:{row.get('port')}"
-            latency = _format_latency(row.get("live_latency_ms") or row.get("base_latency_ms") or row.get("connect_latency_ms"))
+            latency = _format_latency(row.get("latency_ms") or row.get("live_latency_ms") or row.get("base_latency_ms") or row.get("connect_latency_ms"))
             up = _format_rate(row.get("recent_media_upload_kbps") or row.get("deep_media_upload_kbps"))
             down = _format_rate(row.get("recent_media_download_kbps") or row.get("deep_media_download_kbps"))
-            subtitle = f"{row.get('reason') or 'ready'} · ↑ {up} · ↓ {down}"
+            if self.runtime.config.active_mode == "xray_core":
+                subtitle = f"{row.get('protocol') or 'node'} · {row.get('runtime') or 'core'} · {_format_download_rate(row.get('download_kbps'))} · {row.get('reason') or 'ready'}"
+            else:
+                subtitle = f"{row.get('reason') or 'ready'} · ↑ {up} · ↓ {down}"
             widget = self._proxy_card_widget(
                 badge=str(index + 1),
                 title=_trim_middle(host, 34),
@@ -2425,6 +3266,11 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText("\n".join(str(row.get("url") or "") for row in rows if row.get("url")))
 
     def quick_probe(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            self.run_task("quick_sort_mode", lambda: self.runtime.quick_sort_active_mode(cancel_event=self.refresh_cancel_event))
+            return
         self.run_task("quick_probe", lambda: self.runtime.quick_probe_pool(limit=self.runtime.config.live_probe_top_n, reason="manual"))
 
     def copy_local_link(self) -> None:
@@ -2449,20 +3295,88 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _read_hosts_text(self) -> str:
+        try:
+            return HOSTS_PATH.read_text(encoding="utf-8", errors="ignore") if HOSTS_PATH.exists() else ""
+        except Exception:
+            return ""
+
+    def _telegram_hosts_installed(self) -> bool:
+        return _managed_hosts_installed(
+            self._read_hosts_text(),
+            HOSTS_BLOCK_BEGIN,
+            HOSTS_BLOCK_END,
+            list(TELEGRAM_WEB_HOSTS_LINES),
+        )
+
+    def _github_hosts_installed(self) -> bool:
+        return _managed_hosts_installed(
+            self._read_hosts_text(),
+            GITHUB_HOSTS_BLOCK_BEGIN,
+            GITHUB_HOSTS_BLOCK_END,
+            list(GITHUB_HOSTS_LINES),
+        )
+
+    def _update_hosts_buttons(self) -> None:
+        if hasattr(self, "apply_github_hosts_button"):
+            installed = self._github_hosts_installed()
+            self.apply_github_hosts_button.setEnabled(not installed)
+            self.apply_github_hosts_button.setVisible(not installed)
+            self.apply_github_hosts_button.setText("Применить")
+            self.github_hosts_status.setText("Hosts уже применены" if installed else "")
+        if hasattr(self, "apply_hosts_button"):
+            installed = self._telegram_hosts_installed()
+            self.apply_hosts_button.setEnabled(not installed)
+            self.apply_hosts_button.setVisible(not installed)
+            self.apply_hosts_button.setText("Применить")
+            self.telegram_hosts_status.setText("Hosts уже применены" if installed else "")
+
     def copy_hosts_block(self) -> None:
         QApplication.clipboard().setText(_telegram_web_hosts_block())
         self.show_info("Telegram Web", "Hosts-блок скопирован")
 
+    def copy_github_hosts_block(self) -> None:
+        QApplication.clipboard().setText(_github_hosts_block())
+        self.show_info("GitHub hosts", "Hosts-блок скопирован")
+
     def apply_hosts_block(self) -> None:
         try:
             current = HOSTS_PATH.read_text(encoding="utf-8", errors="ignore") if HOSTS_PATH.exists() else ""
+            if _managed_hosts_installed(current, HOSTS_BLOCK_BEGIN, HOSTS_BLOCK_END, list(TELEGRAM_WEB_HOSTS_LINES)):
+                self._update_hosts_buttons()
+                self.show_info("Telegram Web", "Hosts-правила уже применены")
+                return
             updated = _strip_hosts_block(current).rstrip() + "\n\n" + _telegram_web_hosts_block() + "\n"
             HOSTS_PATH.write_text(updated, encoding="utf-8")
+            self._update_hosts_buttons()
             self.show_info("Telegram Web", "Hosts-правила применены")
         except PermissionError:
             self.show_error("Telegram Web", "Нет доступа к hosts. Запустите приложение от имени администратора.")
         except Exception as exc:
             self.show_error("Telegram Web", str(exc))
+
+    def apply_github_hosts_block(self, *, silent: bool = False) -> bool:
+        try:
+            current = HOSTS_PATH.read_text(encoding="utf-8", errors="ignore") if HOSTS_PATH.exists() else ""
+            if _managed_hosts_installed(current, GITHUB_HOSTS_BLOCK_BEGIN, GITHUB_HOSTS_BLOCK_END, list(GITHUB_HOSTS_LINES)):
+                self._update_hosts_buttons()
+                if not silent:
+                    self.show_info("GitHub hosts", "Hosts-правила уже применены")
+                return True
+            updated = _strip_github_hosts_block(current).rstrip() + "\n\n" + _github_hosts_block() + "\n"
+            HOSTS_PATH.write_text(updated, encoding="utf-8")
+            self._update_hosts_buttons()
+            if not silent:
+                self.show_info("GitHub hosts", "Hosts-правила применены")
+            return True
+        except PermissionError:
+            if not silent:
+                self.show_error("GitHub hosts", "Нет доступа к hosts. Запустите приложение от имени администратора.")
+            return False
+        except Exception as exc:
+            if not silent:
+                self.show_error("GitHub hosts", str(exc))
+            return False
 
     def remove_hosts_block(self) -> None:
         try:
@@ -2473,6 +3387,16 @@ class MainWindow(QMainWindow):
             self.show_error("Telegram Web", "Нет доступа к hosts. Запустите приложение от имени администратора.")
         except Exception as exc:
             self.show_error("Telegram Web", str(exc))
+
+    def remove_github_hosts_block(self) -> None:
+        try:
+            current = HOSTS_PATH.read_text(encoding="utf-8", errors="ignore")
+            HOSTS_PATH.write_text(_strip_github_hosts_block(current), encoding="utf-8")
+            self.show_info("GitHub hosts", "Hosts-правила удалены")
+        except PermissionError:
+            self.show_error("GitHub hosts", "Нет доступа к hosts. Запустите приложение от имени администратора.")
+        except Exception as exc:
+            self.show_error("GitHub hosts", str(exc))
 
     def refresh_auth_status(self) -> None:
         if getattr(self, "_telegram_auth_busy", None):
@@ -2503,7 +3427,7 @@ class MainWindow(QMainWindow):
         else:
             self._telegram_authorized = False
             self._telegram_auth_stage = "start"
-            self.auth_status.setText("Telegram API не авторизован")
+            self.auth_status.setText("Telegram не авторизован")
         self._update_telegram_auth_ui()
 
     def _auth_status_failed(self, error: str) -> None:
@@ -2535,11 +3459,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error("Telegram", str(exc))
             return
-        force_sms = self._telegram_auth_stage == "code"
+        resend_code = self._telegram_auth_stage == "code"
         self._set_telegram_auth_busy("request_code", "Запрашиваем код Telegram...")
         self.run_task(
             "request_code",
-            lambda: self.runtime.request_auth_code(phone, force_sms=force_sms),
+            lambda: self.runtime.request_auth_code(phone, resend=resend_code),
             on_success=lambda result: (self._set_telegram_auth_busy(None), self._auth_code_requested(result)),
             on_error=self._telegram_auth_failed,
         )
@@ -2549,8 +3473,21 @@ class MainWindow(QMainWindow):
         phone = str(payload.get("phone") or "")
         if phone:
             self.telegram_phone.setText(phone)
+        if payload.get("already_authorized"):
+            self._telegram_auth_known = True
+            self._telegram_authorized = True
+            self._telegram_auth_stage = "authorized"
+            delivery_text = self._telegram_code_delivery_text(payload)
+            self.auth_status.setText(delivery_text)
+            self._update_telegram_auth_ui()
+            self.show_info("Telegram", delivery_text)
+            return
         self._telegram_code_requested_at = time.monotonic()
         self._telegram_code_delivery_type = str(payload.get("type") or "")
+        self._telegram_code_resend_timeout = max(
+            1,
+            int(payload.get("timeout") or TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS),
+        )
         self._telegram_auth_known = True
         self._telegram_authorized = False
         self._telegram_auth_stage = "code"
@@ -2595,6 +3532,7 @@ class MainWindow(QMainWindow):
         self._telegram_auth_stage = "authorized"
         self._telegram_code_requested_at = 0.0
         self._telegram_code_delivery_type = ""
+        self._telegram_code_resend_timeout = TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS
         self._update_telegram_auth_ui()
         self.refresh_auth_status()
         self.show_info("Telegram", "Сессия авторизована")
@@ -2616,8 +3554,9 @@ class MainWindow(QMainWindow):
         self._telegram_auth_stage = "start"
         self._telegram_code_requested_at = 0.0
         self._telegram_code_delivery_type = ""
+        self._telegram_code_resend_timeout = TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS
         self.telegram_sources_enabled.setChecked(False)
-        self.auth_status.setText("Telegram API не авторизован")
+        self.auth_status.setText("Telegram не авторизован")
         self._update_telegram_auth_ui()
 
     def send_proxy_list_to_saved(self) -> None:
@@ -2639,13 +3578,17 @@ class MainWindow(QMainWindow):
 
     def check_updates(self, *, show_dialog: bool = True) -> None:
         self.check_updates_button.setEnabled(False)
+        self.install_update_button.setVisible(False)
+        self.install_update_button.setEnabled(False)
         self.update_status.setText("Проверяем обновления...")
+        self.apply_github_hosts_block(silent=True)
 
         def loaded(release: object) -> None:
             self.update_release = release
             tag = str(getattr(release, "tag_name", "") or "")
             available = bool(tag and is_update_available(APP_PUBLIC_VERSION, release))
             self.install_update_button.setEnabled(available)
+            self.install_update_button.setVisible(available)
             self.check_updates_button.setEnabled(True)
             self.update_status.setText(f"Доступна версия {tag}" if available else f"Установлена актуальная версия {APP_PUBLIC_VERSION}")
             if show_dialog:
@@ -2657,6 +3600,7 @@ class MainWindow(QMainWindow):
         def failed(error: str) -> None:
             self.check_updates_button.setEnabled(True)
             self.install_update_button.setEnabled(False)
+            self.install_update_button.setVisible(False)
             self.update_status.setText(f"Ошибка проверки: {error}")
             if show_dialog:
                 self.show_error("Обновления", error)

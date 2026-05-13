@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 .env
 .env.*
+config.json
 
 .venv/
 venv/
@@ -17,6 +18,7 @@ release-macos/
 data/
 debug_screens/
 hiddify-app-main/
+tg-ws-proxy-main/
 *.session
 *.sec
 *.log

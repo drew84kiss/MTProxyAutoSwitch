@@ -1,4 +1,5 @@
 {
+  "active_mode": "mtproxy_picker",
   "sources": [
     "https://mtpro.xyz/mtproto-ru",
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
@@ -52,7 +53,36 @@
   "telegram_api_id": 0,
   "telegram_api_hash": "",
   "telegram_api_proxy_enabled": false,
-  "telegram_api_proxy_url": "https://t.me/proxy?server=max.ru.rightarion.ru&port=443&secret=eedcaae509a2455bbfc6165f1708fd5c586d61782e7275",
+  "telegram_api_proxy_url": "https://t.me/proxy?server=myrka.bronstein.ar&port=8443&secret=eea37385d8a4bbf632eabc9091fdc95a9c6d79726b612e62726f6e737465696e2e6172",
   "telegram_phone": "",
-  "telegram_session_file": "telegram_user.sec"
+  "telegram_session_file": "telegram_user.sec",
+  "xray_subscription_urls": [
+    "https://mifa.world/turbo#MIFA%20%20%7C%20%20Turbo",
+    "https://mifa.world/vless#MIFA%20%20%7C%20%20Vless",
+    "https://mifa.world/trojan",
+    "https://mifa.world/hysteria",
+    "https://mifa.world/vmess"
+  ],
+  "xray_socks_host": "127.0.0.1",
+  "xray_socks_port": 10808,
+  "xray_probe_workers": 4,
+  "xray_probe_timeout_sec": 8.0,
+  "xray_max_servers": 250,
+  "xray_binary_path": "",
+  "sing_box_binary_path": "",
+  "xray_manual_upstream_url": "",
+  "tg_ws_host": "127.0.0.1",
+  "tg_ws_port": 1443,
+  "tg_ws_secret": "274763e0d711fd394e833938dd93c8c3",
+  "tg_ws_dc_ip": [
+    "2:149.154.167.220",
+    "4:149.154.167.220"
+  ],
+  "tg_ws_buf_kb": 256,
+  "tg_ws_pool_size": 4,
+  "tg_ws_cfproxy_enabled": true,
+  "tg_ws_cfproxy_priority": true,
+  "tg_ws_cfproxy_user_domain": "",
+  "tg_ws_fake_tls_domain": "",
+  "tg_ws_proxy_protocol": false
 }

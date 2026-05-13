@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from telethon import TelegramClient, errors, types
+from telethon import TelegramClient, errors, functions, types, utils
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.sessions import StringSession
 from cryptography.fernet import Fernet
@@ -146,6 +146,49 @@ def normalize_telegram_phone(phone: str) -> str:
     return digits
 
 
+def _telegram_api_phone(phone: str) -> str:
+    parsed = utils.parse_phone(normalize_telegram_phone(phone))
+    if not parsed:
+        raise _telegram_user_error("Telegram не принял номер телефона. Введите номер в международном формате, например +79991234567.")
+    return parsed
+
+
+def _sent_code_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, (list, tuple)):
+        return [_sent_code_value(item) for item in value]
+    if hasattr(value, "to_dict"):
+        data = value.to_dict()
+        return {
+            str(key): _sent_code_value(item)
+            for key, item in data.items()
+            if key != "phone_code_hash"
+        }
+    return str(value)
+
+
+def _sent_code_payload(sent: Any, *, phone: str, resend: bool, request_phone: str) -> dict[str, Any]:
+    code_type = getattr(sent, "type", None)
+    next_type = getattr(sent, "next_type", None)
+    phone_code_hash = str(getattr(sent, "phone_code_hash", "") or "")
+    return {
+        "phone_code_hash": phone_code_hash,
+        "phone_code_hash_present": bool(phone_code_hash),
+        "type": type(code_type).__name__ if code_type is not None else "",
+        "next_type": type(next_type).__name__ if next_type is not None else "",
+        "timeout": int(getattr(sent, "timeout", 0) or 0),
+        "length": int(getattr(code_type, "length", 0) or 0),
+        "resend": bool(resend),
+        "phone": phone,
+        "request_phone": request_phone,
+        "type_details": _sent_code_value(code_type),
+        "next_type_details": _sent_code_value(next_type),
+    }
+
+
 def build_client(
     config: TelegramAuthConfig,
     *,
@@ -201,20 +244,80 @@ async def request_login_code(
     config: TelegramAuthConfig,
     *,
     phone: str,
-    force_sms: bool = False,
+    resend_code_hash: str = "",
+    reset_unauthorized_session: bool = True,
     upstream_proxy: ProxyRecord | None = None,
 ) -> dict[str, Any]:
     _ensure_auth_config(config)
     normalized_phone = normalize_telegram_phone(phone)
+    api_phone = _telegram_api_phone(normalized_phone)
     client = build_client(config, upstream_proxy=upstream_proxy, timeout=DEFAULT_AUTH_TIMEOUT)
     try:
         await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
+        authorized = await _await_timeout(client.is_user_authorized(), DEFAULT_AUTH_TIMEOUT, "auth_status")
+        if authorized:
+            me = await _await_timeout(client.get_me(), DEFAULT_AUTH_TIMEOUT, "get_me")
+            return {
+                "authorized": True,
+                "display": getattr(me, "first_name", "") or getattr(me, "username", "") or "",
+                "phone": getattr(me, "phone", "") or "",
+                "already_authorized": True,
+            }
+        resend_code_hash = str(resend_code_hash or "").strip()
+        if reset_unauthorized_session and not resend_code_hash and config.session_path.exists():
+            await _disconnect_quietly(client)
+            _delete_session(config.session_path)
+            client = build_client(config, upstream_proxy=upstream_proxy, timeout=DEFAULT_AUTH_TIMEOUT)
+            await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
         try:
-            sent = await _await_timeout(
-                client.send_code_request(normalized_phone, force_sms=force_sms),
-                DEFAULT_AUTH_TIMEOUT,
-                "send_code",
-            )
+            if resend_code_hash:
+                sent = await _await_timeout(
+                    client(functions.auth.ResendCodeRequest(api_phone, resend_code_hash)),
+                    DEFAULT_AUTH_TIMEOUT,
+                    "resend_code",
+                )
+            else:
+                for attempt in range(3):
+                    try:
+                        sent = await _await_timeout(
+                            client(
+                                functions.auth.SendCodeRequest(
+                                    api_phone,
+                                    config.api_id,
+                                    config.api_hash,
+                                    types.CodeSettings(
+                                        allow_flashcall=False,
+                                        current_number=False,
+                                        allow_app_hash=False,
+                                        allow_missed_call=False,
+                                        allow_firebase=False,
+                                        unknown_number=False,
+                                    ),
+                                )
+                            ),
+                            DEFAULT_AUTH_TIMEOUT,
+                            "send_code",
+                        )
+                        break
+                    except errors.AuthRestartError:
+                        if attempt >= 2:
+                            raise
+                        await _disconnect_quietly(client)
+                        _delete_session(config.session_path)
+                        client = build_client(config, upstream_proxy=upstream_proxy, timeout=DEFAULT_AUTH_TIMEOUT)
+                        await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
+                else:
+                    raise RuntimeError("send_code_failed")
+            if isinstance(sent, types.auth.SentCodeSuccess):
+                return {
+                    "authorized": True,
+                    "display": "",
+                    "phone": normalized_phone,
+                    "already_authorized": True,
+                }
+            if getattr(sent, "phone_code_hash", ""):
+                client._phone_code_hash[api_phone] = sent.phone_code_hash
+            client._phone = api_phone
         except errors.PhoneNumberInvalidError as exc:
             raise _telegram_user_error("Telegram не принял номер телефона. Введите российский номер в формате +7XXXXXXXXXX.") from exc
         except errors.PhoneNumberBannedError as exc:
@@ -225,21 +328,24 @@ async def request_login_code(
             raise _telegram_user_error("Telegram сейчас не может отправить код на этот номер. Попробуйте позже.") from exc
         except errors.SmsCodeCreateFailedError as exc:
             raise _telegram_user_error("Telegram не смог создать SMS-код. Попробуйте позже.") from exc
+        except errors.PhoneCodeExpiredError as exc:
+            raise _telegram_user_error("Активный запрос кода истек. Запросите новый код.") from exc
+        except errors.PhoneCodeHashEmptyError as exc:
+            raise _telegram_user_error("Не найден активный запрос кода. Запросите код заново.") from exc
+        except errors.CodeHashInvalidError as exc:
+            raise _telegram_user_error("Telegram не принял hash запроса кода. Запросите код заново.") from exc
         except errors.ApiIdInvalidError as exc:
             raise _telegram_user_error("API ID или API Hash неверные. Проверьте данные с my.telegram.org/apps.") from exc
         except errors.FloodWaitError as exc:
             seconds = int(getattr(exc, "seconds", 0) or 0)
             suffix = f" Подождите {seconds} сек." if seconds > 0 else ""
             raise _telegram_user_error(f"Telegram временно ограничил запросы кода.{suffix}") from exc
-        return {
-            "phone_code_hash": sent.phone_code_hash,
-            "type": type(sent.type).__name__ if sent.type is not None else "",
-            "next_type": type(sent.next_type).__name__ if getattr(sent, "next_type", None) is not None else "",
-            "timeout": int(getattr(sent, "timeout", 0) or 0),
-            "length": int(getattr(getattr(sent, "type", None), "length", 0) or 0),
-            "force_sms": bool(force_sms),
-            "phone": normalized_phone,
-        }
+        return _sent_code_payload(
+            sent,
+            phone=normalized_phone,
+            resend=bool(resend_code_hash),
+            request_phone=api_phone,
+        )
     finally:
         _save_session(config.session_path, client)
         await _disconnect_quietly(client)

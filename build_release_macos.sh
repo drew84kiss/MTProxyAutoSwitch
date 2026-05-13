@@ -19,16 +19,7 @@ esac
 
 echo "Using macOS target arch: ${MTPROXY_TARGET_ARCH:-default}"
 
-python3 -m pip install --upgrade \
-    pyinstaller \
-    PySide6 \
-    telethon \
-    certifi \
-    cryptography \
-    pillow \
-    pyobjc-core \
-    pyobjc-framework-Cocoa \
-    pyobjc-framework-Quartz
+python3 -m pip install --upgrade -r requirements.txt
 
 rm -rf build dist release-macos
 

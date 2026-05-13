@@ -3,14 +3,8 @@ setlocal
 
 cd /d "%~dp0"
 
-python -m pip install --upgrade ^
-    pyinstaller ^
-    PySide6 ^
-    cryptography ^
-    pillow ^
-    pywin32
-
-python -m pip install telethon==1.42.0
+python -m pip install --upgrade -r requirements.txt
+if errorlevel 1 exit /b 1
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist

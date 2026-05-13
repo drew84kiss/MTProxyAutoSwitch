@@ -3,7 +3,7 @@
 ## Requirements
 
 - macOS 12 or newer recommended
-- Python 3.11 or 3.12
+- Python 3.11+
 - Xcode Command Line Tools
 
 Install Xcode tools:
@@ -21,18 +21,10 @@ chmod +x build_release_macos.sh
 ./build_release_macos.sh
 ```
 
-The build script installs these dependencies automatically:
+The build script installs pinned dependencies from `requirements.txt`.
 
 ```text
-pyinstaller
-PySide6
-telethon
-certifi
-cryptography
-pillow
-pyobjc-core
-pyobjc-framework-Cocoa
-pyobjc-framework-Quartz
+python3 -m pip install --upgrade -r requirements.txt
 ```
 
 ## Output
