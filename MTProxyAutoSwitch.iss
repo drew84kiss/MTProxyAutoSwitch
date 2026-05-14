@@ -40,8 +40,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 Source: "release-public\portable\MTProxyAutoSwitch\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 Source: "config.template.json"; DestDir: "{app}"; DestName: "config.template.json"; Flags: ignoreversion
-Source: "list\*.txt"; DestDir: "{app}\list"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "list\report.json"; DestDir: "{app}\list"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon

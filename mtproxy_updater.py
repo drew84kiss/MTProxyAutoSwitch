@@ -23,7 +23,7 @@ WINDOWS_INSTALLER_ASSET_CANDIDATES = ("MTProxyAutoSwitch-Setup.exe",)
 WINDOWS_ARCHIVE_ASSET_CANDIDATES = ("MTProxyAutoSwitch.zip", "MTProxyAutoSwitchPublic.zip")
 MACOS_INSTALLER_ASSET_CANDIDATES = ("MTProxyAutoSwitch.pkg",)
 MACOS_ARCHIVE_ASSET_CANDIDATES = ("MTProxyAutoSwitch.dmg",)
-USER_AGENT = "MTProxyAutoSwitchUpdater/1.3.5"
+USER_AGENT = f"MTProxyAutoSwitchUpdater/{APP_VERSION}"
 URLLIB_SSL_CONTEXT = create_verified_ssl_context()
 WINDOWS_DEFAULT_INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "Programs" / "MTProxy AutoSwitch"
 

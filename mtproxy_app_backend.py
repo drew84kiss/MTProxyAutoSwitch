@@ -145,6 +145,7 @@ XRAY_FULL_REFRESH_LATENCY_MS = 260.0
 XRAY_HEALTH_INTERVAL_SEC = 20.0
 XRAY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
 XRAY_AUTO_REFRESH_COOLDOWN_SEC = 180.0
+XRAY_SPEED_SAMPLE_INTERVAL_SEC = 90.0
 MTPROXY_QUICK_SWITCH_LATENCY_MS = 200.0
 MTPROXY_FULL_REFRESH_LATENCY_MS = 260.0
 MTPROXY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
@@ -365,6 +366,7 @@ class AppRuntime:
         self._last_xray_health_at: float = 0.0
         self._last_xray_quick_sort_at: float = 0.0
         self._last_xray_auto_refresh_at: float = 0.0
+        self._last_xray_speed_sample_at: float = 0.0
         self._xray_high_latency_streak: int = 0
         self._xray_restart_attempted_at: float = 0.0
         self._health_cycle_lock = threading.Lock()
@@ -1401,6 +1403,13 @@ class AppRuntime:
                 threshold_ms=XRAY_QUICK_SWITCH_LATENCY_MS,
                 full_threshold_ms=XRAY_FULL_REFRESH_LATENCY_MS,
             )
+            if (now - self._last_xray_speed_sample_at) >= XRAY_SPEED_SAMPLE_INTERVAL_SEC:
+                self._last_xray_speed_sample_at = now
+                speed = self.xray_runtime.probe_active_download_speed(
+                    timeout=max(6.0, float(self.config.xray_probe_timeout_sec or 8.0))
+                )
+                if speed is not None:
+                    self._emit("xray_speed_sample", download_kbps=speed)
             if latency < XRAY_QUICK_SWITCH_LATENCY_MS:
                 self._xray_high_latency_streak = 0
                 return

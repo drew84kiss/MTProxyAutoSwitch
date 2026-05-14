@@ -731,8 +731,6 @@ class MainWindow(QMainWindow):
         self.refresh_in_progress = False
         self.refresh_cancel_event = threading.Event()
         self.last_snapshot: dict[str, Any] = {}
-        self.last_upload_kbps: float | None = None
-        self.last_download_kbps: float | None = None
         self.update_release: Any | None = None
         self.alert_overlay: QWidget | None = None
         self._quitting = False
@@ -2969,26 +2967,13 @@ class MainWindow(QMainWindow):
             self.speed_title.setText("Скорость")
         if mode == "mtproxy_picker":
             self._last_tgws_speed_sample = None
-            upload = (
-                best_row.get("live_media_upload_kbps")
-                or best_row.get("recent_media_upload_kbps")
-                or best_row.get("deep_media_upload_kbps")
-            )
-            download = (
-                best_row.get("live_media_download_kbps")
-                or best_row.get("recent_media_download_kbps")
-                or best_row.get("deep_media_download_kbps")
-            )
-            if _safe_float(upload):
-                self.last_upload_kbps = _safe_float(upload)
-            if _safe_float(download):
-                self.last_download_kbps = _safe_float(download)
-            self.speed_value.setText(_format_rate_pair(self.last_upload_kbps, self.last_download_kbps))
+            upload = best_row.get("live_media_upload_kbps")
+            download = best_row.get("live_media_download_kbps")
+            self.speed_value.setText(_format_rate_pair(upload, download))
         elif mode == "xray_core":
             self._last_tgws_speed_sample = None
             self.speed_title.setText("Скорость")
-            active_node = dict(snapshot.get("active_node") or {})
-            download_kbps = active_node.get("download_kbps") or best_row.get("download_kbps")
+            download_kbps = snapshot.get("active_download_kbps")
             self.speed_value.setText(_format_download_rate(download_kbps))
         else:
             if hasattr(self, "speed_title"):

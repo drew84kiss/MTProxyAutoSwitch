@@ -16,14 +16,18 @@ if errorlevel 1 exit /b 1
 mkdir release-public\portable\MTProxyAutoSwitch
 xcopy /E /I /Y dist\MTProxyAutoSwitch release-public\portable\MTProxyAutoSwitch >nul
 copy /Y README.md release-public\portable\MTProxyAutoSwitch\README.txt >nul
-copy /Y config.template.json release-public\portable\MTProxyAutoSwitch\config.json >nul
-if exist list mkdir release-public\portable\MTProxyAutoSwitch\list
-if exist list\proxy_list.txt copy /Y list\proxy_list.txt release-public\portable\MTProxyAutoSwitch\list\proxy_list.txt >nul
-if exist list\report.json copy /Y list\report.json release-public\portable\MTProxyAutoSwitch\list\report.json >nul
+copy /Y config.template.json release-public\portable\MTProxyAutoSwitch\config.template.json >nul
 if exist img\icon.ico copy /Y img\icon.ico release-public\portable\MTProxyAutoSwitch\icon.ico >nul
 
 if exist release-public\MTProxyAutoSwitch.zip del /f /q release-public\MTProxyAutoSwitch.zip
-powershell -NoProfile -Command "Compress-Archive -Path 'release-public\\portable\\MTProxyAutoSwitch\\*' -DestinationPath 'release-public\\MTProxyAutoSwitch.zip' -Force"
+where tar >nul 2>nul
+if errorlevel 1 (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Compress-Archive -Path 'release-public\\portable\\MTProxyAutoSwitch\\*' -DestinationPath 'release-public\\MTProxyAutoSwitch.zip' -Force"
+) else (
+    tar -a -c -f release-public\MTProxyAutoSwitch.zip -C release-public\portable\MTProxyAutoSwitch .
+)
+if errorlevel 1 exit /b 1
+if not exist release-public\MTProxyAutoSwitch.zip exit /b 1
 
 set "ISCC_EXE="
 for %%I in (iscc.exe) do set "ISCC_EXE=%%~$PATH:I"

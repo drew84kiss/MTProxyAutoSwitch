@@ -49,7 +49,10 @@ TELEGRAM_DCS = [
 TELEGRAM_XRAY_PROBE_TOTAL = 1 + len(TELEGRAM_DCS)
 XRAY_SPEED_TEST_HOST = "speed.cloudflare.com"
 XRAY_SPEED_TEST_PATH = "/__down?bytes=262144"
-XRAY_SPEED_TEST_BYTES = 262144
+XRAY_PROBE_SPEED_TEST_BYTES = 512 * 1024
+XRAY_PROBE_SPEED_TEST_SECONDS = 2.5
+XRAY_ACTIVE_SPEED_TEST_BYTES = 128 * 1024 * 1024
+XRAY_ACTIVE_SPEED_TEST_SECONDS = 8.0
 
 XRAY_PROTOCOLS = {"vless", "vmess", "trojan"}
 SING_BOX_PROTOCOLS = {"hysteria", "hysteria2", "hy2"}
@@ -156,6 +159,8 @@ class XrayCoreRuntime:
         self.discovered_nodes: list[XrayNode] = []
         self.last_error = ""
         self.last_refresh_finished_at = 0.0
+        self.active_download_kbps: float | None = None
+        self.active_download_measured_at: float = 0.0
         self._round_robin_cursor = 0
         self._sticky_key: tuple[str, str, int, str] | None = None
         self._load_cached_results()
@@ -267,6 +272,25 @@ class XrayCoreRuntime:
             )
             if latency is not None:
                 return latency
+        return None
+
+    def probe_active_download_speed(self, timeout: float | None = None) -> float | None:
+        if not self.is_running():
+            return None
+        probe_timeout = float(timeout if timeout is not None else self.config.probe_timeout_sec or 8.0)
+        speed = _xray_download_speed(
+            self.config.socks_host,
+            int(self.config.socks_port),
+            min(15.0, max(8.0, probe_timeout)),
+            max_bytes=XRAY_ACTIVE_SPEED_TEST_BYTES,
+            sample_seconds=XRAY_ACTIVE_SPEED_TEST_SECONDS,
+        )
+        if speed is not None and speed > 0:
+            self.active_download_kbps = float(speed)
+            self.active_download_measured_at = time.time()
+            if self.active_result is not None:
+                self.active_result.download_kbps = max(float(self.active_result.download_kbps or 0.0), float(speed))
+            return float(speed)
         return None
 
     def refresh(self, cancel_event: threading.Event | None = None) -> None:
@@ -446,6 +470,8 @@ class XrayCoreRuntime:
             "balancer_strategy": _normalize_selection_strategy(self.config.selection_strategy),
             "manual_upstream_url": self.config.manual_upstream_url,
             "last_refresh_finished_at": self.last_refresh_finished_at,
+            "active_download_kbps": self.active_download_kbps,
+            "active_download_measured_at": self.active_download_measured_at,
             "reason_counts": _reason_counts(self.last_rejected),
             "xray_binary_found": bool(_resolve_binary(self.config.xray_binary_path, self.root_dir, "xray")),
             "sing_box_binary_found": bool(_resolve_binary(self.config.sing_box_binary_path, self.root_dir, "sing-box")),
@@ -1299,7 +1325,14 @@ def _socks_https_latency(
                 raw_sock.close()
 
 
-def _xray_download_speed(socks_host: str, socks_port: int, timeout: float) -> float | None:
+def _xray_download_speed(
+    socks_host: str,
+    socks_port: int,
+    timeout: float,
+    *,
+    max_bytes: int = XRAY_PROBE_SPEED_TEST_BYTES,
+    sample_seconds: float = XRAY_PROBE_SPEED_TEST_SECONDS,
+) -> float | None:
     return _socks_https_download_kbps(
         socks_host,
         socks_port,
@@ -1307,8 +1340,9 @@ def _xray_download_speed(socks_host: str, socks_port: int, timeout: float) -> fl
         443,
         XRAY_SPEED_TEST_HOST,
         XRAY_SPEED_TEST_PATH,
-        XRAY_SPEED_TEST_BYTES,
-        min(5.0, max(2.0, timeout)),
+        max_bytes,
+        min(max(2.0, timeout), max(2.0, float(sample_seconds) + 4.0)),
+        sample_seconds=sample_seconds,
     )
 
 
@@ -1321,6 +1355,8 @@ def _socks_https_download_kbps(
     path: str,
     max_bytes: int,
     timeout: float,
+    *,
+    sample_seconds: float,
 ) -> float | None:
     raw_sock: socket.socket | None = None
     try:
@@ -1342,6 +1378,7 @@ def _socks_https_download_kbps(
             body_bytes = 0
             started: float | None = None
             deadline = time.perf_counter() + timeout
+            sample_deadline: float | None = None
             while body_bytes < max_bytes and time.perf_counter() < deadline:
                 chunk = tls_sock.recv(min(65536, max_bytes - body_bytes + 4096))
                 if not chunk:
@@ -1360,9 +1397,12 @@ def _socks_https_download_kbps(
                     body = buffer[header_end + 4 :]
                     body_bytes += len(body)
                     started = time.perf_counter()
+                    sample_deadline = started + max(0.5, float(sample_seconds))
                     buffer = b""
                 else:
                     body_bytes += len(chunk)
+                if sample_deadline is not None and time.perf_counter() >= sample_deadline:
+                    break
             if started is None or body_bytes <= 0:
                 return None
             elapsed = max(0.001, time.perf_counter() - started)
