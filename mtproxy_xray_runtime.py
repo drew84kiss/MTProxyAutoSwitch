@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import base64
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from ctypes import wintypes
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -151,6 +153,8 @@ class XrayCoreRuntime:
         self._process: subprocess.Popen | None = None
         self._config_path: str = ""
         self._pid_path = self.out_dir / "xray_runtime.pid"
+        self._shutdown_requested = False
+        self._job_handle: int | None = _create_kill_on_close_job()
         self._cleanup_stale_processes()
         atexit.register(self.stop)
         self.active_result: XrayProbeResult | None = None
@@ -179,6 +183,8 @@ class XrayCoreRuntime:
 
     def start(self) -> bool:
         with self._lock:
+            if self._shutdown_requested:
+                return False
             if self.is_running():
                 return True
             if self.active_result is None:
@@ -212,11 +218,16 @@ class XrayCoreRuntime:
                     _terminate_pid_tree(stale_pid, timeout=timeout)
             self._process = None
             self._unlink_pid_file()
+            self._reset_process_job()
             if self._config_path:
                 with contextlib.suppress(Exception):
                     Path(self._config_path).unlink(missing_ok=True)
                 self._config_path = ""
             self._emit("xray_state", running=False)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        self._shutdown_requested = True
+        self.stop(timeout=timeout)
 
     def _read_pid_file(self) -> int | None:
         try:
@@ -253,6 +264,19 @@ class XrayCoreRuntime:
             _terminate_pid_tree(stale_pid, timeout=2.0)
             self._unlink_pid_file()
         _cleanup_stale_bundle_cores(self.root_dir, self.out_dir)
+
+    def _assign_to_process_job(self, proc: subprocess.Popen) -> None:
+        if self._shutdown_requested:
+            _terminate_process_tree(proc, timeout=1.0)
+            return
+        if self._job_handle is None:
+            self._job_handle = _create_kill_on_close_job()
+        _assign_process_to_job(self._job_handle, proc)
+
+    def _reset_process_job(self) -> None:
+        if self._job_handle is not None:
+            _close_windows_handle(self._job_handle)
+        self._job_handle = _create_kill_on_close_job()
 
     def restart(self) -> bool:
         self.stop()
@@ -294,6 +318,8 @@ class XrayCoreRuntime:
         return None
 
     def refresh(self, cancel_event: threading.Event | None = None) -> None:
+        if self._shutdown_requested:
+            raise RuntimeError("runtime_shutdown")
         self._log("[xray] fetching subscriptions")
         previous_working = list(self.last_working)
         previous_active = self.active_result
@@ -372,6 +398,8 @@ class XrayCoreRuntime:
             reason_counts=_reason_counts(self.last_rejected),
         )
         if new_working and self.active_result is not None:
+            if self._shutdown_requested or (cancel_event and cancel_event.is_set()):
+                return
             self.stop()
             try:
                 self._start_node(self.active_result.node, int(self.config.socks_port))
@@ -382,6 +410,8 @@ class XrayCoreRuntime:
                 self._emit("xray_state", running=False, error=str(exc))
 
     def quick_sort_by_ping(self, cancel_event: threading.Event | None = None) -> int:
+        if self._shutdown_requested:
+            return len(self.last_working)
         with self._lock:
             nodes = [item.node for item in self.last_working]
         if not nodes:
@@ -422,6 +452,8 @@ class XrayCoreRuntime:
             self.last_refresh_finished_at = time.time()
             self._export_results()
             if new_working and self.active_result is not None and self.is_running():
+                if self._shutdown_requested or (cancel_event and cancel_event.is_set()):
+                    return len(self.last_working)
                 self.stop()
                 self._start_node(self.active_result.node, int(self.config.socks_port))
                 self._emit("xray_state", running=True, endpoint=self.config.endpoint)
@@ -529,6 +561,8 @@ class XrayCoreRuntime:
         return chosen
 
     def _probe_node(self, node: XrayNode) -> XrayProbeResult:
+        if self._shutdown_requested:
+            return XrayProbeResult(node, False, "runtime_shutdown", None, 0, 0, node.runtime)
         binary = self._binary_for_node(node)
         if not binary:
             return XrayProbeResult(node, False, f"{node.runtime} binary not found", None, 0, 0, node.runtime)
@@ -544,6 +578,7 @@ class XrayCoreRuntime:
                 stderr=subprocess.DEVNULL,
                 creationflags=_subprocess_no_window(),
             )
+            self._assign_to_process_job(proc)
             time.sleep(0.8)
             if proc.poll() is not None:
                 return XrayProbeResult(node, False, "core exited", None, 0, TELEGRAM_XRAY_PROBE_TOTAL, node.runtime)
@@ -605,6 +640,8 @@ class XrayCoreRuntime:
                     Path(config_path).unlink(missing_ok=True)
 
     def _probe_node_ping(self, node: XrayNode) -> XrayProbeResult:
+        if self._shutdown_requested:
+            return XrayProbeResult(node, False, "runtime_shutdown", None, 0, 0, node.runtime)
         binary = self._binary_for_node(node)
         if not binary:
             return XrayProbeResult(node, False, f"{node.runtime} binary not found", None, 0, 0, node.runtime)
@@ -620,6 +657,7 @@ class XrayCoreRuntime:
                 stderr=subprocess.DEVNULL,
                 creationflags=_subprocess_no_window(),
             )
+            self._assign_to_process_job(proc)
             time.sleep(0.45)
             if proc.poll() is not None:
                 return XrayProbeResult(node, False, "core exited", None, 0, len(TELEGRAM_DCS), node.runtime)
@@ -661,6 +699,8 @@ class XrayCoreRuntime:
                     Path(config_path).unlink(missing_ok=True)
 
     def _start_node(self, node: XrayNode, port: int) -> None:
+        if self._shutdown_requested:
+            raise RuntimeError("runtime_shutdown")
         binary = self._binary_for_node(node)
         if not binary:
             raise RuntimeError(f"{node.runtime} binary not found")
@@ -672,6 +712,7 @@ class XrayCoreRuntime:
             stderr=subprocess.DEVNULL,
             creationflags=_subprocess_no_window(),
         )
+        self._assign_to_process_job(self._process)
         self._config_path = config_path
         self._write_pid_file(self._process, config_path, binary)
         time.sleep(0.5)
@@ -1101,6 +1142,99 @@ def _write_temp_config(config: dict[str, Any]) -> str:
     with handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
     return handle.name
+
+
+if os.name == "nt":
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+
+def _create_kill_on_close_job() -> int | None:
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(
+            handle,
+            9,  # JobObjectExtendedLimitInformation
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            kernel32.CloseHandle(handle)
+            return None
+        return int(handle)
+    except Exception:
+        return None
+
+
+def _assign_process_to_job(job_handle: int | None, proc: subprocess.Popen) -> None:
+    if os.name != "nt" or not job_handle:
+        return
+    process_handle = int(getattr(proc, "_handle", 0) or 0)
+    if process_handle <= 0:
+        return
+    with contextlib.suppress(Exception):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject(wintypes.HANDLE(job_handle), wintypes.HANDLE(process_handle))
+
+
+def _close_windows_handle(handle: int | None) -> None:
+    if os.name != "nt" or not handle:
+        return
+    with contextlib.suppress(Exception):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
 def _terminate_process_tree(proc: subprocess.Popen, *, timeout: float = 5.0) -> None:

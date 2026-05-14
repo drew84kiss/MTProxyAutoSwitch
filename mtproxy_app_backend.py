@@ -321,6 +321,7 @@ class AppRuntime:
         self.pool = ProxyPool()
         self.log_sink = log_sink
         self.event_sink = event_sink
+        self._shutdown_requested = False
         self.local_server = LocalMTProxyServer(
             self.pool,
             host=self.config.local_host,
@@ -432,10 +433,17 @@ class AppRuntime:
         return (self.state_dir / session_name).resolve()
 
     def shutdown(self) -> None:
+        self._shutdown_requested = True
+        self._refresh_in_progress.clear()
         self.live_probe_stop.set()
+        with contextlib.suppress(Exception):
+            self.stop_local_server()
+        with contextlib.suppress(Exception):
+            self.tg_ws_server.stop()
+        with contextlib.suppress(Exception):
+            self.xray_runtime.shutdown()
         if self.live_probe_thread.is_alive():
             self.live_probe_thread.join(timeout=3.0)
-        self.stop_all_modes()
 
     def save_config(self) -> None:
         payload = self._config_payload(self.config)
@@ -678,6 +686,8 @@ class AppRuntime:
             self.stop_local_server()
 
     def start_active_mode(self, *, initial: bool = False) -> bool:
+        if self._shutdown_requested:
+            return False
         mode = self.config.active_mode if self.config.active_mode in APP_MODES else "mtproxy_picker"
         self.stop_all_modes()
 
@@ -700,6 +710,8 @@ class AppRuntime:
         return False
 
     def restart_active_mode(self) -> bool:
+        if self._shutdown_requested:
+            return False
         mode = self.config.active_mode
         self.stop_all_modes()
         if mode == "tg_ws_proxy":
@@ -710,6 +722,8 @@ class AppRuntime:
         return self.start_active_mode()
 
     def set_active_mode(self, mode: str) -> None:
+        if self._shutdown_requested:
+            return
         if mode not in APP_MODES:
             raise ValueError(f"Unknown mode: {mode}")
         if self.config.active_mode == mode:
@@ -720,6 +734,8 @@ class AppRuntime:
         self.start_active_mode()
 
     def refresh_active_mode(self, cancel_event: threading.Event | None = None, *, manual: bool = True) -> None:
+        if self._shutdown_requested:
+            return
         if self.config.active_mode == "xray_core":
             self._refresh_in_progress.set()
             self.last_refresh_started_at = time.time()
@@ -1373,6 +1389,8 @@ class AppRuntime:
                 self._log(f"[live] probe loop error: {exc}")
 
     def _run_xray_health_cycle(self) -> None:
+        if self._shutdown_requested:
+            return
         if self.config.active_mode != "xray_core":
             return
         if self._refresh_in_progress.is_set():
@@ -1390,6 +1408,8 @@ class AppRuntime:
                 if self.xray_runtime.active_result is not None and (now - self._xray_restart_attempted_at) >= 20.0:
                     self._xray_restart_attempted_at = now
                     self._log("[sing-box] core is not running, restarting active node")
+                    if self._shutdown_requested:
+                        return
                     self.xray_runtime.start()
                 return
             latency = self.xray_runtime.probe_active_latency(timeout=min(5.0, float(self.config.xray_probe_timeout_sec or 8.0)))
@@ -1423,6 +1443,8 @@ class AppRuntime:
             self._health_cycle_lock.release()
 
     def _run_xray_quick_sort_if_due(self, now: float, *, latency: float) -> None:
+        if self._shutdown_requested:
+            return
         if (now - self._last_xray_quick_sort_at) < XRAY_QUICK_SWITCH_COOLDOWN_SEC:
             return
         if not self.xray_runtime.last_working:
@@ -1438,7 +1460,7 @@ class AppRuntime:
         self.last_refresh_started_at = time.time()
         try:
             self._log(f"[sing-box] background quick ping-sort started ({latency:.0f} ms)")
-            self.xray_runtime.quick_sort_by_ping()
+            self.xray_runtime.quick_sort_by_ping(cancel_event=self.live_probe_stop)
         except Exception as exc:
             self._log(f"[sing-box] background quick ping-sort failed: {exc}")
             self._emit("xray_background_refresh_failed", error=str(exc))
@@ -1447,6 +1469,8 @@ class AppRuntime:
             self._refresh_in_progress.clear()
 
     def _run_xray_full_refresh_if_due(self, now: float, *, reason: str) -> None:
+        if self._shutdown_requested:
+            return
         if (now - self._last_xray_auto_refresh_at) < XRAY_AUTO_REFRESH_COOLDOWN_SEC:
             return
         self._last_xray_auto_refresh_at = now
@@ -1454,6 +1478,8 @@ class AppRuntime:
         self._run_xray_background_refresh(reason=reason)
 
     def _run_xray_background_refresh(self, *, reason: str) -> None:
+        if self._shutdown_requested:
+            return
         if self._refresh_in_progress.is_set():
             return
         self._refresh_in_progress.set()
@@ -1465,7 +1491,7 @@ class AppRuntime:
         )
         try:
             self._log(f"[sing-box] background refresh started ({reason})")
-            self.xray_runtime.refresh()
+            self.xray_runtime.refresh(cancel_event=self.live_probe_stop)
         except Exception as exc:
             self._log(f"[sing-box] background refresh failed: {exc}")
             self._emit("xray_background_refresh_failed", error=str(exc))
