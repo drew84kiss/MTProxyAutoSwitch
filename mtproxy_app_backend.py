@@ -149,7 +149,6 @@ MTPROXY_QUICK_SWITCH_LATENCY_MS = 200.0
 MTPROXY_FULL_REFRESH_LATENCY_MS = 260.0
 MTPROXY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
 MTPROXY_AUTO_REFRESH_COOLDOWN_SEC = 180.0
-TELEGRAM_SOURCE_AUTO_REFRESH_INTERVAL_SEC = 24 * 60 * 60
 FAST_LIST_FILE_NAME = "fast_list.txt"
 TG_PARSED_FILE_NAME = "tg_parsed_proxy.txt"
 DEFAULT_LOCAL_SECRET = "274763e0d711fd394e833938dd93c8c3"
@@ -937,11 +936,14 @@ class AppRuntime:
 
             telegram_sources = self._collect_enabled_telegram_sources()
             if telegram_sources:
-                should_parse_telegram = manual or self._telegram_source_cache_is_stale()
+                should_parse_telegram = self._telegram_source_cache_is_stale()
                 if not should_parse_telegram:
                     self.thread_status = "cached"
                     self.thread_proxy_count = len(self._load_tg_parsed_proxy_records())
-                    self._log(f"[telegram] using cached parsed proxies: {self.thread_proxy_count}")
+                    self._log(
+                        f"[telegram] using cached parsed proxies: {self.thread_proxy_count}; "
+                        f"current parse slot={self._telegram_source_current_slot_label()}"
+                    )
                 else:
                     try:
                         if best_upstream is not None and self.config.active_mode == "mtproxy_picker" and not self.local_server.is_running():
@@ -2116,12 +2118,26 @@ class AppRuntime:
     def _tg_parsed_proxy_path(self) -> Path:
         return (self.install_dir / self.config.out_dir / TG_PARSED_FILE_NAME).resolve()
 
+    @staticmethod
+    def _telegram_source_parse_slot(timestamp: float | None = None) -> tuple[int, int, str]:
+        value = time.time() if timestamp is None else float(timestamp)
+        local = time.localtime(value)
+        if 6 <= int(local.tm_hour) < 18:
+            return (int(local.tm_year), int(local.tm_yday), "day")
+        slot_time = value if int(local.tm_hour) >= 18 else value - 6 * 60 * 60
+        slot_local = time.localtime(slot_time)
+        return (int(slot_local.tm_year), int(slot_local.tm_yday), "evening")
+
+    def _telegram_source_current_slot_label(self) -> str:
+        _, _, slot = self._telegram_source_parse_slot()
+        return "day" if slot == "day" else "evening"
+
     def _telegram_source_cache_is_stale(self) -> bool:
         path = self._tg_parsed_proxy_path()
         if not path.exists():
             return True
         try:
-            return (time.time() - path.stat().st_mtime) >= TELEGRAM_SOURCE_AUTO_REFRESH_INTERVAL_SEC
+            return self._telegram_source_parse_slot(path.stat().st_mtime) != self._telegram_source_parse_slot()
         except Exception:
             return True
 
