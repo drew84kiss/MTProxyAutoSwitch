@@ -1,210 +1,251 @@
 # MTProxy AutoSwitch
 
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img width="260" alt="Главный экран MTProxy AutoSwitch" src="https://github.com/user-attachments/assets/8d4cc4b9-7f42-4fe6-96ab-33f1f0a347c0" />
-    </td>
-    <td align="center" width="50%">
-      <img width="260" alt="Настройки MTProxy AutoSwitch" src="https://github.com/user-attachments/assets/d223f0cf-157a-4ac1-a401-78adb398f642" />
-    </td>
-  </tr>
-</table>
+`MTProxy AutoSwitch` - приложение для Telegram, которое поднимает локальный proxy и автоматически подбирает рабочий маршрут. Подключение делается только в Telegram через локальную ссылку. Системный VPN, TUN и общий proxy для всей ОС не включаются.
 
-`MTProxy AutoSwitch` поднимает локальный MTProto frontend на `127.0.0.1:1443`, собирает MTProto-прокси из веб-источников и Telegram, проверяет их и автоматически переключает upstream на лучший доступный вариант.
+В приложении три режима работы:
 
-Проект является форком клиента Flowseal:
+- `Подбор прокси` - сбор, проверка и автоматический выбор лучшего MTProto proxy.
+- `sing-box` - локальный SOCKS5 для Telegram через VPN-конфиги из подписок.
+- `Локальный прокси` - встроенный TG WebSocket/MTProto proxy на локальном порту.
 
-`https://github.com/Flowseal/tg-ws-proxy`
+Одновременно работает только выбранный режим. При переключении режима предыдущий runtime останавливается.
 
-В оригинальном проекте основной сценарий работы — локальный proxy frontend. В этом форке добавлены:
+## Подбор прокси
 
-- парсинг веб- и Telegram-источников
-- дедупликация и фильтрация списков
-- фоновая проверка доступности и стабильности
-- автоподбор лучшего upstream MTProto proxy
-- стратегии выбора upstream-прокси
-- быстрый список лучших прокси для старта
-- экспорт рабочих списков и отчетов
-- автообновление приложения
-- новый интерфейс на PySide6
+Основной режим приложения. Он собирает MTProto proxy из WEB-источников и Telegram-источников, проверяет их, сохраняет рабочие списки и держит локальный MTProto frontend:
 
-## Что умеет приложение
+```text
+127.0.0.1:1443
+```
 
-- поднимать локальный MTProto proxy для Telegram на `127.0.0.1:1443`
-- автоматически выбирать лучший upstream MTProto proxy
-- собирать MTProto-прокси из веб-источников
-- парсить публичные Telegram-каналы через `t.me/s/...`
-- парсить Telegram-каналы, группы, сообщения и ветки через Telegram API после входа в аккаунт
-- проверять прокси в фоне без полного обновления списка
-- делать `deep media check` через Telegram API
-- отправлять список рабочих прокси себе в `Избранное`
-- экспортировать результаты в папку `list`
-- проверять и устанавливать обновления приложения
+Telegram подключается к локальному proxy, а приложение само переключает upstream на лучший рабочий сервер.
 
-## Что лежит в репозитории
+Что делает режим:
 
-- `mtproxy_gui.py` — интерфейс приложения
-- `mtproxy_app_backend.py` — runtime, refresh, экспорт, локальный frontend
-- `mtproxy_local_proxy.py` — локальный MTProto frontend и pool upstream-прокси
-- `mtproxy_collector.py` — веб-парсинг и первичная проверка прокси
-- `mtproxy_telegram.py` — Telegram API, авторизация, Telegram-источники, media-check
-- `mtproxy_updater.py` — автообновление приложения
-- `config.template.json` — шаблон конфига для релизной сборки
-- `config.json` — локальный конфиг, создается приложением и не хранится в репозитории
-- `list/` — экспортированные списки и отчеты
+- собирает MTProto proxy из сайтов и Telegram-источников;
+- удаляет дубли;
+- проверяет ping, стабильность и доступность Telegram;
+- выбирает upstream по стратегии `Round robin`, `Consistent hash`, `Sticky session` или ручному выбору;
+- сохраняет рабочие и отклоненные proxy в папку `list`;
+- в фоне следит за качеством активного upstream.
 
-## Как пользоваться
+Health-check:
 
-1. Установите и запустите приложение.
-2. Нажмите `Обновить`, чтобы собрать и проверить прокси.
-3. Нажмите `Пуск`, чтобы поднять локальный proxy frontend.
-4. Подключите Telegram к локальному proxy: `https://t.me/proxy?server=127.0.0.1&port=1443&secret=<secret>`.
-5. Если нужно, скопируйте ссылку кнопкой на главном экране или нажмите `Подключиться`.
+- ping `< 200 ms` - ничего не делает;
+- ping `200-259 ms` - быстро перепроверяет уже найденные рабочие proxy и переключается на лучший;
+- ping `>= 260 ms` - запускает полный refresh с cooldown;
+- если активный upstream не отвечает - запускает полный refresh с cooldown.
 
-## Где хранятся данные
+Telegram-источники через Telegram API в авто-режиме парсятся не чаще одного раза в сутки. Найденные там proxy сохраняются отдельно:
 
-Приложение отделяет установленные файлы от пользовательских данных.
+```text
+list/tg_parsed_proxy.txt
+```
 
-Windows:
+WEB-источники продолжают проверяться при обновлении как обычно.
 
-- приложение ставится в `%LOCALAPPDATA%\Programs\MTProxy AutoSwitch`
-- пользовательские данные хранятся в `%APPDATA%\MTProxyAutoSwitch`
+## sing-box
 
-macOS:
+Режим для VPN-подписок. Приложение берет конфиги из подписок, проверяет их на доступность Telegram и запускает локальный SOCKS5:
 
-- приложение ставится в `/Applications/MTProxyAutoSwitch.app`
-- пользовательские данные хранятся в `~/Library/Application Support/MTProxyAutoSwitch`
+```text
+127.0.0.1:10808
+```
 
-Это позволяет обновлять приложение через установщик без потери конфигурации, сессии Telegram и сохраненных списков.
+Telegram подключается по ссылке:
 
-## Когда нужен вход в Telegram
-
-Вход в Telegram не нужен для:
-
-- обычного веб-парса сайтов
-- работы локального proxy frontend
-
-Вход в Telegram нужен для:
-
-- Telegram-источников, где нужен доступ через Telegram API
-- приватных каналов, групп и веток
-- `deep media check`
-- отправки списка рабочих прокси в `Избранное`
-
-Сессия пользователя хранится локально и в зашифрованном виде.
-
-## Источники
+```text
+tg://socks?server=127.0.0.1&port=10808
+```
 
 Поддерживаются:
 
-- веб-страницы с прямыми `https://t.me/proxy?...`
-- публичные Telegram-страницы `https://t.me/s/...`
-- Telegram API-источники вида `https://t.me/<channel>`
-- Telegram API-источники вида `https://t.me/<channel>/<message_id>`
-- Telegram API-ветки и сообщения из групп, если у аккаунта есть доступ
+- `vless://`
+- `vmess://`
+- `trojan://`
+- `hysteria://`
+- `hy2://`
+
+VLESS/VMess/Trojan запускаются через `xray`, Hysteria/Hysteria2 - через `sing-box`. Бинарники `xray` и `sing-box` должны поставляться вместе с приложением.
+
+Что делает режим:
+
+- скачивает подписки;
+- декодирует base64 и raw line lists;
+- парсит `vless`, `vmess`, `trojan`, `hysteria`, `hy2`;
+- удаляет дубли по protocol, host, port и credential;
+- проверяет ноды через временный local SOCKS;
+- выбирает лучший accepted сервер;
+- запускает постоянный local SOCKS только для Telegram.
+
+Health-check:
+
+- ping `< 200 ms` - ничего не делает;
+- ping `200-259 ms` - быстрая проверка уже найденных accepted серверов без обновления подписок;
+- ping `>= 260 ms` - полное обновление подписок;
+- если активная нода не отвечает - полный refresh с cooldown.
+
+## Локальный прокси
+
+Режим локального TG WebSocket/MTProto proxy. Эта часть основана на проекте Flowseal:
+
+```text
+https://github.com/Flowseal/tg-ws-proxy
+```
+
+В основной код перенесена нужная runtime-логика, поэтому приложение не зависит от исходной папки Flowseal во время работы.
+
+По умолчанию локальный proxy слушает:
+
+```text
+127.0.0.1:1443
+```
+
+Прокси для авторизации и парса Telegram-источников по умолчанию:
+
+```text
+tg://proxy?server=127.0.0.1&port=1443&secret=dd274763e0d711fd394e833938dd93c8c3
+```
+
+Режим поддерживает:
+
+- MTProto handshake parsing;
+- WebSocket bridge;
+- Fake TLS secret;
+- Cloudflare proxy fallback;
+- DC IP routing;
+- локальную статистику и логирование.
+
+## Настройки
+
+### Общие
+
+- `Запускать вместе с Windows` - добавляет приложение в автозапуск.
+- `Запускать свернутым` - открывает приложение сразу в трее.
+- `Проверять обновления при запуске` - проверяет наличие нового релиза.
+- `Тема` - светлая, темная или авто.
+- `При закрытии окна` - закрывать приложение, сворачивать в трей или спрашивать.
+- `GitHub hosts` - строки hosts для доступа приложения к GitHub, raw.githubusercontent.com и release-assets.
+- `Telegram hosts` - строки hosts для Telegram-сервисов, которые использует приложение.
+
+### Маршрутизация
+
+- `Режим приложения` - выбранный активный режим. Синхронизирован с главным экраном.
+- `Стратегия выбора upstream` - как выбирать рабочий сервер из списка.
+- `Manual upstream` - ручной выбор конкретного сервера из списка.
+
+### Источники
+
+- `WEB-источники` - сайты и публичные страницы, откуда приложение собирает MTProto proxy.
+- `Telegram-источники` - каналы, группы и ветки, которые парсятся через Telegram API после авторизации.
+- `Прокси для авторизации` - proxy, через который выполняется вход в Telegram и парс Telegram-источников.
+- `Deep media check` - дополнительная проверка Telegram media/CDN через аккаунт.
+- `sing-box подписки` - подписки с `vless`, `vmess`, `trojan`, `hysteria`, `hy2`.
 
 ## Файлы результата
 
-- `list/proxy_list.txt` — рабочие MTProto-прокси
-- `list/all_list.txt` — все найденные MTProto-прокси
-- `list/rejected_list.txt` — отсеянные MTProto-прокси
-- `list/fast_list.txt` — быстрый поднабор лучших прокси, который приложение использует первым при старте
-- `list/report.json` — подробный отчет
-- `list/source_audit.txt` — сводка по источникам: сколько прокси найдено, принято и отклонено
+- `list/proxy_list.txt` - рабочие MTProto proxy.
+- `list/all_list.txt` - все найденные MTProto proxy.
+- `list/rejected_list.txt` - отклоненные MTProto proxy.
+- `list/tg_parsed_proxy.txt` - proxy, найденные через Telegram API.
+- `list/report.json` - подробный отчет по проверке.
+- `list/source_audit.txt` - статистика по источникам.
+- `list/xray_working.json` - рабочие nodes для режима `sing-box`.
+- `list/xray_rejected.json` - отклоненные nodes для режима `sing-box`.
 
-## Стратегии выбора upstream
+## Частые проблемы
 
-- `Round robin` — распределяет новые подключения по кругу между рабочими прокси.
-- `Consistent hash` — привязывает похожие сессии к одному upstream, чтобы меньше дергать маршрут.
-- `Sticky session` — закрепляет активную сессию за одним upstream и меняет его только при проблемах.
+### Telegram бесконечно пишет "соединение"
 
-При старте приложение сначала берет прокси из `list/fast_list.txt`, если файл существует и содержит рабочие записи.
+1. Убедитесь, что выбранный режим запущен.
+2. Нажмите `Обновить`.
+3. В режиме `Подбор прокси` откройте список proxy и выберите другой upstream.
+4. В режиме `sing-box` выберите другой node или запустите полное обновление.
+5. Проверьте локальный адрес в Telegram.
 
-## Обновления
+Для `Подбор прокси` и `Локальный прокси`:
 
-Новый релизный формат использует установщики:
+```text
+127.0.0.1:1443
+```
 
-- Windows: `MTProxyAutoSwitch-Setup.exe`
-- macOS: `MTProxyAutoSwitch.pkg`
+Для `sing-box`:
 
-Переходный режим для старых клиентов сохранен:
+```text
+127.0.0.1:10808
+```
 
-- Windows-релиз по-прежнему публикует `MTProxyAutoSwitch.zip`
-- старые portable-клиенты могут обновиться через legacy ZIP-канал
-- после этого новые версии будут предпочитать установщик
+### Не работает sing-box
 
-На macOS основной канал обновления тоже ориентирован на установщик. Старые сборки, которые не умели ставиться автоматически, могут потребовать один ручной переход на `.pkg`.
+Проверьте:
 
-## Сборка Windows
+- в сборке есть `xray.exe` и `sing-box.exe`;
+- порт `10808` не занят другим приложением;
+- подписки доступны;
+- в списке nodes есть accepted серверы;
+- активный node не показывает высокий ping или нулевую скорость.
 
-Требование: установленный Inno Setup 6 (`ISCC.exe`).
+### После закрытия приложения остался SOCKS5
+
+Новые версии при выходе останавливают дерево процесса `xray/sing-box` и чистят старые зависшие core-процессы при следующем запуске. Если процесс остался от старой версии, перезапустите приложение и закройте его через `Выход`.
+
+### Telegram-каналы не парсятся
+
+Проверьте:
+
+- выполнена авторизация Telegram;
+- включены Telegram-источники;
+- включен `Прокси для авторизации`;
+- локальный proxy `127.0.0.1:1443` работает;
+- аккаунт имеет доступ к приватному каналу, группе или ветке.
+
+### Не работает обновление приложения
+
+В некоторых регионах GitHub может открываться нестабильно. Откройте `Настройки` -> `Общие` и используйте блок `GitHub hosts`.
+
+## Где хранятся данные
+
+Windows:
+
+- приложение: `%LOCALAPPDATA%\Programs\MTProxy AutoSwitch`
+- пользовательские данные: `%APPDATA%\MTProxyAutoSwitch`
+
+macOS:
+
+- приложение: `/Applications/MTProxyAutoSwitch.app`
+- пользовательские данные: `~/Library/Application Support/MTProxyAutoSwitch`
+
+Это позволяет обновлять приложение без потери настроек, Telegram-сессии и сохраненных списков.
+
+## Сборка
+
+Требования:
+
+- Python 3.11+
+- зависимости из `requirements.txt`
+
+Установка зависимостей:
+
+```bash
+pip install -r requirements.txt
+```
+
+Windows build:
 
 ```bat
 build_release.bat
 ```
 
-Результат:
-
-```text
-release-public\MTProxyAutoSwitch-Setup.exe
-release-public\MTProxyAutoSwitch.zip
-```
-
-`MTProxyAutoSwitch-Setup.exe` — основной установщик. Он:
-
-- ставит приложение в `%LOCALAPPDATA%\Programs\MTProxy AutoSwitch`
-- добавляет ярлык в меню `Пуск`
-- может добавить ярлык на рабочий стол
-- регистрирует удаление приложения
-
-`MTProxyAutoSwitch.zip` сохраняется как legacy-канал для старых portable-клиентов, чтобы переход на установочный формат не сломал автообновление.
-
-## Сборка macOS
-
-Сборку нужно выполнять на самой macOS.
+macOS build:
 
 ```bash
 chmod +x build_release_macos.sh
 ./build_release_macos.sh
 ```
 
-Результат:
+## Ссылки
 
-```text
-release-macos/MTProxyAutoSwitch.app
-release-macos/MTProxyAutoSwitch.pkg
-```
-
-`MTProxyAutoSwitch.pkg` — основной установщик для macOS. Он ставит приложение в `/Applications`, после чего оно появляется в списке приложений и Launchpad.
-
-## Зависимости для сборки
-
-- Python 3.11+
-- `pip install -r requirements.txt`
-
-Windows:
-
-- Inno Setup 6
-
-macOS:
-
-- Xcode Command Line Tools
-- `pkgbuild`
-
-Релизные скрипты ставят Python-зависимости автоматически, включая `PySide6`, `telethon`, `cryptography` и `pillow`.
-
-## Публикация релиза
-
-Для GitHub Release нужно выкладывать:
-
-- Windows: `MTProxyAutoSwitch-Setup.exe`
-- Windows legacy: `MTProxyAutoSwitch.zip`
-- macOS: `MTProxyAutoSwitch.pkg`
-
-Если нужно сохранить ручную установку drag-and-drop для тестов на macOS, можно дополнительно прикладывать `.app` или отдельный `.dmg`, но основным каналом должен оставаться `.pkg`.
-
-## Авторы
-
-- оригинальный проект Flowseal: `https://github.com/Flowseal/tg-ws-proxy`
+- Flowseal tg-ws-proxy: `https://github.com/Flowseal/tg-ws-proxy`
+- Xray-core: `https://github.com/XTLS/Xray-core`
+- sing-box: `https://github.com/SagerNet/sing-box`
 - Telegram автора: `https://t.me/peppe_poppo`

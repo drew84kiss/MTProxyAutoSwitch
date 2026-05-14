@@ -736,8 +736,11 @@ class MainWindow(QMainWindow):
         self.update_release: Any | None = None
         self.alert_overlay: QWidget | None = None
         self._quitting = False
+        self._runtime_shutdown_done = False
         self.tray_menu: QMenu | None = None
         self._tray_menu_state: tuple[object, ...] | None = None
+        self.tray_actions: dict[str, QAction] = {}
+        self.tray_mode_actions: dict[str, QAction] = {}
         self._settings_refreshing = False
         self._settings_baseline: AppConfig | None = None
         self._last_proxy_page_refresh_at = 0.0
@@ -760,6 +763,7 @@ class MainWindow(QMainWindow):
         self.bridge.task_done.connect(self._on_task_done)
         self.bridge.task_failed.connect(self._on_task_failed)
         self.runtime = AppRuntime(log_sink=self._runtime_log, event_sink=self._runtime_event)
+        QApplication.instance().aboutToQuit.connect(self._shutdown_runtime)
         self.runtime.config.autostart_enabled = is_autostart_enabled()
         self._theme_name = _resolve_theme(self.runtime.config.appearance)
         QApplication.instance().setStyleSheet(THEMES[self._theme_name]["qss"])
@@ -773,6 +777,11 @@ class MainWindow(QMainWindow):
         self.snapshot_timer.setInterval(1000)
         self.snapshot_timer.timeout.connect(self._refresh_snapshot)
         self.snapshot_timer.start()
+
+        self.tray_watchdog_timer = QTimer(self)
+        self.tray_watchdog_timer.setInterval(5000)
+        self.tray_watchdog_timer.timeout.connect(self._ensure_tray_alive)
+        self.tray_watchdog_timer.start()
 
         self.telegram_code_timer = QTimer(self)
         self.telegram_code_timer.setInterval(1000)
@@ -1813,7 +1822,7 @@ class MainWindow(QMainWindow):
 
         self.telegram_api_proxy_enabled = QCheckBox("Прокси для авторизации")
         self.telegram_api_proxy_enabled.toggled.connect(self._update_telegram_api_proxy_ui)
-        self.telegram_api_proxy_enabled.setToolTip("Использовать proxy только для входа в Telegram.")
+        self.telegram_api_proxy_enabled.setToolTip("Использовать proxy для входа в Telegram и парса Telegram-источников.")
         setup_layout.addWidget(self.telegram_api_proxy_enabled)
         self.telegram_api_proxy_panel = QWidget()
         self.telegram_api_proxy_panel.setObjectName("transparentPanel")
@@ -1887,9 +1896,6 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(16, 16, 16, 16)
         form.addWidget(self._label("Web-источники", size=16, bold=True))
         form.addWidget(self._label("Списки MTProto proxy, которые проверяются при обновлении.", size=11, soft=True))
-        enable_all = self._button("Включить все источники", soft=True)
-        enable_all.clicked.connect(lambda: (self._set_list_values(self.source_list, list(DEFAULT_SOURCES)), self._settings_form_changed()))
-        form.addWidget(enable_all)
         self.source_checks: dict[str, QCheckBox] = {}
         source_editor, self.source_list, self.source_input = self._list_editor(
             placeholder="https://example.com/proxy-list",
@@ -1923,7 +1929,7 @@ class MainWindow(QMainWindow):
         self.workers = self._spin(1, 200)
         self.max_latency = self._spin(50, 10000)
         self.live_probe_top_n = self._spin(1, 200)
-        self.source_list.setToolTip("Web-источники, из которых собираются MTProto proxy.")
+        self.source_list.setToolTip("Web-источники, из которых собираются MTProto proxy. Источник mtproxytg mirrors проверяет зеркала mtproxytg2..10 и останавливается на первом рабочем.")
         self.duration.setToolTip("Длительность проверки proxy в секундах.")
         self.timeout.setToolTip("Таймаут сетевого подключения при проверке.")
         self.workers.setToolTip("Количество параллельных проверок.")
@@ -2261,55 +2267,91 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(_asset_icon(), self)
         self.tray.setToolTip(APP_NAME)
         self.tray.activated.connect(self._tray_activated)
-        self._refresh_tray_menu()
+        self._create_tray_menu()
         self.tray.show()
+        self._refresh_tray_menu(force=True)
 
-    def _refresh_tray_menu(self, *, force: bool = False) -> None:
-        snapshot = self.runtime.snapshot()
-        menu_state = (bool(snapshot.get("local_running")), bool(self.refresh_in_progress), str(self.runtime.config.active_mode))
-        if not force and self._tray_menu_state == menu_state:
-            return
-        if self.tray_menu is not None and self.tray_menu.isVisible():
-            return
-        old_menu = self.tray_menu
+    def _create_tray_menu(self) -> None:
+        self.tray_actions.clear()
+        self.tray_mode_actions.clear()
         menu = QMenu(self)
         show_action = QAction("Открыть", self)
         show_action.triggered.connect(self.show_from_tray)
         menu.addAction(show_action)
+        self.tray_actions["show"] = show_action
+
         copy_action = QAction("Скопировать ссылку", self)
         copy_action.triggered.connect(self.copy_local_link)
         menu.addAction(copy_action)
+        self.tray_actions["copy"] = copy_action
+
         connect_action = QAction("Подключиться", self)
         connect_action.triggered.connect(self.connect_local_proxy)
         menu.addAction(connect_action)
+        self.tray_actions["connect"] = connect_action
+
         modes_menu = QMenu("Режим", self)
         for mode in ("mtproxy_picker", "xray_core", "tg_ws_proxy"):
             mode_action = QAction(MODE_LABELS.get(mode, mode), self)
             mode_action.setCheckable(True)
-            mode_action.setChecked(self.runtime.config.active_mode == mode)
             mode_action.triggered.connect(
                 lambda checked=False, selected=mode: self.change_active_mode(MODE_LABELS.get(selected, selected))
             )
             modes_menu.addAction(mode_action)
+            self.tray_mode_actions[mode] = mode_action
         menu.addMenu(modes_menu)
+
         restart_action = QAction("Перезапустить текущий режим", self)
         restart_action.triggered.connect(self.restart_active_mode)
         menu.addAction(restart_action)
-        if self.refresh_in_progress:
-            refresh = QAction("Отменить обновление", self)
-            refresh.triggered.connect(self.cancel_refresh)
-        else:
-            refresh = QAction("Обновить", self)
-            refresh.triggered.connect(self.start_refresh)
-        menu.addAction(refresh)
+        self.tray_actions["restart"] = restart_action
+
+        refresh_action = QAction("Обновить", self)
+        refresh_action.triggered.connect(self._tray_refresh_action)
+        menu.addAction(refresh_action)
+        self.tray_actions["refresh"] = refresh_action
+
         quit_action = QAction("Выход", self)
         quit_action.triggered.connect(lambda: self.quit_application(force=True))
         menu.addAction(quit_action)
+        self.tray_actions["quit"] = quit_action
+
         self.tray_menu = menu
-        self._tray_menu_state = menu_state
         self.tray.setContextMenu(self.tray_menu)
-        if old_menu is not None:
-            old_menu.deleteLater()
+
+    def _tray_refresh_action(self) -> None:
+        if self.refresh_in_progress:
+            self.cancel_refresh()
+        else:
+            self.start_refresh()
+
+    def _refresh_tray_menu(self, *, force: bool = False) -> None:
+        if self.tray_menu is None or not hasattr(self, "tray") or self.tray.contextMenu() is None:
+            self._create_tray_menu()
+        snapshot = self.runtime.snapshot()
+        menu_state = (bool(snapshot.get("local_running")), bool(self.refresh_in_progress), str(self.runtime.config.active_mode))
+        if not force and self._tray_menu_state == menu_state:
+            return
+        refresh_action = self.tray_actions.get("refresh")
+        if refresh_action is not None:
+            refresh_action.setText("Отменить обновление" if self.refresh_in_progress else "Обновить")
+        for mode, action in self.tray_mode_actions.items():
+            action.setChecked(self.runtime.config.active_mode == mode)
+        self._tray_menu_state = menu_state
+
+    def _ensure_tray_alive(self) -> None:
+        if self._quitting:
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        if not hasattr(self, "tray") or self.tray is None:
+            self._build_tray()
+            return
+        if self.tray.contextMenu() is None:
+            self._create_tray_menu()
+        self.tray.setIcon(_asset_icon())
+        self.tray.setToolTip(APP_NAME)
+        self.tray.show()
 
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
@@ -2818,7 +2860,7 @@ class MainWindow(QMainWindow):
             return
         self.run_task("stop_local", self.runtime.stop_active_mode)
 
-    def start_refresh(self) -> None:
+    def start_refresh(self, checked: bool = False, *, manual: bool = True) -> None:
         if self.refresh_in_progress:
             self.cancel_refresh()
             return
@@ -2838,7 +2880,7 @@ class MainWindow(QMainWindow):
 
         def worker() -> None:
             try:
-                self.runtime.refresh_active_mode(cancel_event=self.refresh_cancel_event)
+                self.runtime.refresh_active_mode(cancel_event=self.refresh_cancel_event, manual=manual)
                 self.bridge.task_done.emit("refresh", True)
             except Exception as exc:
                 self.bridge.task_failed.emit("refresh", str(exc))
@@ -2880,7 +2922,7 @@ class MainWindow(QMainWindow):
                 self.restart_active_mode()
             return
         if int(snapshot.get("working_count") or 0) <= 0 and not self.refresh_in_progress:
-            self.start_refresh()
+            self.start_refresh(manual=False)
         elif snapshot.get("pool_rows") and not snapshot.get("local_running"):
             self.start_local_proxy()
 
@@ -3065,7 +3107,12 @@ class MainWindow(QMainWindow):
             self.progress.setVisible(True)
             self.progress.setValue(80)
             threshold = int(float(payload.get("threshold_ms") or 200))
-            self.progress_text.setText(f"sing-box: пинг выше {threshold} ms, обновляю список в фоне")
+            self.progress_text.setText(f"sing-box: пинг выше {threshold} ms, полное обновление в фоне")
+        elif event_name == "xray_background_quick_sort_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            latency = _format_latency(payload.get("latency_ms"))
+            self.progress_text.setText(f"sing-box: пинг {latency}, выбираю более быстрый сервер")
         elif event_name == "xray_background_refresh_failed":
             self.progress.setVisible(True)
             self.progress.setValue(0)
@@ -3074,6 +3121,15 @@ class MainWindow(QMainWindow):
             if not self.refresh_in_progress and not self.busy_task_names:
                 latency = _format_latency(payload.get("latency_ms"))
                 self.progress_text.setText(f"sing-box: текущий пинг {latency}")
+        elif event_name == "mtproxy_background_quick_sort_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            latency = _format_latency(payload.get("latency_ms"))
+            self.progress_text.setText(f"Подбор прокси: пинг {latency}, выбираю более быстрый сервер")
+        elif event_name == "mtproxy_health":
+            if not self.refresh_in_progress and not self.busy_task_names:
+                latency = _format_latency(payload.get("latency_ms"))
+                self.progress_text.setText(f"Подбор прокси: текущий пинг {latency}")
         elif event_name == "xray_refresh_complete":
             self.progress.setVisible(True)
             total = int(payload.get("total") or 0)
@@ -3636,6 +3692,10 @@ class MainWindow(QMainWindow):
         )
 
     def hide_to_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.show_warning("Трей недоступен", "Windows сейчас не отдает системный трей. Окно останется открытым, чтобы приложение не потерялось.")
+            return
+        self._ensure_tray_alive()
         self.hide()
         if self.tray.isVisible():
             self.tray.showMessage(APP_NAME, "Приложение продолжает работать в трее", QSystemTrayIcon.Information, 1800)
@@ -3680,11 +3740,17 @@ class MainWindow(QMainWindow):
         else:
             self.quit_application(force=True)
 
-    def quit_application(self, *, force: bool = False) -> None:
-        self._quitting = True
+    def _shutdown_runtime(self) -> None:
+        if self._runtime_shutdown_done:
+            return
+        self._runtime_shutdown_done = True
         self.refresh_cancel_event.set()
         with contextlib.suppress(Exception):
             self.runtime.shutdown()
+
+    def quit_application(self, *, force: bool = False) -> None:
+        self._quitting = True
+        self._shutdown_runtime()
         with contextlib.suppress(Exception):
             self.tray.hide()
         QApplication.instance().quit()
@@ -3707,6 +3773,8 @@ def main() -> None:
     try:
         sys.exit(app.exec())
     finally:
+        with contextlib.suppress(Exception):
+            window._shutdown_runtime()
         _release_single_instance(single_instance_handle)
 
 

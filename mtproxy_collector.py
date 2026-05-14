@@ -39,10 +39,13 @@ DEFAULT_SOURCES = [
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
-    "https://mtproxytg2.vercel.app/",
+    "mtproxytg mirrors",
     "https://t.me/s/mtpro_xyz",
     "https://t.me/s/ProxyFree_Ru",
 ]
+
+MTPROXYTG_MIRROR_GROUP = "mtproxytg mirrors"
+MTPROXYTG_MIRRORS = [f"https://mtproxytg{index}.vercel.app/" for index in range(2, 11)]
 
 LIST_DIR_NAME = "list"
 LIST_FILE_NAME = "proxy_list.txt"
@@ -732,6 +735,55 @@ def scrape_source(
     return summary
 
 
+def is_mtproxytg_mirror_group(source_url: str) -> bool:
+    return str(source_url or "").strip().lower() in {
+        MTPROXYTG_MIRROR_GROUP,
+        "mtproxytg",
+        "mtproxytg-mirrors",
+        "mtproxytg mirrors",
+    }
+
+
+def scrape_mtproxytg_mirrors(
+    fetcher: Fetcher,
+    registry: dict[tuple[str, int, str], ProxyRecord],
+    socks5_registry: dict[tuple[str, int, str, str], Socks5Record],
+    visited_data_urls: set[str],
+    *,
+    verbose: bool,
+    log_sink: LogSink | None,
+) -> SourceSummary:
+    group_summary = SourceSummary(source_url=MTPROXYTG_MIRROR_GROUP)
+    for mirror_url in MTPROXYTG_MIRRORS:
+        mirror_summary = scrape_source(
+            source_url=mirror_url,
+            fetcher=fetcher,
+            registry=registry,
+            socks5_registry=socks5_registry,
+            visited_data_urls=visited_data_urls,
+            verbose=verbose,
+            log_sink=log_sink,
+        )
+        group_summary.fetched_urls.extend(mirror_summary.fetched_urls)
+        group_summary.errors.extend(f"{mirror_url}: {error}" for error in mirror_summary.errors)
+        group_summary.mtproxy_found += mirror_summary.mtproxy_found
+        group_summary.mtproxy_new += mirror_summary.mtproxy_new
+        group_summary.mtproxy_duplicate += mirror_summary.mtproxy_duplicate
+        group_summary.socks5_found += mirror_summary.socks5_found
+        group_summary.socks5_new += mirror_summary.socks5_new
+        group_summary.socks5_duplicate += mirror_summary.socks5_duplicate
+        group_summary.script_urls_found += mirror_summary.script_urls_found
+        group_summary.data_urls_found += mirror_summary.data_urls_found
+        if mirror_summary.mtproxy_found > 0 or mirror_summary.socks5_found > 0:
+            log(
+                f"[source] mtproxytg mirror selected: {mirror_url}",
+                verbose=verbose,
+                sink=log_sink,
+            )
+            break
+    return group_summary
+
+
 def create_probe_client(proxy: ProxyRecord, timeout: float) -> TelegramClient:
     connection = ConnectionTcpMTProxyRandomizedIntermediate
     proxy_tuple = (proxy.host, proxy.port, proxy.secret)
@@ -1158,15 +1210,25 @@ def run_collection(
             total=len(config.sources),
         )
 
-        summary = scrape_source(
-            source_url=source_url,
-            fetcher=fetcher,
-            registry=registry,
-            socks5_registry=socks5_registry,
-            visited_data_urls=visited_data_urls,
-            verbose=config.verbose,
-            log_sink=log_sink,
-        )
+        if is_mtproxytg_mirror_group(source_url):
+            summary = scrape_mtproxytg_mirrors(
+                fetcher=fetcher,
+                registry=registry,
+                socks5_registry=socks5_registry,
+                visited_data_urls=visited_data_urls,
+                verbose=config.verbose,
+                log_sink=log_sink,
+            )
+        else:
+            summary = scrape_source(
+                source_url=source_url,
+                fetcher=fetcher,
+                registry=registry,
+                socks5_registry=socks5_registry,
+                visited_data_urls=visited_data_urls,
+                verbose=config.verbose,
+                log_sink=log_sink,
+            )
         source_summaries.append(summary)
 
         log(

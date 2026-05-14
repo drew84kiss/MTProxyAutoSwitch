@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import contextlib
 import hashlib
@@ -30,6 +31,10 @@ DEFAULT_XRAY_SUBSCRIPTIONS = [
     "https://mifa.world/trojan",
     "https://mifa.world/hysteria",
     "https://mifa.world/vmess",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
 ]
 
 TELEGRAM_PROBE_TARGETS = [
@@ -48,6 +53,7 @@ XRAY_SPEED_TEST_BYTES = 262144
 
 XRAY_PROTOCOLS = {"vless", "vmess", "trojan"}
 SING_BOX_PROTOCOLS = {"hysteria", "hysteria2", "hy2"}
+XRAY_GOOD_DOWNLOAD_KBPS = 512.0
 
 
 @dataclass
@@ -141,6 +147,9 @@ class XrayCoreRuntime:
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._config_path: str = ""
+        self._pid_path = self.out_dir / "xray_runtime.pid"
+        self._cleanup_stale_processes()
+        atexit.register(self.stop)
         self.active_result: XrayProbeResult | None = None
         self.last_working: list[XrayProbeResult] = []
         self.last_rejected: list[XrayProbeResult] = []
@@ -191,17 +200,54 @@ class XrayCoreRuntime:
         with self._lock:
             proc = self._process
             if proc is not None and proc.poll() is None:
-                proc.terminate()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=timeout)
-                if proc.poll() is None:
-                    proc.kill()
+                _terminate_process_tree(proc, timeout=timeout)
+            elif proc is None:
+                stale_pid = self._read_pid_file()
+                if stale_pid:
+                    _terminate_pid_tree(stale_pid, timeout=timeout)
             self._process = None
+            self._unlink_pid_file()
             if self._config_path:
                 with contextlib.suppress(Exception):
                     Path(self._config_path).unlink(missing_ok=True)
                 self._config_path = ""
             self._emit("xray_state", running=False)
+
+    def _read_pid_file(self) -> int | None:
+        try:
+            payload = json.loads(self._pid_path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid") or 0)
+            return pid if pid > 0 else None
+        except Exception:
+            return None
+
+    def _write_pid_file(self, proc: subprocess.Popen, config_path: str, binary: str) -> None:
+        with contextlib.suppress(Exception):
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            self._pid_path.write_text(
+                json.dumps(
+                    {
+                        "pid": int(proc.pid),
+                        "binary": str(binary),
+                        "config": str(config_path),
+                        "started_at": time.time(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+    def _unlink_pid_file(self) -> None:
+        with contextlib.suppress(Exception):
+            self._pid_path.unlink(missing_ok=True)
+
+    def _cleanup_stale_processes(self) -> None:
+        stale_pid = self._read_pid_file()
+        if stale_pid:
+            _terminate_pid_tree(stale_pid, timeout=2.0)
+            self._unlink_pid_file()
+        _cleanup_stale_bundle_cores(self.root_dir, self.out_dir)
 
     def restart(self) -> bool:
         self.stop()
@@ -527,11 +573,7 @@ class XrayCoreRuntime:
             return XrayProbeResult(node, False, str(exc), None, 0, TELEGRAM_XRAY_PROBE_TOTAL, node.runtime)
         finally:
             if proc is not None and proc.poll() is None:
-                proc.terminate()
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
-                if proc.poll() is None:
-                    proc.kill()
+                _terminate_process_tree(proc, timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
             if config_path:
                 with contextlib.suppress(Exception):
                     Path(config_path).unlink(missing_ok=True)
@@ -587,11 +629,7 @@ class XrayCoreRuntime:
             return XrayProbeResult(node, False, str(exc), None, 0, len(TELEGRAM_DCS), node.runtime)
         finally:
             if proc is not None and proc.poll() is None:
-                proc.terminate()
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
-                if proc.poll() is None:
-                    proc.kill()
+                _terminate_process_tree(proc, timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
             if config_path:
                 with contextlib.suppress(Exception):
                     Path(config_path).unlink(missing_ok=True)
@@ -609,8 +647,10 @@ class XrayCoreRuntime:
             creationflags=_subprocess_no_window(),
         )
         self._config_path = config_path
+        self._write_pid_file(self._process, config_path, binary)
         time.sleep(0.5)
         if self._process.poll() is not None:
+            self._unlink_pid_file()
             raise RuntimeError(f"{node.runtime} exited during startup")
 
     def _build_config(self, node: XrayNode, port: int) -> dict[str, Any]:
@@ -708,10 +748,16 @@ def _reason_counts(results: list[XrayProbeResult]) -> dict[str, int]:
     return dict(Counter(str(item.reason or "unknown") for item in results))
 
 
-def _xray_result_sort_key(item: XrayProbeResult) -> tuple[float, str]:
+def _xray_result_sort_key(item: XrayProbeResult) -> tuple[int, float, float, str]:
     latency = item.dc_latency_ms if item.dc_latency_ms is not None else item.latency_ms
-    speed_bonus = float(item.download_kbps or 0.0) / 100_000.0
-    return ((latency if latency is not None else 10_000_000.0) - speed_bonus, item.node.raw_url)
+    speed = float(item.download_kbps or 0.0)
+    speed_bucket = 0 if speed >= XRAY_GOOD_DOWNLOAD_KBPS else 1 if speed > 0 else 2
+    return (
+        speed_bucket,
+        latency if latency is not None else 10_000_000.0,
+        -speed,
+        item.node.raw_url,
+    )
 
 
 def _normalize_selection_strategy(strategy: str) -> str:
@@ -1025,10 +1071,114 @@ def _sing_box_config(node: XrayNode, listen_host: str, listen_port: int) -> dict
 
 
 def _write_temp_config(config: dict[str, Any]) -> str:
-    handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    handle = tempfile.NamedTemporaryFile("w", prefix="mtproxy-autoswitch-core-", suffix=".json", delete=False, encoding="utf-8")
     with handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
     return handle.name
+
+
+def _terminate_process_tree(proc: subprocess.Popen, *, timeout: float = 5.0) -> None:
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(Exception):
+        proc.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=max(0.1, timeout))
+    if proc.poll() is None:
+        _terminate_pid_tree(int(proc.pid), timeout=max(1.0, timeout))
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=1.0)
+
+
+def _terminate_pid_tree(pid: int, *, timeout: float = 5.0) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(1.0, timeout),
+                creationflags=_subprocess_no_window(),
+                check=False,
+            )
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, 15)
+    deadline = time.monotonic() + max(0.1, timeout)
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, 9)
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            output = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2.0,
+                creationflags=_subprocess_no_window(),
+                check=False,
+            ).stdout
+            return str(pid) in output
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _cleanup_stale_bundle_cores(root_dir: Path, out_dir: Path) -> None:
+    if os.name != "nt":
+        return
+    roots = [root_dir.resolve()]
+    bundle_root = Path(str(getattr(sys, "_MEIPASS", "") or ""))
+    if bundle_root:
+        with contextlib.suppress(Exception):
+            roots.append(bundle_root.resolve())
+    module_root = Path(__file__).resolve().parent
+    with contextlib.suppress(Exception):
+        roots.append(module_root.resolve())
+    root_literals = []
+    for root in roots:
+        text = str(root)
+        if text and text not in root_literals:
+            root_literals.append(text)
+    if not root_literals:
+        return
+    ps_roots = "@(" + ",".join("'" + item.replace("'", "''") + "'" for item in root_literals) + ")"
+    script = f"""
+$roots = {ps_roots}
+Get-CimInstance Win32_Process |
+  Where-Object {{
+    $exe = $_.ExecutablePath
+    ($_.Name -in @('xray.exe','sing-box.exe')) -and
+    ($_.CommandLine -match ' run -c ') -and
+    ($_.CommandLine -match 'mtproxy-autoswitch-core-|tmp[a-z0-9]+\\.json') -and
+    ($roots | Where-Object {{ $exe -like ($_.TrimEnd('\\') + '\\*') }})
+  }} |
+  ForEach-Object {{ taskkill /PID $_.ProcessId /T /F | Out-Null }}
+"""
+    with contextlib.suppress(Exception):
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4.0,
+            creationflags=_subprocess_no_window(),
+            check=False,
+        )
 
 
 def _resolve_binary(override_path: str, root_dir: Path, name: str) -> str:

@@ -16,6 +16,8 @@ from mtproxy_collector import (
     CollectorConfig,
     CollectorRunResult,
     DEFAULT_SOURCES,
+    MTPROXYTG_MIRROR_GROUP,
+    MTPROXYTG_MIRRORS,
     ProbeOutcome,
     ProbeSettings,
     ProxyRecord,
@@ -138,18 +140,29 @@ def _clean_api_hash(value: object) -> str:
 DEFAULT_MAX_PROXIES = 500
 DEFAULT_DEEP_MEDIA_TOP_N = 0
 DEFAULT_FAST_LIST_LIMIT = 24
-XRAY_AUTO_REFRESH_LATENCY_MS = 200.0
+XRAY_QUICK_SWITCH_LATENCY_MS = 200.0
+XRAY_FULL_REFRESH_LATENCY_MS = 260.0
 XRAY_HEALTH_INTERVAL_SEC = 20.0
-XRAY_AUTO_REFRESH_COOLDOWN_SEC = 90.0
+XRAY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
+XRAY_AUTO_REFRESH_COOLDOWN_SEC = 180.0
+MTPROXY_QUICK_SWITCH_LATENCY_MS = 200.0
+MTPROXY_FULL_REFRESH_LATENCY_MS = 260.0
+MTPROXY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
+MTPROXY_AUTO_REFRESH_COOLDOWN_SEC = 180.0
+TELEGRAM_SOURCE_AUTO_REFRESH_INTERVAL_SEC = 24 * 60 * 60
 FAST_LIST_FILE_NAME = "fast_list.txt"
+TG_PARSED_FILE_NAME = "tg_parsed_proxy.txt"
 DEFAULT_LOCAL_SECRET = "274763e0d711fd394e833938dd93c8c3"
 OLD_DEFAULT_TELEGRAM_API_PROXY_URL = (
     "https://t.me/proxy?server=max.ru.rightarion.ru&port=443"
     "&secret=eedcaae509a2455bbfc6165f1708fd5c586d61782e7275"
 )
-DEFAULT_TELEGRAM_API_PROXY_URL = (
+OLD_DEFAULT_TELEGRAM_API_PROXY_URL_2 = (
     "https://t.me/proxy?server=myrka.bronstein.ar&port=8443"
     "&secret=eea37385d8a4bbf632eabc9091fdc95a9c6d79726b612e62726f6e737465696e2e6172"
+)
+DEFAULT_TELEGRAM_API_PROXY_URL = (
+    f"tg://proxy?server=127.0.0.1&port=1443&secret=dd{DEFAULT_LOCAL_SECRET}"
 )
 BALANCER_STRATEGIES = {
     "round_robin",
@@ -208,7 +221,7 @@ class AppConfig:
     auto_update_enabled: bool = True
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
-    telegram_api_proxy_enabled: bool = False
+    telegram_api_proxy_enabled: bool = True
     telegram_api_proxy_url: str = DEFAULT_TELEGRAM_API_PROXY_URL
     telegram_phone: str = ""
     telegram_session_file: str = "telegram_user.sec"
@@ -333,6 +346,9 @@ class AppRuntime:
         self._latest_deep_media_scores: dict[tuple[str, int, str], MediaProbeResult] = {}
         self.telegram_lock = threading.RLock()
         self._last_quick_probe_at: float = 0.0
+        self._last_mtproxy_health_at: float = 0.0
+        self._last_mtproxy_quick_sort_at: float = 0.0
+        self._last_mtproxy_auto_refresh_at: float = 0.0
         self._refresh_in_progress = threading.Event()
         with contextlib.suppress(Exception):
             stale_cache_path = self.state_dir / "proxy_list_persist.txt"
@@ -348,6 +364,7 @@ class AppRuntime:
         self._last_heavy_upload_at: float = 0.0
         self._last_media_accel_probe_at: float = 0.0
         self._last_xray_health_at: float = 0.0
+        self._last_xray_quick_sort_at: float = 0.0
         self._last_xray_auto_refresh_at: float = 0.0
         self._xray_high_latency_streak: int = 0
         self._xray_restart_attempted_at: float = 0.0
@@ -499,7 +516,7 @@ class AppRuntime:
             normalized.local_secret = DEFAULT_LOCAL_SECRET
         normalized.auto_start_local = True
         normalized.telegram_api_proxy_url = str(normalized.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL).strip()
-        if normalized.telegram_api_proxy_url == OLD_DEFAULT_TELEGRAM_API_PROXY_URL:
+        if normalized.telegram_api_proxy_url in {OLD_DEFAULT_TELEGRAM_API_PROXY_URL, OLD_DEFAULT_TELEGRAM_API_PROXY_URL_2}:
             normalized.telegram_api_proxy_url = DEFAULT_TELEGRAM_API_PROXY_URL
         normalized.telegram_session_file = Path(
             str(normalized.telegram_session_file or "telegram_user.sec")
@@ -514,6 +531,10 @@ class AppRuntime:
             normalized.deep_media_top_n = DEFAULT_DEEP_MEDIA_TOP_N
         if not normalized.xray_subscription_urls:
             normalized.xray_subscription_urls = list(DEFAULT_XRAY_SUBSCRIPTIONS)
+        else:
+            for source in DEFAULT_XRAY_SUBSCRIPTIONS:
+                if source not in normalized.xray_subscription_urls:
+                    normalized.xray_subscription_urls.append(source)
         normalized.xray_socks_host = str(normalized.xray_socks_host or "127.0.0.1").strip() or "127.0.0.1"
         normalized.xray_socks_port = max(1, min(65535, int(normalized.xray_socks_port or 10808)))
         normalized.xray_probe_workers = max(1, int(normalized.xray_probe_workers or 4))
@@ -697,7 +718,7 @@ class AppRuntime:
         self.save_config()
         self.start_active_mode()
 
-    def refresh_active_mode(self, cancel_event: threading.Event | None = None) -> None:
+    def refresh_active_mode(self, cancel_event: threading.Event | None = None, *, manual: bool = True) -> None:
         if self.config.active_mode == "xray_core":
             self._refresh_in_progress.set()
             self.last_refresh_started_at = time.time()
@@ -710,7 +731,7 @@ class AppRuntime:
         if self.config.active_mode == "tg_ws_proxy":
             self.restart_active_mode()
             return
-        self.run_refresh(cancel_event=cancel_event)
+        self.run_refresh(cancel_event=cancel_event, manual=manual)
 
     def quick_sort_active_mode(self, cancel_event: threading.Event | None = None) -> int:
         if self.config.active_mode == "xray_core":
@@ -850,7 +871,7 @@ class AppRuntime:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("refresh_cancelled")
 
-    def run_refresh(self, *, cancel_event: threading.Event | None = None) -> None:
+    def run_refresh(self, *, cancel_event: threading.Event | None = None, manual: bool = True) -> None:
         self._refresh_in_progress.set()
         try:
             self.last_refresh_started_at = time.time()
@@ -916,49 +937,60 @@ class AppRuntime:
 
             telegram_sources = self._collect_enabled_telegram_sources()
             if telegram_sources:
-                try:
-                    with self.telegram_lock:
-                        thread_proxies = self._run_telegram_api_call(
-                            "telegram-sources",
-                            lambda upstream: collect_telegram_sources_proxies(
-                                telegram_sources,
-                                self.auth_config,
-                                upstream_proxy=upstream,
-                                log_sink=self._log,
-                                event_sink=self._emit,
-                                total_timeout=max(45.0, float(self.config.fetch_timeout) * 4.0),
-                                request_timeout=max(8.0, float(self.config.fetch_timeout)),
-                                max_messages=int(self.config.telegram_source_max_messages or DEFAULT_SOURCE_MAX_MESSAGES),
-                                max_proxies=int(self.config.telegram_source_max_proxies or DEFAULT_SOURCE_MAX_PROXIES),
-                                max_age_days=int(self.config.telegram_source_max_age_days or DEFAULT_SOURCE_MAX_AGE_DAYS),
-                                cancel_event=cancel_event,
-                            ),
-                            preferred=best_upstream,
-                        )
-                    self.thread_proxy_count = len(thread_proxies)
-                    self.thread_status = f"loaded:{len(thread_proxies)}"
-                    new_proxies = [item for item in thread_proxies if item.key not in known_keys]
-                    if new_proxies:
-                        self._log(f"[telegram] probing {len(new_proxies)} new proxies from Telegram sources")
-                        self._emit("telegram_sources_probing_started", total_proxies=len(new_proxies))
-                        extra_outcomes = run_async(
-                            probe_all(
-                                proxies=new_proxies,
-                                settings=self._probe_settings(),
-                                concurrency=max(1, min(self.config.workers, 10)),
-                                verbose=False,
-                                log_sink=self._log,
-                                event_sink=None,
-                                cancel_event=cancel_event,
+                should_parse_telegram = manual or self._telegram_source_cache_is_stale()
+                if not should_parse_telegram:
+                    self.thread_status = "cached"
+                    self.thread_proxy_count = len(self._load_tg_parsed_proxy_records())
+                    self._log(f"[telegram] using cached parsed proxies: {self.thread_proxy_count}")
+                else:
+                    try:
+                        if best_upstream is not None and self.config.active_mode == "mtproxy_picker" and not self.local_server.is_running():
+                            self.start_local_server(raise_on_verify_failure=False, pre_probe=False, verify=False)
+                        preferred_for_telegram = self._configured_telegram_api_proxy() or best_upstream
+                        with self.telegram_lock:
+                            thread_proxies = self._run_telegram_api_call(
+                                "telegram-sources",
+                                lambda upstream: collect_telegram_sources_proxies(
+                                    telegram_sources,
+                                    self.auth_config,
+                                    upstream_proxy=upstream,
+                                    log_sink=self._log,
+                                    event_sink=self._emit,
+                                    total_timeout=max(45.0, float(self.config.fetch_timeout) * 4.0),
+                                    request_timeout=max(8.0, float(self.config.fetch_timeout)),
+                                    max_messages=int(self.config.telegram_source_max_messages or DEFAULT_SOURCE_MAX_MESSAGES),
+                                    max_proxies=int(self.config.telegram_source_max_proxies or DEFAULT_SOURCE_MAX_PROXIES),
+                                    max_age_days=int(self.config.telegram_source_max_age_days or DEFAULT_SOURCE_MAX_AGE_DAYS),
+                                    cancel_event=cancel_event,
+                                ),
+                                preferred=preferred_for_telegram,
+                                include_direct=False,
                             )
-                        )
-                        combined_outcomes.extend(extra_outcomes)
-                        self._emit("telegram_sources_probing_finished", total_proxies=len(new_proxies))
-                    elif thread_proxies:
-                        self._log(f"[telegram] sources parsed, all {len(thread_proxies)} proxies were duplicates")
-                except Exception as exc:
-                    self.thread_status = f"skipped:{exc}"
-                    self._log(f"[telegram] skipped: {exc}")
+                        self._save_tg_parsed_proxy_records(thread_proxies)
+                        self.thread_proxy_count = len(thread_proxies)
+                        self.thread_status = f"loaded:{len(thread_proxies)}"
+                        new_proxies = [item for item in thread_proxies if item.key not in known_keys]
+                        if new_proxies:
+                            self._log(f"[telegram] probing {len(new_proxies)} new proxies from Telegram sources")
+                            self._emit("telegram_sources_probing_started", total_proxies=len(new_proxies))
+                            extra_outcomes = run_async(
+                                probe_all(
+                                    proxies=new_proxies,
+                                    settings=self._probe_settings(),
+                                    concurrency=max(1, min(self.config.workers, 10)),
+                                    verbose=False,
+                                    log_sink=self._log,
+                                    event_sink=None,
+                                    cancel_event=cancel_event,
+                                )
+                            )
+                            combined_outcomes.extend(extra_outcomes)
+                            self._emit("telegram_sources_probing_finished", total_proxies=len(new_proxies))
+                        elif thread_proxies:
+                            self._log(f"[telegram] sources parsed, all {len(thread_proxies)} proxies were duplicates")
+                    except Exception as exc:
+                        self.thread_status = f"skipped:{exc}"
+                        self._log(f"[telegram] skipped: {exc}")
             else:
                 self.thread_status = "disabled"
             self._raise_if_cancelled(cancel_event)
@@ -1358,25 +1390,57 @@ class AppRuntime:
                 return
             latency = self.xray_runtime.probe_active_latency(timeout=min(5.0, float(self.config.xray_probe_timeout_sec or 8.0)))
             if latency is None:
-                self._xray_high_latency_streak += 1
                 self._log("[sing-box] active node health probe failed")
-            else:
-                self._emit("xray_health", latency_ms=latency, threshold_ms=XRAY_AUTO_REFRESH_LATENCY_MS)
-                if latency > XRAY_AUTO_REFRESH_LATENCY_MS:
-                    self._xray_high_latency_streak += 1
-                    self._log(f"[sing-box] high latency {latency:.0f} ms, streak={self._xray_high_latency_streak}")
-                else:
-                    self._xray_high_latency_streak = 0
-                    return
-            if self._xray_high_latency_streak <= 0:
+                self._run_xray_full_refresh_if_due(now, reason="health_failed")
                 return
-            if (now - self._last_xray_auto_refresh_at) < XRAY_AUTO_REFRESH_COOLDOWN_SEC:
+            self._emit(
+                "xray_health",
+                latency_ms=latency,
+                threshold_ms=XRAY_QUICK_SWITCH_LATENCY_MS,
+                full_threshold_ms=XRAY_FULL_REFRESH_LATENCY_MS,
+            )
+            if latency < XRAY_QUICK_SWITCH_LATENCY_MS:
+                self._xray_high_latency_streak = 0
                 return
-            self._last_xray_auto_refresh_at = now
-            self._xray_high_latency_streak = 0
-            self._run_xray_background_refresh(reason="latency")
+            self._xray_high_latency_streak += 1
+            self._log(f"[sing-box] high latency {latency:.0f} ms, streak={self._xray_high_latency_streak}")
+            if latency >= XRAY_FULL_REFRESH_LATENCY_MS:
+                self._run_xray_full_refresh_if_due(now, reason=f"latency_{latency:.0f}ms")
+                return
+            self._run_xray_quick_sort_if_due(now, latency=latency)
         finally:
             self._health_cycle_lock.release()
+
+    def _run_xray_quick_sort_if_due(self, now: float, *, latency: float) -> None:
+        if (now - self._last_xray_quick_sort_at) < XRAY_QUICK_SWITCH_COOLDOWN_SEC:
+            return
+        if not self.xray_runtime.last_working:
+            self._run_xray_full_refresh_if_due(now, reason="no_cached_nodes")
+            return
+        self._last_xray_quick_sort_at = now
+        self._emit(
+            "xray_background_quick_sort_started",
+            latency_ms=latency,
+            threshold_ms=XRAY_QUICK_SWITCH_LATENCY_MS,
+        )
+        self._refresh_in_progress.set()
+        self.last_refresh_started_at = time.time()
+        try:
+            self._log(f"[sing-box] background quick ping-sort started ({latency:.0f} ms)")
+            self.xray_runtime.quick_sort_by_ping()
+        except Exception as exc:
+            self._log(f"[sing-box] background quick ping-sort failed: {exc}")
+            self._emit("xray_background_refresh_failed", error=str(exc))
+        finally:
+            self.last_refresh_finished_at = time.time()
+            self._refresh_in_progress.clear()
+
+    def _run_xray_full_refresh_if_due(self, now: float, *, reason: str) -> None:
+        if (now - self._last_xray_auto_refresh_at) < XRAY_AUTO_REFRESH_COOLDOWN_SEC:
+            return
+        self._last_xray_auto_refresh_at = now
+        self._xray_high_latency_streak = 0
+        self._run_xray_background_refresh(reason=reason)
 
     def _run_xray_background_refresh(self, *, reason: str) -> None:
         if self._refresh_in_progress.is_set():
@@ -1386,7 +1450,7 @@ class AppRuntime:
         self._emit(
             "xray_background_refresh_started",
             reason=reason,
-            threshold_ms=XRAY_AUTO_REFRESH_LATENCY_MS,
+            threshold_ms=XRAY_FULL_REFRESH_LATENCY_MS,
         )
         try:
             self._log(f"[sing-box] background refresh started ({reason})")
@@ -1403,6 +1467,8 @@ class AppRuntime:
             return
         try:
             if self._refresh_in_progress.is_set():
+                return
+            if self._run_mtproxy_latency_guard():
                 return
             pressure = self._active_media_transfer_pressure()
             if pressure["active_media"] > 0 or pressure["active_heavy"] > 0:
@@ -1441,6 +1507,42 @@ class AppRuntime:
                 self._last_media_pulse_at = now
         finally:
             self._health_cycle_lock.release()
+
+    def _run_mtproxy_latency_guard(self) -> bool:
+        if self.config.active_mode != "mtproxy_picker" or not self.local_server.is_running():
+            return False
+        now = time.time()
+        if (now - self._last_mtproxy_health_at) < XRAY_HEALTH_INTERVAL_SEC:
+            return False
+        self._last_mtproxy_health_at = now
+        best = self.pool.best()
+        if best is None:
+            return False
+        latency = best.telegram_ping_ms
+        if latency is None:
+            return False
+        self._emit(
+            "mtproxy_health",
+            latency_ms=latency,
+            threshold_ms=MTPROXY_QUICK_SWITCH_LATENCY_MS,
+            full_threshold_ms=MTPROXY_FULL_REFRESH_LATENCY_MS,
+        )
+        if latency < MTPROXY_QUICK_SWITCH_LATENCY_MS:
+            return False
+        if latency >= MTPROXY_FULL_REFRESH_LATENCY_MS:
+            if (now - self._last_mtproxy_auto_refresh_at) >= MTPROXY_AUTO_REFRESH_COOLDOWN_SEC:
+                self._last_mtproxy_auto_refresh_at = now
+                self._log(f"[mtproxy] high latency {latency:.0f} ms, background web refresh")
+                self.run_refresh(manual=False)
+                return True
+            return False
+        if (now - self._last_mtproxy_quick_sort_at) >= MTPROXY_QUICK_SWITCH_COOLDOWN_SEC:
+            self._last_mtproxy_quick_sort_at = now
+            self._log(f"[mtproxy] high latency {latency:.0f} ms, quick ping-sort")
+            self._emit("mtproxy_background_quick_sort_started", latency_ms=latency, threshold_ms=MTPROXY_QUICK_SWITCH_LATENCY_MS)
+            self.quick_probe_pool(limit=max(self.config.live_probe_top_n, 12), reason="latency_guard")
+            return True
+        return False
 
     def _run_live_probe_once(self, *, focused: bool, prefer_media: bool = False) -> None:
         if self._refresh_in_progress.is_set():
@@ -2011,6 +2113,35 @@ class AppRuntime:
                 merged.append(legacy_url)
         return merged
 
+    def _tg_parsed_proxy_path(self) -> Path:
+        return (self.install_dir / self.config.out_dir / TG_PARSED_FILE_NAME).resolve()
+
+    def _telegram_source_cache_is_stale(self) -> bool:
+        path = self._tg_parsed_proxy_path()
+        if not path.exists():
+            return True
+        try:
+            return (time.time() - path.stat().st_mtime) >= TELEGRAM_SOURCE_AUTO_REFRESH_INTERVAL_SEC
+        except Exception:
+            return True
+
+    def _save_tg_parsed_proxy_records(self, proxies: list[ProxyRecord]) -> None:
+        path = self._tg_parsed_proxy_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        urls = [proxy.url for proxy in proxies]
+        self._write_url_list(path, urls)
+
+    def _load_tg_parsed_proxy_records(self) -> list[ProxyRecord]:
+        path = self._tg_parsed_proxy_path()
+        proxies: dict[tuple[str, int, str], ProxyRecord] = {}
+        for raw_url in self._read_url_list(path):
+            proxy = parse_proxy_link(raw_url, f"telegram-cache:{path.name}", str(path))
+            if proxy is None:
+                continue
+            proxy.sources.add(f"telegram-cache:{path.name}")
+            proxies.setdefault(proxy.key, proxy)
+        return list(proxies.values())
+
     def _load_manual_list_proxies(self) -> list[ProxyRecord]:
         paths = [
             self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME,
@@ -2041,6 +2172,7 @@ class AppRuntime:
         limit = max(48, min(96, int(self.config.max_proxies or 0) or 96))
         paths = [
             self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME,
+            self.install_dir / self.config.out_dir / TG_PARSED_FILE_NAME,
             self.install_dir / self.config.out_dir / REPORT_FILE_NAME,
             self.install_dir / self.config.out_dir / LIST_FILE_NAME,
             self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
@@ -2050,6 +2182,7 @@ class AppRuntime:
             paths.extend(
                 [
                     self.state_root / self.config.out_dir / FAST_LIST_FILE_NAME,
+                    self.state_root / self.config.out_dir / TG_PARSED_FILE_NAME,
                     self.state_root / self.config.out_dir / REPORT_FILE_NAME,
                     self.state_root / self.config.out_dir / LIST_FILE_NAME,
                     self.state_root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
@@ -2359,8 +2492,14 @@ class AppRuntime:
         if "telegram_api_proxy_url" not in data:
             data["telegram_api_proxy_url"] = DEFAULT_TELEGRAM_API_PROXY_URL
             normalized = True
+        if data.get("telegram_api_proxy_url") in (OLD_DEFAULT_TELEGRAM_API_PROXY_URL, OLD_DEFAULT_TELEGRAM_API_PROXY_URL_2):
+            data["telegram_api_proxy_url"] = DEFAULT_TELEGRAM_API_PROXY_URL
+            normalized = True
         if "telegram_api_proxy_enabled" not in data:
-            data["telegram_api_proxy_enabled"] = False
+            data["telegram_api_proxy_enabled"] = True
+            normalized = True
+        if data.get("telegram_api_proxy_url") == DEFAULT_TELEGRAM_API_PROXY_URL and not bool(data.get("telegram_api_proxy_enabled", False)):
+            data["telegram_api_proxy_enabled"] = True
             normalized = True
         cleaned_api_id = _safe_int(data.get("telegram_api_id"))
         if data.get("telegram_api_id") != cleaned_api_id:
@@ -2390,6 +2529,9 @@ class AppRuntime:
                     if bool(data.get(key, False)) != bool(value):
                         data[key] = bool(value)
                         normalized = True
+        if data.get("telegram_api_proxy_url") == DEFAULT_TELEGRAM_API_PROXY_URL and not bool(data.get("telegram_api_proxy_enabled", False)):
+            data["telegram_api_proxy_enabled"] = True
+            normalized = True
         if "telegram_sources_enabled" not in data:
             data["telegram_sources_enabled"] = bool(data.get("thread_source_enabled", False))
             normalized = True
@@ -2410,6 +2552,21 @@ class AppRuntime:
             for item in data.get("sources", [])
             if str(item).strip() and str(item).strip() not in REMOVED_WEB_SOURCES
         ]
+        mtproxytg_mirror_set = {source.lower() for source in MTPROXYTG_MIRRORS}
+        compact_sources: list[str] = []
+        found_mtproxytg_mirror = False
+        for source in sources:
+            normalized_source = source.lower()
+            if normalized_source in mtproxytg_mirror_set or normalized_source in {"mtproxytg", "mtproxytg-mirrors", MTPROXYTG_MIRROR_GROUP}:
+                found_mtproxytg_mirror = True
+                continue
+            if source not in compact_sources:
+                compact_sources.append(source)
+        sources = compact_sources
+        if found_mtproxytg_mirror or any(source not in compact_sources for source in data.get("sources", [])):
+            normalized = True
+        if found_mtproxytg_mirror and MTPROXYTG_MIRROR_GROUP not in sources:
+            sources.append(MTPROXYTG_MIRROR_GROUP)
         if any(str(item).strip() in REMOVED_WEB_SOURCES for item in data.get("sources", [])):
             normalized = True
         for source in RECOMMENDED_WEB_SOURCE_ADDITIONS:
@@ -2417,6 +2574,12 @@ class AppRuntime:
                 sources.append(source)
                 normalized = True
         data["sources"] = sources
+        xray_sources = [str(item).strip() for item in data.get("xray_subscription_urls", []) if str(item).strip()]
+        for source in DEFAULT_XRAY_SUBSCRIPTIONS:
+            if source not in xray_sources:
+                xray_sources.append(source)
+                normalized = True
+        data["xray_subscription_urls"] = xray_sources
         telegram_sources = [str(item).strip() for item in data.get("telegram_sources", []) if str(item).strip()]
         for source in RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS:
             if source not in telegram_sources:

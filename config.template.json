@@ -5,7 +5,7 @@
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
-    "https://mtproxytg2.vercel.app/",
+    "mtproxytg mirrors",
     "https://t.me/s/mtpro_xyz",
     "https://t.me/s/ProxyFree_Ru"
   ],
@@ -52,8 +52,8 @@
   "auto_update_enabled": true,
   "telegram_api_id": 0,
   "telegram_api_hash": "",
-  "telegram_api_proxy_enabled": false,
-  "telegram_api_proxy_url": "https://t.me/proxy?server=myrka.bronstein.ar&port=8443&secret=eea37385d8a4bbf632eabc9091fdc95a9c6d79726b612e62726f6e737465696e2e6172",
+  "telegram_api_proxy_enabled": true,
+  "telegram_api_proxy_url": "tg://proxy?server=127.0.0.1&port=1443&secret=dd274763e0d711fd394e833938dd93c8c3",
   "telegram_phone": "",
   "telegram_session_file": "telegram_user.sec",
   "xray_subscription_urls": [
@@ -61,7 +61,11 @@
     "https://mifa.world/vless#MIFA%20%20%7C%20%20Vless",
     "https://mifa.world/trojan",
     "https://mifa.world/hysteria",
-    "https://mifa.world/vmess"
+    "https://mifa.world/vmess",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt"
   ],
   "xray_socks_host": "127.0.0.1",
   "xray_socks_port": 10808,
