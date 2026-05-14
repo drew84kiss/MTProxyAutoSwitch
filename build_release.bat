@@ -31,10 +31,12 @@ if not exist release-public\MTProxyAutoSwitch.zip exit /b 1
 
 set "ISCC_EXE="
 for %%I in (iscc.exe) do set "ISCC_EXE=%%~$PATH:I"
+if not defined ISCC_EXE if exist "%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe" set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe"
+if not defined ISCC_EXE if exist "%ProgramFiles%\Inno Setup 7\ISCC.exe" set "ISCC_EXE=%ProgramFiles%\Inno Setup 7\ISCC.exe"
 if not defined ISCC_EXE if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not defined ISCC_EXE if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles%\Inno Setup 6\ISCC.exe"
 if not defined ISCC_EXE (
-    echo Inno Setup 6 not found. Skipping installer build and keeping portable artifacts only.
+    echo Inno Setup not found. Skipping installer build and keeping portable artifacts only.
     goto :portable_only
 )
 
