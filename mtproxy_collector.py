@@ -1255,52 +1255,63 @@ def run_collection(
     if config.max_proxies > 0:
         proxies = proxies[: config.max_proxies]
 
-    if not proxies:
-        raise RuntimeError("No MTProto proxies were collected from the configured sources.")
+    all_txt_path = out_dir / ALL_FILE_NAME
+    working_txt_path = out_dir / LIST_FILE_NAME
+    rejected_txt_path = out_dir / REJECTED_FILE_NAME
+    socks5_all_txt_path = out_dir / SOCKS5_FILE_NAME
+    report_json_path = out_dir / REPORT_FILE_NAME
 
-    log(f"[phase] probing {len(proxies)} unique proxies", verbose=config.verbose, sink=log_sink)
-    emit_event(
-        event_sink,
-        "phase",
-        phase="probing",
-        total_proxies=len(proxies),
-    )
-
-    settings = ProbeSettings(
-        duration=config.duration,
-        interval=config.interval,
-        timeout=config.timeout,
-        max_latency_ms=config.max_latency_ms,
-        min_success_rate=config.min_success_rate,
-        max_high_latency_ratio=config.max_high_latency_ratio,
-        high_latency_streak=config.high_latency_streak,
-        unreachable_failures=3,
-    )
-
-    _raise_if_cancelled(cancel_event)
-    outcomes = run_async(
-        probe_all(
-            proxies=proxies,
-            settings=settings,
-            concurrency=max(1, config.workers),
-            verbose=config.verbose,
-            log_sink=log_sink,
-            event_sink=event_sink,
-            cancel_event=cancel_event,
+    if proxies:
+        log(f"[phase] probing {len(proxies)} unique proxies", verbose=config.verbose, sink=log_sink)
+        emit_event(
+            event_sink,
+            "phase",
+            phase="probing",
+            total_proxies=len(proxies),
         )
-    )
+
+        settings = ProbeSettings(
+            duration=config.duration,
+            interval=config.interval,
+            timeout=config.timeout,
+            max_latency_ms=config.max_latency_ms,
+            min_success_rate=config.min_success_rate,
+            max_high_latency_ratio=config.max_high_latency_ratio,
+            high_latency_streak=config.high_latency_streak,
+            unreachable_failures=3,
+        )
+
+        _raise_if_cancelled(cancel_event)
+        outcomes = run_async(
+            probe_all(
+                proxies=proxies,
+                settings=settings,
+                concurrency=max(1, config.workers),
+                verbose=config.verbose,
+                log_sink=log_sink,
+                event_sink=event_sink,
+                cancel_event=cancel_event,
+            )
+        )
+    else:
+        log(
+            "[phase] no MTProto proxies collected from web sources; continuing with cached/runtime sources",
+            verbose=config.verbose,
+            sink=log_sink,
+        )
+        emit_event(
+            event_sink,
+            "phase",
+            phase="probing",
+            total_proxies=0,
+        )
+        outcomes = []
 
     working = sorted((item for item in outcomes if item.accepted), key=outcome_sort_key)
     rejected = sorted(
         (item for item in outcomes if not item.accepted),
         key=lambda item: (item.reason, outcome_sort_key(item)),
     )
-
-    all_txt_path = out_dir / ALL_FILE_NAME
-    working_txt_path = out_dir / LIST_FILE_NAME
-    rejected_txt_path = out_dir / REJECTED_FILE_NAME
-    socks5_all_txt_path = out_dir / SOCKS5_FILE_NAME
-    report_json_path = out_dir / REPORT_FILE_NAME
 
     _raise_if_cancelled(cancel_event)
     if write_output:
