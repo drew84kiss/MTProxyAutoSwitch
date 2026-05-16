@@ -3092,7 +3092,39 @@ class MainWindow(QMainWindow):
             self.progress.setVisible(True)
             self.progress.setValue(80)
             threshold = int(float(payload.get("threshold_ms") or 200))
-            self.progress_text.setText(f"sing-box: пинг выше {threshold} ms, полное обновление в фоне")
+            reason = str(payload.get("reason") or "")
+            if reason == "health_failed":
+                self.progress_text.setText("sing-box: активный туннель не отвечает, полное обновление в фоне")
+            elif reason.startswith("latency_"):
+                latency = _format_latency(payload.get("latency_ms")) if payload.get("latency_ms") is not None else f"> {threshold} ms"
+                held_for = int(float(payload.get("held_for_sec") or 0))
+                self.progress_text.setText(f"sing-box: пинг {latency} держится {held_for} сек, полное обновление в фоне")
+            elif reason == "no_cached_nodes":
+                self.progress_text.setText("sing-box: нет кешированных серверов, полное обновление в фоне")
+            else:
+                self.progress_text.setText(f"sing-box: полное обновление в фоне (порог {threshold} ms)")
+        elif event_name == "xray_high_latency_observed":
+            if not self.refresh_in_progress and not self.busy_task_names:
+                latency = _format_latency(payload.get("latency_ms"))
+                streak = int(payload.get("streak") or 0)
+                required = int(payload.get("required_streak") or 0)
+                held_for = int(float(payload.get("held_for_sec") or 0))
+                required_sec = int(float(payload.get("required_sec") or 0))
+                if required_sec > 0:
+                    self.progress_text.setText(
+                        f"sing-box: пинг {latency}, проверка {streak}/{required} ({held_for}/{required_sec} сек)"
+                    )
+                else:
+                    self.progress_text.setText(f"sing-box: пинг {latency}, проверка {streak}/{required}")
+        elif event_name == "xray_health_degraded":
+            if not self.refresh_in_progress and not self.busy_task_names:
+                streak = int(payload.get("fail_streak") or 0)
+                required = int(payload.get("required_streak") or 0)
+                self.progress_text.setText(f"sing-box: туннель не ответил {streak}/{required}, готовлю рестарт")
+        elif event_name == "xray_core_restart_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            self.progress_text.setText("sing-box: локальный core не отвечает, перезапускаю")
         elif event_name == "xray_background_quick_sort_started":
             self.progress.setVisible(True)
             self.progress.setValue(80)
@@ -3111,6 +3143,32 @@ class MainWindow(QMainWindow):
             self.progress.setValue(80)
             latency = _format_latency(payload.get("latency_ms"))
             self.progress_text.setText(f"Подбор прокси: пинг {latency}, выбираю более быстрый сервер")
+        elif event_name == "mtproxy_background_refresh_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            reason = str(payload.get("reason") or "")
+            threshold = int(float(payload.get("threshold_ms") or 300))
+            if reason.startswith("latency_"):
+                latency = _format_latency(payload.get("latency_ms")) if payload.get("latency_ms") is not None else f"> {threshold} ms"
+                held_for = int(float(payload.get("held_for_sec") or 0))
+                self.progress_text.setText(f"Подбор прокси: пинг {latency} держится {held_for} сек, полное обновление")
+            elif reason == "no_cached_proxies":
+                self.progress_text.setText("Подбор прокси: нет кешированных прокси, полное обновление")
+            else:
+                self.progress_text.setText(f"Подбор прокси: полное обновление (порог {threshold} ms)")
+        elif event_name == "mtproxy_high_latency_observed":
+            if not self.refresh_in_progress and not self.busy_task_names:
+                latency = _format_latency(payload.get("latency_ms"))
+                streak = int(payload.get("streak") or 0)
+                required = int(payload.get("required_streak") or 0)
+                held_for = int(float(payload.get("held_for_sec") or 0))
+                required_sec = int(float(payload.get("required_sec") or 0))
+                if required_sec > 0:
+                    self.progress_text.setText(
+                        f"Подбор прокси: пинг {latency}, проверка {streak}/{required} ({held_for}/{required_sec} сек)"
+                    )
+                else:
+                    self.progress_text.setText(f"Подбор прокси: пинг {latency}, проверка {streak}/{required}")
         elif event_name == "mtproxy_health":
             if not self.refresh_in_progress and not self.busy_task_names:
                 latency = _format_latency(payload.get("latency_ms"))

@@ -140,16 +140,24 @@ def _clean_api_hash(value: object) -> str:
 DEFAULT_MAX_PROXIES = 500
 DEFAULT_DEEP_MEDIA_TOP_N = 0
 DEFAULT_FAST_LIST_LIMIT = 24
-XRAY_QUICK_SWITCH_LATENCY_MS = 200.0
-XRAY_FULL_REFRESH_LATENCY_MS = 260.0
-XRAY_HEALTH_INTERVAL_SEC = 20.0
-XRAY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
-XRAY_AUTO_REFRESH_COOLDOWN_SEC = 180.0
+XRAY_QUICK_SWITCH_LATENCY_MS = 240.0
+XRAY_FULL_REFRESH_LATENCY_MS = 300.0
+XRAY_HEALTH_INTERVAL_SEC = 45.0
+XRAY_QUICK_SWITCH_COOLDOWN_SEC = 120.0
+XRAY_AUTO_REFRESH_COOLDOWN_SEC = 900.0
+XRAY_QUICK_SWITCH_CONFIRM_STREAK = 2
+XRAY_FULL_REFRESH_CONFIRM_STREAK = 14
+XRAY_FULL_REFRESH_CONFIRM_SEC = 600.0
+XRAY_HEALTH_FAIL_RESTART_STREAK = 2
 XRAY_SPEED_SAMPLE_INTERVAL_SEC = 90.0
-MTPROXY_QUICK_SWITCH_LATENCY_MS = 200.0
-MTPROXY_FULL_REFRESH_LATENCY_MS = 260.0
-MTPROXY_QUICK_SWITCH_COOLDOWN_SEC = 45.0
-MTPROXY_AUTO_REFRESH_COOLDOWN_SEC = 180.0
+MTPROXY_QUICK_SWITCH_LATENCY_MS = 240.0
+MTPROXY_FULL_REFRESH_LATENCY_MS = 300.0
+MTPROXY_HEALTH_INTERVAL_SEC = 45.0
+MTPROXY_QUICK_SWITCH_COOLDOWN_SEC = 120.0
+MTPROXY_AUTO_REFRESH_COOLDOWN_SEC = 900.0
+MTPROXY_QUICK_SWITCH_CONFIRM_STREAK = 2
+MTPROXY_FULL_REFRESH_CONFIRM_STREAK = 14
+MTPROXY_FULL_REFRESH_CONFIRM_SEC = 600.0
 FAST_LIST_FILE_NAME = "fast_list.txt"
 TG_PARSED_FILE_NAME = "tg_parsed_proxy.txt"
 DEFAULT_LOCAL_SECRET = "274763e0d711fd394e833938dd93c8c3"
@@ -355,6 +363,8 @@ class AppRuntime:
         self._last_mtproxy_health_at: float = 0.0
         self._last_mtproxy_quick_sort_at: float = 0.0
         self._last_mtproxy_auto_refresh_at: float = 0.0
+        self._mtproxy_high_latency_streak: int = 0
+        self._mtproxy_full_refresh_candidate_since: float = 0.0
         self._refresh_in_progress = threading.Event()
         with contextlib.suppress(Exception):
             stale_cache_path = self.state_dir / "proxy_list_persist.txt"
@@ -374,8 +384,10 @@ class AppRuntime:
         self._last_xray_auto_refresh_at: float = 0.0
         self._last_xray_speed_sample_at: float = 0.0
         self._xray_high_latency_streak: int = 0
+        self._xray_full_refresh_candidate_since: float = 0.0
+        self._xray_health_fail_streak: int = 0
         self._xray_restart_attempted_at: float = 0.0
-        self._health_cycle_lock = threading.Lock()
+        self._health_cycle_lock = threading.RLock()
         self.live_probe_thread = threading.Thread(target=self._live_probe_loop, daemon=True, name="mtproxy-live-probe")
         self.live_probe_thread.start()
         self._auth_code_hash: str = ""
@@ -1432,9 +1444,30 @@ class AppRuntime:
                 return
             latency = self.xray_runtime.probe_active_latency(timeout=min(5.0, float(self.config.xray_probe_timeout_sec or 8.0)))
             if latency is None:
-                self._log("[sing-box] active node health probe failed")
-                self._run_xray_full_refresh_if_due(now, reason="health_failed")
+                self._xray_health_fail_streak += 1
+                self._xray_high_latency_streak = 0
+                self._xray_full_refresh_candidate_since = 0.0
+                self._log(
+                    "[sing-box] active node health probe failed, "
+                    f"streak={self._xray_health_fail_streak}/{XRAY_HEALTH_FAIL_RESTART_STREAK}"
+                )
+                self._emit(
+                    "xray_health_degraded",
+                    reason="health_failed",
+                    fail_streak=self._xray_health_fail_streak,
+                    required_streak=XRAY_HEALTH_FAIL_RESTART_STREAK,
+                )
+                if (
+                    self._xray_health_fail_streak >= XRAY_HEALTH_FAIL_RESTART_STREAK
+                    and (now - self._xray_restart_attempted_at) >= XRAY_QUICK_SWITCH_COOLDOWN_SEC
+                ):
+                    self._xray_restart_attempted_at = now
+                    self._emit("xray_core_restart_started", fail_streak=self._xray_health_fail_streak)
+                    self._log("[sing-box] active tunnel is unhealthy, restarting local core")
+                    self.xray_runtime.restart()
+                    self._xray_health_fail_streak = 0
                 return
+            self._xray_health_fail_streak = 0
             self._emit(
                 "xray_health",
                 latency_ms=latency,
@@ -1450,24 +1483,75 @@ class AppRuntime:
                     self._emit("xray_speed_sample", download_kbps=speed)
             if latency < XRAY_QUICK_SWITCH_LATENCY_MS:
                 self._xray_high_latency_streak = 0
+                self._xray_full_refresh_candidate_since = 0.0
                 return
             self._xray_high_latency_streak += 1
-            self._log(f"[sing-box] high latency {latency:.0f} ms, streak={self._xray_high_latency_streak}")
-            if latency >= XRAY_FULL_REFRESH_LATENCY_MS:
-                self._run_xray_full_refresh_if_due(now, reason=f"latency_{latency:.0f}ms")
+            full_latency_candidate = latency >= XRAY_FULL_REFRESH_LATENCY_MS
+            held_for_sec = 0.0
+            if full_latency_candidate:
+                if self._xray_full_refresh_candidate_since <= 0:
+                    self._xray_full_refresh_candidate_since = now
+                held_for_sec = max(0.0, now - self._xray_full_refresh_candidate_since)
+            else:
+                self._xray_full_refresh_candidate_since = 0.0
+            required_streak = XRAY_FULL_REFRESH_CONFIRM_STREAK if full_latency_candidate else XRAY_QUICK_SWITCH_CONFIRM_STREAK
+            required_sec = XRAY_FULL_REFRESH_CONFIRM_SEC if full_latency_candidate else 0.0
+            self._log(
+                f"[sing-box] high latency {latency:.0f} ms, "
+                f"streak={self._xray_high_latency_streak}/{required_streak}, "
+                f"held={held_for_sec:.0f}/{required_sec:.0f}s"
+            )
+            self._emit(
+                "xray_high_latency_observed",
+                latency_ms=latency,
+                threshold_ms=XRAY_FULL_REFRESH_LATENCY_MS if full_latency_candidate else XRAY_QUICK_SWITCH_LATENCY_MS,
+                streak=self._xray_high_latency_streak,
+                required_streak=required_streak,
+                held_for_sec=held_for_sec,
+                required_sec=required_sec,
+            )
+            if self._xray_high_latency_streak < XRAY_QUICK_SWITCH_CONFIRM_STREAK:
                 return
-            self._run_xray_quick_sort_if_due(now, latency=latency)
+            best_cached_latency = self._run_xray_quick_sort_if_due(now, latency=latency)
+            if best_cached_latency is not None and best_cached_latency < XRAY_FULL_REFRESH_LATENCY_MS:
+                self._xray_full_refresh_candidate_since = 0.0
+                self._xray_high_latency_streak = 0
+                return
+            if (
+                full_latency_candidate
+                and self._xray_high_latency_streak >= XRAY_FULL_REFRESH_CONFIRM_STREAK
+                and held_for_sec >= XRAY_FULL_REFRESH_CONFIRM_SEC
+                and (best_cached_latency is None or best_cached_latency >= XRAY_FULL_REFRESH_LATENCY_MS)
+            ):
+                self._run_xray_full_refresh_if_due(
+                    now,
+                    reason=f"latency_{latency:.0f}ms",
+                    latency=latency,
+                    streak=self._xray_high_latency_streak,
+                    held_for_sec=held_for_sec,
+                )
         finally:
             self._health_cycle_lock.release()
 
-    def _run_xray_quick_sort_if_due(self, now: float, *, latency: float) -> None:
+    def _best_cached_xray_latency(self) -> float | None:
+        latencies: list[float] = []
+        for item in getattr(self.xray_runtime, "last_working", []) or []:
+            value = getattr(item, "latency_ms", None)
+            if value is None:
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                if float(value) > 0:
+                    latencies.append(float(value))
+        return min(latencies) if latencies else None
+
+    def _run_xray_quick_sort_if_due(self, now: float, *, latency: float) -> float | None:
         if self._shutdown_requested:
-            return
+            return self._best_cached_xray_latency()
         if (now - self._last_xray_quick_sort_at) < XRAY_QUICK_SWITCH_COOLDOWN_SEC:
-            return
+            return self._best_cached_xray_latency()
         if not self.xray_runtime.last_working:
             self._run_xray_full_refresh_if_due(now, reason="no_cached_nodes")
-            return
+            return None
         self._last_xray_quick_sort_at = now
         self._emit(
             "xray_background_quick_sort_started",
@@ -1485,17 +1569,43 @@ class AppRuntime:
         finally:
             self.last_refresh_finished_at = time.time()
             self._refresh_in_progress.clear()
+        return self._best_cached_xray_latency()
 
-    def _run_xray_full_refresh_if_due(self, now: float, *, reason: str) -> None:
+    def _run_xray_full_refresh_if_due(
+        self,
+        now: float,
+        *,
+        reason: str,
+        latency: float | None = None,
+        streak: int = 0,
+        held_for_sec: float = 0.0,
+        fail_streak: int = 0,
+    ) -> None:
         if self._shutdown_requested:
             return
         if (now - self._last_xray_auto_refresh_at) < XRAY_AUTO_REFRESH_COOLDOWN_SEC:
             return
         self._last_xray_auto_refresh_at = now
         self._xray_high_latency_streak = 0
-        self._run_xray_background_refresh(reason=reason)
+        self._xray_full_refresh_candidate_since = 0.0
+        self._xray_health_fail_streak = 0
+        self._run_xray_background_refresh(
+            reason=reason,
+            latency_ms=latency,
+            streak=streak,
+            held_for_sec=held_for_sec,
+            fail_streak=fail_streak,
+        )
 
-    def _run_xray_background_refresh(self, *, reason: str) -> None:
+    def _run_xray_background_refresh(
+        self,
+        *,
+        reason: str,
+        latency_ms: float | None = None,
+        streak: int = 0,
+        held_for_sec: float = 0.0,
+        fail_streak: int = 0,
+    ) -> None:
         if self._shutdown_requested:
             return
         if self._refresh_in_progress.is_set():
@@ -1506,6 +1616,10 @@ class AppRuntime:
             "xray_background_refresh_started",
             reason=reason,
             threshold_ms=XRAY_FULL_REFRESH_LATENCY_MS,
+            latency_ms=latency_ms,
+            streak=streak,
+            held_for_sec=held_for_sec,
+            fail_streak=fail_streak,
         )
         try:
             self._log(f"[sing-box] background refresh started ({reason})")
@@ -1567,7 +1681,7 @@ class AppRuntime:
         if self.config.active_mode != "mtproxy_picker" or not self.local_server.is_running():
             return False
         now = time.time()
-        if (now - self._last_mtproxy_health_at) < XRAY_HEALTH_INTERVAL_SEC:
+        if (now - self._last_mtproxy_health_at) < MTPROXY_HEALTH_INTERVAL_SEC:
             return False
         self._last_mtproxy_health_at = now
         best = self.pool.best()
@@ -1583,21 +1697,117 @@ class AppRuntime:
             full_threshold_ms=MTPROXY_FULL_REFRESH_LATENCY_MS,
         )
         if latency < MTPROXY_QUICK_SWITCH_LATENCY_MS:
+            self._mtproxy_high_latency_streak = 0
+            self._mtproxy_full_refresh_candidate_since = 0.0
             return False
-        if latency >= MTPROXY_FULL_REFRESH_LATENCY_MS:
-            if (now - self._last_mtproxy_auto_refresh_at) >= MTPROXY_AUTO_REFRESH_COOLDOWN_SEC:
-                self._last_mtproxy_auto_refresh_at = now
-                self._log(f"[mtproxy] high latency {latency:.0f} ms, background web refresh")
-                self.run_refresh(manual=False)
-                return True
+
+        self._mtproxy_high_latency_streak += 1
+        full_latency_candidate = latency >= MTPROXY_FULL_REFRESH_LATENCY_MS
+        held_for_sec = 0.0
+        if full_latency_candidate:
+            if self._mtproxy_full_refresh_candidate_since <= 0:
+                self._mtproxy_full_refresh_candidate_since = now
+            held_for_sec = max(0.0, now - self._mtproxy_full_refresh_candidate_since)
+        else:
+            self._mtproxy_full_refresh_candidate_since = 0.0
+        required_streak = MTPROXY_FULL_REFRESH_CONFIRM_STREAK if full_latency_candidate else MTPROXY_QUICK_SWITCH_CONFIRM_STREAK
+        required_sec = MTPROXY_FULL_REFRESH_CONFIRM_SEC if full_latency_candidate else 0.0
+        self._log(
+            f"[mtproxy] high latency {latency:.0f} ms, "
+            f"streak={self._mtproxy_high_latency_streak}/{required_streak}, "
+            f"held={held_for_sec:.0f}/{required_sec:.0f}s"
+        )
+        self._emit(
+            "mtproxy_high_latency_observed",
+            latency_ms=latency,
+            threshold_ms=MTPROXY_FULL_REFRESH_LATENCY_MS if full_latency_candidate else MTPROXY_QUICK_SWITCH_LATENCY_MS,
+            streak=self._mtproxy_high_latency_streak,
+            required_streak=required_streak,
+            held_for_sec=held_for_sec,
+            required_sec=required_sec,
+        )
+        if self._mtproxy_high_latency_streak < MTPROXY_QUICK_SWITCH_CONFIRM_STREAK:
             return False
-        if (now - self._last_mtproxy_quick_sort_at) >= MTPROXY_QUICK_SWITCH_COOLDOWN_SEC:
-            self._last_mtproxy_quick_sort_at = now
-            self._log(f"[mtproxy] high latency {latency:.0f} ms, quick ping-sort")
-            self._emit("mtproxy_background_quick_sort_started", latency_ms=latency, threshold_ms=MTPROXY_QUICK_SWITCH_LATENCY_MS)
-            self.quick_probe_pool(limit=max(self.config.live_probe_top_n, 12), reason="latency_guard")
+
+        best_cached_latency = self._run_mtproxy_quick_sort_if_due(now, latency=latency)
+        if best_cached_latency is not None and best_cached_latency < MTPROXY_FULL_REFRESH_LATENCY_MS:
+            self._mtproxy_high_latency_streak = 0
+            self._mtproxy_full_refresh_candidate_since = 0.0
+            return True
+
+        if (
+            full_latency_candidate
+            and self._mtproxy_high_latency_streak >= MTPROXY_FULL_REFRESH_CONFIRM_STREAK
+            and held_for_sec >= MTPROXY_FULL_REFRESH_CONFIRM_SEC
+            and (best_cached_latency is None or best_cached_latency >= MTPROXY_FULL_REFRESH_LATENCY_MS)
+        ):
+            self._run_mtproxy_full_refresh_if_due(
+                now,
+                reason=f"latency_{latency:.0f}ms",
+                latency=latency,
+                streak=self._mtproxy_high_latency_streak,
+                held_for_sec=held_for_sec,
+            )
             return True
         return False
+
+    def _best_cached_mtproxy_latency(self) -> float | None:
+        candidates = self.pool.select_candidates(is_media=False, limit=max(1, min(16, self.pool.count())))
+        latencies: list[float] = []
+        for item in candidates:
+            value = item.telegram_ping_ms
+            if value is None:
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                if float(value) > 0:
+                    latencies.append(float(value))
+        best = self.pool.best()
+        if best is not None and best.telegram_ping_ms is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                if float(best.telegram_ping_ms) > 0:
+                    latencies.append(float(best.telegram_ping_ms))
+        return min(latencies) if latencies else None
+
+    def _run_mtproxy_quick_sort_if_due(self, now: float, *, latency: float) -> float | None:
+        if self._shutdown_requested:
+            return self._best_cached_mtproxy_latency()
+        if (now - self._last_mtproxy_quick_sort_at) < MTPROXY_QUICK_SWITCH_COOLDOWN_SEC:
+            return self._best_cached_mtproxy_latency()
+        if self.pool.count() <= 0:
+            self._run_mtproxy_full_refresh_if_due(now, reason="no_cached_proxies")
+            return None
+        self._last_mtproxy_quick_sort_at = now
+        self._log(f"[mtproxy] high latency {latency:.0f} ms, quick ping-sort")
+        self._emit("mtproxy_background_quick_sort_started", latency_ms=latency, threshold_ms=MTPROXY_QUICK_SWITCH_LATENCY_MS)
+        self.quick_probe_pool(limit=max(self.config.live_probe_top_n, 12), reason="latency_guard")
+        return self._best_cached_mtproxy_latency()
+
+    def _run_mtproxy_full_refresh_if_due(
+        self,
+        now: float,
+        *,
+        reason: str,
+        latency: float | None = None,
+        streak: int = 0,
+        held_for_sec: float = 0.0,
+    ) -> None:
+        if self._shutdown_requested:
+            return
+        if (now - self._last_mtproxy_auto_refresh_at) < MTPROXY_AUTO_REFRESH_COOLDOWN_SEC:
+            return
+        self._last_mtproxy_auto_refresh_at = now
+        self._mtproxy_high_latency_streak = 0
+        self._mtproxy_full_refresh_candidate_since = 0.0
+        self._emit(
+            "mtproxy_background_refresh_started",
+            reason=reason,
+            threshold_ms=MTPROXY_FULL_REFRESH_LATENCY_MS,
+            latency_ms=latency,
+            streak=streak,
+            held_for_sec=held_for_sec,
+        )
+        self._log(f"[mtproxy] sustained high latency, background web refresh ({reason})")
+        self.run_refresh(manual=False)
 
     def _run_live_probe_once(self, *, focused: bool, prefer_media: bool = False) -> None:
         if self._refresh_in_progress.is_set():
