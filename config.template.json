@@ -1,11 +1,22 @@
 {
   "active_mode": "mtproxy_picker",
   "sources": [
+    "local:telegram-proxy-collector",
     "https://mtpro.xyz/mtproto-ru",
+    "https://mtpro.xyz/api/?type=mtproto",
+    "https://mtpro.xyz/api/?type=mtproto-ru",
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
     "mtproxytg mirrors",
+    "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
+    "https://raw.githubusercontent.com/Grim1313/mtproto-for-telegram/refs/heads/master/all_proxies.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
+    "https://raw.githubusercontent.com/yemixzy/proxy-projects/main/proxies/mtproto.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.txt",
+    "https://raw.githubusercontent.com/Freedom-Guard/Proxy/main/proxies/mtproto.txt",
+    "https://raw.githubusercontent.com/seriyps/mtproto_proxy/master/proxies.txt",
+    "https://raw.githubusercontent.com/MTProto/MTProtoProxy/master/proxies/mtproto.txt",
     "https://t.me/s/mtpro_xyz",
     "https://t.me/s/ProxyFree_Ru"
   ],
@@ -35,7 +46,8 @@
     "https://t.me/telemtrs/16160",
     "https://t.me/telemtfreeproxy",
     "https://t.me/mtpro_xyz",
-    "https://t.me/ProxyFree_Ru"
+    "https://t.me/ProxyFree_Ru",
+    "https://t.me/JustMTProxy"
   ],
   "thread_source_enabled": false,
   "thread_source_url": "https://t.me/strbypass/237103",
@@ -57,6 +69,8 @@
   "telegram_phone": "",
   "telegram_session_file": "telegram_user.sec",
   "xray_subscription_urls": [
+    "https://charity.invisibleshrimp.su/DGC4_hKXVZ0phvvw",
+    "https://s3.toostep.top/sub/exitfy",
     "https://mifa.world/turbo#MIFA%20%20%7C%20%20Turbo",
     "https://mifa.world/vless#MIFA%20%20%7C%20%20Vless",
     "https://mifa.world/trojan",

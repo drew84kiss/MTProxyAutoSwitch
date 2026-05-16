@@ -10,7 +10,7 @@ import time
 import logging
 
 from typing import Optional, Tuple
-from .stats import stats
+from .utils import stats
 
 
 log = logging.getLogger('tg-mtproto-proxy')

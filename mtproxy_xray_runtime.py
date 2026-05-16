@@ -4,9 +4,12 @@ import atexit
 import base64
 import contextlib
 import ctypes
+import gzip
 import hashlib
+import html
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -23,11 +26,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse, urlsplit, urlunsplit
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 DEFAULT_XRAY_SUBSCRIPTIONS = [
+    "https://charity.invisibleshrimp.su/DGC4_hKXVZ0phvvw",
+    "https://s3.toostep.top/sub/exitfy",
     "https://mifa.world/turbo#MIFA%20%20%7C%20%20Turbo",
     "https://mifa.world/vless#MIFA%20%20%7C%20%20Vless",
     "https://mifa.world/trojan",
@@ -56,9 +62,15 @@ XRAY_PROBE_SPEED_TEST_SECONDS = 2.5
 XRAY_ACTIVE_SPEED_TEST_BYTES = 128 * 1024 * 1024
 XRAY_ACTIVE_SPEED_TEST_SECONDS = 8.0
 
-XRAY_PROTOCOLS = {"vless", "vmess", "trojan"}
+XRAY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks"}
 SING_BOX_PROTOCOLS = {"hysteria", "hysteria2", "hy2"}
 XRAY_GOOD_DOWNLOAD_KBPS = 512.0
+NODE_LINK_RE = re.compile(
+    r"(?:vless|vmess|trojan|ss|hysteria2|hy2|hysteria)://[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "hysteria://")
+SUBSCRIPTION_USER_AGENT = "v2rayN/6.23 MTProxyAutoSwitch/1.0"
 
 
 @dataclass
@@ -94,8 +106,9 @@ class XrayNode:
 
     @property
     def key(self) -> tuple[str, str, int, str]:
-        digest = hashlib.sha256(str(self.credential or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
-        return (self.protocol, self.host, int(self.port), digest)
+        dedup = _node_dedup_text(self.raw_url) or str(self.credential or "")
+        digest = hashlib.sha256(dedup.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return (self.protocol, self.host.lower(), int(self.port), digest)
 
     def title(self) -> str:
         return self.name or f"{self.protocol}://{self.host}:{self.port}"
@@ -792,7 +805,7 @@ def collect_subscription_nodes(
         per_source_limit = max(1, (max_servers + len(source_urls) - 1) // len(source_urls))
     for source_url in source_urls:
         try:
-            text = _fetch_text(source_url, timeout=timeout)
+            text = _fetch_text(source_url, timeout=timeout, log_sink=log_sink)
         except Exception as exc:
             if log_sink is not None:
                 log_sink(f"[xray] source failed {source_url}: {exc}")
@@ -872,12 +885,14 @@ def _result_from_row(row: dict[str, Any], *, accepted: bool) -> XrayProbeResult 
 
 
 def parse_node_link(raw_url: str, *, source_url: str = "") -> XrayNode | None:
-    raw_url = str(raw_url or "").strip()
+    raw_url = _sanitize_node_uri(raw_url)
     if not raw_url:
         return None
     scheme = raw_url.split(":", 1)[0].lower()
     if scheme == "vmess":
         return _parse_vmess(raw_url, source_url)
+    if scheme == "ss":
+        return _parse_shadowsocks(raw_url, source_url)
     if scheme in {"vless", "trojan", "hysteria", "hysteria2", "hy2"}:
         return _parse_uri_node(raw_url, source_url)
     return None
@@ -944,23 +959,426 @@ def _parse_uri_node(raw_url: str, source_url: str) -> XrayNode | None:
     )
 
 
+def _parse_shadowsocks(raw_url: str, source_url: str) -> XrayNode | None:
+    parsed = urlparse(raw_url)
+    fragment = unquote(parsed.fragment or "")
+    main = raw_url.split("://", 1)[1].split("#", 1)[0]
+    main = main.split("?", 1)[0]
+
+    method = ""
+    password = ""
+    host = parsed.hostname or ""
+    port = int(parsed.port or 0)
+
+    if "@" in main:
+        userinfo = main.rsplit("@", 1)[0]
+        decoded_userinfo = _decode_base64_plain(userinfo) if ":" not in userinfo else unquote(userinfo)
+        if ":" not in decoded_userinfo:
+            decoded_userinfo = unquote(userinfo)
+        if ":" in decoded_userinfo:
+            method, password = decoded_userinfo.split(":", 1)
+    else:
+        decoded = _decode_base64_plain(main)
+        if "@" in decoded:
+            userinfo, hostport = decoded.rsplit("@", 1)
+            if ":" in userinfo:
+                method, password = userinfo.split(":", 1)
+            host, port = _split_host_port(hostport, default_port=8388)
+
+    if not host or not port or not method or not password:
+        return None
+    return XrayNode(
+        protocol="shadowsocks",
+        raw_url=raw_url,
+        name=fragment or f"ss://{host}:{port}",
+        host=host,
+        port=port,
+        credential=password,
+        query={"method": method},
+        source_url=source_url,
+        runtime="xray",
+    )
+
+
+def _split_host_port(hostport: str, *, default_port: int) -> tuple[str, int]:
+    value = str(hostport or "").strip()
+    if value.startswith("[") and "]" in value:
+        host, _, rest = value[1:].partition("]")
+        port_text = rest[1:] if rest.startswith(":") else ""
+        try:
+            return host, int(port_text or default_port)
+        except ValueError:
+            return host, default_port
+    host, sep, port_text = value.rpartition(":")
+    if sep:
+        try:
+            return host, int(port_text or default_port)
+        except ValueError:
+            return host, default_port
+    return value, default_port
+
+
 def _subscription_lines(text: str) -> list[str]:
     text = str(text or "").strip()
     decoded = _decode_base64(text)
-    candidates = decoded if "://" in decoded else text
+    candidates = decoded if "://" in decoded or decoded.lstrip().startswith(("{", "[")) else text
+    extracted: list[str] = []
+    seen: set[str] = set()
+    for value in _node_links_from_text(candidates):
+        clean = _sanitize_node_uri(value)
+        if clean and clean not in seen:
+            seen.add(clean)
+            extracted.append(clean)
+    if extracted:
+        return extracted
+    for value in _node_links_from_json(candidates):
+        clean = _sanitize_node_uri(value)
+        if clean and clean not in seen:
+            seen.add(clean)
+            extracted.append(clean)
+    if extracted:
+        return extracted
     lines: list[str] = []
     for line in candidates.replace("\r", "\n").split("\n"):
-        value = line.strip()
+        value = _sanitize_node_uri(line)
         if value:
             lines.append(value)
     return lines
 
 
-def _fetch_text(url: str, *, timeout: float) -> str:
+def _fetch_text(
+    url: str,
+    *,
+    timeout: float,
+    log_sink: Callable[[str], None] | None = None,
+) -> str:
     clean_url = str(url or "").strip()
-    req = Request(clean_url, headers={"User-Agent": "MTProxyAutoSwitch/1.0"})
-    with urlopen(req, timeout=max(2.0, timeout)) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    errors: list[str] = []
+    for candidate_url in _subscription_candidate_urls(clean_url):
+        headers = _subscription_headers(candidate_url)
+        for current_timeout in _subscription_timeouts(timeout):
+            for context in _subscription_ssl_contexts():
+                try:
+                    req = Request(candidate_url, headers=headers)
+                    with urlopen(req, timeout=current_timeout, context=context) as resp:
+                        encoding = str(resp.headers.get("Content-Encoding", "") or "")
+                        return _decode_subscription_body(resp.read(), encoding=encoding)
+                except (HTTPError, URLError, TimeoutError, OSError, ssl.SSLError) as exc:
+                    marker = f"{urlparse(candidate_url).netloc or '?'}:{type(exc).__name__}"
+                    if marker not in errors:
+                        errors.append(marker)
+                except Exception as exc:
+                    marker = f"{urlparse(candidate_url).netloc or '?'}:{type(exc).__name__}"
+                    if marker not in errors:
+                        errors.append(marker)
+    if log_sink is not None and errors:
+        log_sink(f"[xray] source fetch attempts failed {clean_url}: {' | '.join(errors[:5])}")
+    raise RuntimeError("subscription fetch failed")
+
+
+def _subscription_headers(url: str) -> dict[str, str]:
+    host = urlparse(str(url or "")).netloc
+    headers = {
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+        "Connection": "close",
+        "User-Agent": SUBSCRIPTION_USER_AGENT,
+        "X-Device-Locale": "en",
+        "X-Device-OS": "Windows",
+    }
+    if host:
+        headers["Host"] = host
+    return headers
+
+
+def _subscription_timeouts(timeout: float) -> list[float]:
+    base = max(3.0, float(timeout or 8.0))
+    values = [base, max(base, 15.0), max(base, 30.0)]
+    out: list[float] = []
+    for value in values:
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def _subscription_ssl_contexts() -> list[ssl.SSLContext | None]:
+    contexts: list[ssl.SSLContext | None] = [None]
+    with contextlib.suppress(Exception):
+        contexts.append(ssl._create_unverified_context())
+    return contexts
+
+
+def _subscription_candidate_urls(url: str) -> list[str]:
+    target = str(url or "").strip()
+    if not target:
+        return []
+    urls = [target]
+    with contextlib.suppress(Exception):
+        parsed = urlparse(target)
+        host = str(parsed.netloc or "").strip().lower()
+        parts = [part for part in str(parsed.path or "").split("/") if part]
+        if host == "raw.githubusercontent.com" and len(parts) >= 5 and parts[2] == "refs" and parts[3] == "heads":
+            owner = parts[0]
+            repo = parts[1]
+            branch = parts[4]
+            tail = parts[5:]
+            canonical_path = "/" + "/".join([owner, repo, branch] + tail)
+            canonical = urlunsplit((parsed.scheme or "https", parsed.netloc, canonical_path, parsed.query or "", ""))
+            if canonical not in urls:
+                urls.append(canonical)
+            jsd_path = "/gh/" + "/".join([owner, repo + "@" + branch] + tail)
+            for cdn_host in ("cdn.jsdelivr.net", "gcore.jsdelivr.net", "fastly.jsdelivr.net"):
+                cdn_url = urlunsplit(("https", cdn_host, jsd_path, parsed.query or "", ""))
+                if cdn_url not in urls:
+                    urls.append(cdn_url)
+    return urls
+
+
+def _decode_subscription_body(raw: bytes, *, encoding: str = "") -> str:
+    data = bytes(raw or b"")
+    if data[:2] == b"\x1f\x8b" or "gzip" in str(encoding or "").lower():
+        with contextlib.suppress(Exception):
+            data = gzip.decompress(data)
+    return data.decode("utf-8", errors="replace")
+
+
+def _node_links_from_text(text: str) -> list[str]:
+    values: list[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stripped.lower().startswith(scheme) for scheme in NODE_SCHEMES):
+            values.append(stripped)
+            continue
+        values.extend(match.group(0) for match in NODE_LINK_RE.finditer(stripped))
+    if not values:
+        values.extend(match.group(0) for match in NODE_LINK_RE.finditer(str(text or "")))
+    return values
+
+
+def _node_links_from_json(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw or raw[0] not in "{[":
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    links: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            links.extend(_node_links_from_text(value))
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        converted = _node_link_from_json_object(value)
+        if converted:
+            links.append(converted)
+        for item in value.values():
+            walk(item)
+
+    walk(payload)
+    return links
+
+
+def _node_link_from_json_object(item: dict[str, Any]) -> str:
+    protocol = str(item.get("protocol") or item.get("type") or "").strip().lower()
+    if not protocol:
+        return ""
+    if protocol == "shadowsocks":
+        return _shadowsocks_link_from_json(item)
+    if protocol in {"vless", "trojan"}:
+        return _standard_link_from_json(item, protocol)
+    return ""
+
+
+def _standard_link_from_json(item: dict[str, Any], protocol: str) -> str:
+    try:
+        credential = ""
+        server = str(item.get("server") or item.get("address") or "").strip()
+        port = int(item.get("server_port") or item.get("port") or 0)
+        if protocol == "trojan":
+            credential = str(item.get("password") or "").strip()
+        else:
+            credential = str(item.get("uuid") or item.get("id") or item.get("user") or "").strip()
+        settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+        if protocol == "vless" and (not server or not port or not credential):
+            for vnext in settings.get("vnext") or []:
+                if not isinstance(vnext, dict):
+                    continue
+                server = str(vnext.get("address") or vnext.get("server") or server or "").strip()
+                port = int(vnext.get("port") or port or 0)
+                users = vnext.get("users") or []
+                if users and isinstance(users[0], dict):
+                    credential = str(users[0].get("id") or users[0].get("uuid") or credential or "").strip()
+                break
+        if not server or not port or not credential:
+            return ""
+        query = _query_from_json_transport(item)
+        tag = quote(str(item.get("tag") or item.get("name") or ""), safe="")
+        url = f"{protocol}://{quote(credential, safe='')}@{server}:{port}"
+        if query:
+            url += "?" + query
+        if tag:
+            url += "#" + tag
+        return url
+    except Exception:
+        return ""
+
+
+def _query_from_json_transport(item: dict[str, Any]) -> str:
+    params: dict[str, str] = {}
+    stream = item.get("streamSettings") if isinstance(item.get("streamSettings"), dict) else {}
+    if stream:
+        if stream.get("network"):
+            params["type"] = str(stream.get("network") or "")
+        if stream.get("security"):
+            params["security"] = str(stream.get("security") or "")
+        tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+        if tls:
+            if tls.get("serverName"):
+                params["sni"] = str(tls.get("serverName") or "")
+            if tls.get("fingerprint"):
+                params["fp"] = str(tls.get("fingerprint") or "")
+            if tls.get("alpn"):
+                alpn = tls.get("alpn")
+                params["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
+            if tls.get("allowInsecure") is True:
+                params["allowInsecure"] = "1"
+        reality = stream.get("realitySettings") if isinstance(stream.get("realitySettings"), dict) else {}
+        if reality:
+            params["security"] = "reality"
+            for source, target in [
+                ("serverName", "sni"),
+                ("fingerprint", "fp"),
+                ("publicKey", "pbk"),
+                ("shortId", "sid"),
+                ("spiderX", "spx"),
+            ]:
+                if reality.get(source):
+                    params[target] = str(reality.get(source) or "")
+        ws = stream.get("wsSettings") if isinstance(stream.get("wsSettings"), dict) else {}
+        if ws:
+            if ws.get("path"):
+                params["path"] = str(ws.get("path") or "")
+            headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+            if headers.get("Host") or headers.get("host"):
+                params["host"] = str(headers.get("Host") or headers.get("host") or "")
+        grpc = stream.get("grpcSettings") if isinstance(stream.get("grpcSettings"), dict) else {}
+        if grpc:
+            if grpc.get("serviceName"):
+                params["serviceName"] = str(grpc.get("serviceName") or "")
+            if grpc.get("authority"):
+                params["authority"] = str(grpc.get("authority") or "")
+            if grpc.get("multiMode") is True:
+                params["mode"] = "multi"
+        for settings_key in ("xhttpSettings", "splithttpSettings", "httpupgradeSettings"):
+            transport_settings = stream.get(settings_key) if isinstance(stream.get(settings_key), dict) else {}
+            if transport_settings:
+                if transport_settings.get("path"):
+                    params["path"] = str(transport_settings.get("path") or "")
+                if transport_settings.get("host"):
+                    params["host"] = str(transport_settings.get("host") or "")
+                if transport_settings.get("mode"):
+                    params["mode"] = str(transport_settings.get("mode") or "")
+    tls = item.get("tls") if isinstance(item.get("tls"), dict) else {}
+    if tls:
+        if tls.get("enabled") is True or str(tls.get("enabled") or "").lower() == "true":
+            params["security"] = "tls"
+        if tls.get("server_name") or tls.get("sni"):
+            params["sni"] = str(tls.get("server_name") or tls.get("sni") or "")
+        if tls.get("alpn"):
+            alpn = tls.get("alpn")
+            params["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
+    transport = item.get("transport") if isinstance(item.get("transport"), dict) else {}
+    if transport:
+        if transport.get("type") or transport.get("network"):
+            params["type"] = str(transport.get("type") or transport.get("network") or "")
+        if transport.get("path"):
+            params["path"] = str(transport.get("path") or "")
+        headers = transport.get("headers") if isinstance(transport.get("headers"), dict) else {}
+        if headers.get("Host") or headers.get("host"):
+            params["host"] = str(headers.get("Host") or headers.get("host") or "")
+    return "&".join(f"{quote(str(k), safe='')}={quote(str(v), safe='/@:')}" for k, v in params.items() if v)
+
+
+def _shadowsocks_link_from_json(item: dict[str, Any]) -> str:
+    try:
+        server = str(item.get("server") or item.get("address") or "").strip()
+        port = int(item.get("server_port") or item.get("port") or 0)
+        method = str(item.get("method") or "").strip()
+        password = str(item.get("password") or "").strip()
+        if not server or not port or not method or not password:
+            return ""
+        userinfo = base64.urlsafe_b64encode(f"{method}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
+        tag = quote(str(item.get("tag") or item.get("name") or ""), safe="")
+        url = f"ss://{userinfo}@{server}:{port}"
+        if tag:
+            url += "#" + tag
+        return url
+    except Exception:
+        return ""
+
+
+def _sanitize_node_uri(raw_uri: object) -> str:
+    try:
+        value = html.unescape(str(raw_uri or ""))
+    except Exception:
+        return ""
+    value = value.replace("\r", "").replace("\n", "").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    indices = [lowered.find(scheme) for scheme in NODE_SCHEMES if lowered.find(scheme) >= 0]
+    if indices:
+        value = value[min(indices):]
+    value = re.sub(r"[\s\)\]>,\.;]+$", "", value)
+    if "#" in value and not value.lower().startswith("vmess://"):
+        base, fragment = value.split("#", 1)
+        with contextlib.suppress(Exception):
+            fragment = quote(unquote(fragment), safe="")
+        value = base + "#" + fragment
+    return value
+
+
+def _node_dedup_text(raw_uri: str) -> str:
+    value = _sanitize_node_uri(raw_uri)
+    if not value:
+        return ""
+    if value.lower().startswith("vmess://"):
+        decoded = _decode_base64_plain(value[8:].split("#", 1)[0])
+        with contextlib.suppress(Exception):
+            payload = json.loads(decoded)
+            return "vmess://" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return value
+    if "#" in value:
+        value = value.split("#", 1)[0]
+    parsed = urlsplit(value)
+    if not parsed.scheme:
+        return value
+    query = ""
+    if parsed.query:
+        items = parse_qs(parsed.query, keep_blank_values=True)
+        parts: list[str] = []
+        for key in sorted(items):
+            for item in sorted(items[key]):
+                parts.append(f"{quote(str(key), safe='')}={quote(str(item), safe='/@:')}")
+        query = "&".join(parts)
+    host = (parsed.hostname or "").lower()
+    netloc = host
+    if parsed.port:
+        netloc = f"{host}:{parsed.port}"
+    if parsed.username:
+        userinfo = quote(unquote(parsed.username), safe=":")
+        netloc = f"{userinfo}@{netloc}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
 
 
 def _decode_base64(value: str) -> str:
@@ -978,19 +1396,57 @@ def _decode_base64(value: str) -> str:
     return value
 
 
+def _decode_base64_plain(value: str) -> str:
+    compact = "".join(str(value or "").strip().split())
+    if not compact:
+        return ""
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        with contextlib.suppress(Exception):
+            padded = compact + "=" * (-len(compact) % 4)
+            return decoder(padded.encode("ascii")).decode("utf-8", errors="replace")
+    return value
+
+
 def _xray_config(node: XrayNode, listen_host: str, listen_port: int) -> dict[str, Any]:
     outbound = _xray_outbound(node)
     return {
-        "log": {"loglevel": "warning"},
+        "log": {"loglevel": "warning", "access": "", "error": ""},
+        "dns": {
+            "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"],
+            "queryStrategy": "UseIPv4",
+            "disableFallback": False,
+        },
         "inbounds": [
             {
                 "listen": listen_host,
                 "port": listen_port,
                 "protocol": "socks",
-                "settings": {"udp": False, "auth": "noauth"},
+                "settings": {"udp": True, "auth": "noauth"},
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic", "fakedns"],
+                    "routeOnly": True,
+                },
             }
         ],
-        "outbounds": [outbound],
+        "outbounds": [
+            outbound,
+            {
+                "protocol": "blackhole",
+                "tag": "block",
+                "settings": {"response": {"type": "none"}},
+            },
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {
+                    "type": "field",
+                    "outboundTag": "block",
+                    "ip": ["127.0.0.0/8", "::1/128"],
+                }
+            ],
+        },
     }
 
 
@@ -1022,6 +1478,21 @@ def _xray_outbound(node: XrayNode) -> dict[str, Any]:
             "settings": {"servers": [{"address": node.host, "port": node.port, "password": node.credential}]},
             "streamSettings": stream,
         }
+    if node.protocol == "shadowsocks":
+        return {
+            "protocol": "shadowsocks",
+            "tag": "proxy",
+            "settings": {
+                "servers": [
+                    {
+                        "address": node.host,
+                        "port": node.port,
+                        "method": node.query.get("method") or "aes-256-gcm",
+                        "password": node.credential,
+                    }
+                ]
+            },
+        }
     raise ValueError(f"Unsupported xray protocol: {node.protocol}")
 
 
@@ -1031,6 +1502,8 @@ def _xray_stream_settings(query: dict[str, str]) -> dict[str, Any]:
         network = "http"
     security = query.get("security") or query.get("tls") or ""
     stream: dict[str, Any] = {"network": network}
+    if query.get("packetEncoding"):
+        stream["packetEncoding"] = query["packetEncoding"]
     if security and security != "none":
         stream["security"] = security
     sni = query.get("sni") or query.get("serverName") or query.get("host") or ""
@@ -1040,8 +1513,7 @@ def _xray_stream_settings(query: dict[str, str]) -> dict[str, Any]:
             tls["serverName"] = sni
         if _truthy(query.get("allowInsecure") or query.get("allow_insecure") or query.get("insecure")):
             tls["allowInsecure"] = True
-        if query.get("fp") or query.get("fingerprint"):
-            tls["fingerprint"] = query.get("fp") or query.get("fingerprint")
+        tls["fingerprint"] = query.get("fp") or query.get("fingerprint") or "chrome"
         if query.get("alpn"):
             tls["alpn"] = [item.strip() for item in str(query.get("alpn") or "").split(",") if item.strip()]
         stream["tlsSettings"] = tls
@@ -1049,6 +1521,7 @@ def _xray_stream_settings(query: dict[str, str]) -> dict[str, Any]:
         reality: dict[str, Any] = {}
         if sni:
             reality["serverName"] = sni
+        reality["fingerprint"] = query.get("fp") or query.get("fingerprint") or "chrome"
         for source, target in [("pbk", "publicKey"), ("publicKey", "publicKey"), ("sid", "shortId"), ("fp", "fingerprint"), ("fingerprint", "fingerprint"), ("spx", "spiderX")]:
             if query.get(source):
                 reality[target] = query[source]
@@ -1083,6 +1556,8 @@ def _xray_stream_settings(query: dict[str, str]) -> dict[str, Any]:
     elif network == "grpc":
         service = query.get("serviceName") or query.get("service") or ""
         stream["grpcSettings"] = {"serviceName": service}
+        if (query.get("mode") or "").lower() == "multi":
+            stream["grpcSettings"]["multiMode"] = True
         if query.get("authority"):
             stream["grpcSettings"]["authority"] = query["authority"]
     elif network == "httpupgrade":
@@ -1092,7 +1567,16 @@ def _xray_stream_settings(query: dict[str, str]) -> dict[str, Any]:
         if query.get("host"):
             httpupgrade["host"] = query["host"]
         stream["httpupgradeSettings"] = httpupgrade
-    elif network in {"splithttp", "xhttp"}:
+    elif network == "xhttp":
+        xhttp: dict[str, Any] = {}
+        if query.get("path"):
+            xhttp["path"] = query["path"]
+        if query.get("host"):
+            xhttp["host"] = query["host"]
+        if query.get("mode"):
+            xhttp["mode"] = query["mode"]
+        stream["xhttpSettings"] = xhttp
+    elif network == "splithttp":
         xhttp: dict[str, Any] = {}
         if query.get("path"):
             xhttp["path"] = query["path"]
@@ -1101,6 +1585,26 @@ def _xray_stream_settings(query: dict[str, str]) -> dict[str, Any]:
         if query.get("mode"):
             xhttp["mode"] = query["mode"]
         stream["splithttpSettings"] = xhttp
+    elif network == "kcp":
+        kcp: dict[str, Any] = {
+            "mtu": int(query.get("mtu") or 1350),
+            "tti": int(query.get("tti") or 50),
+            "uplinkCapacity": int(query.get("uplinkCapacity") or query.get("up") or 12),
+            "downlinkCapacity": int(query.get("downlinkCapacity") or query.get("down") or 100),
+            "congestion": _truthy(query.get("congestion")),
+            "readBufferSize": int(query.get("readBufferSize") or 2),
+            "writeBufferSize": int(query.get("writeBufferSize") or 2),
+            "header": {"type": query.get("headerType") or query.get("header") or "none"},
+        }
+        if query.get("seed"):
+            kcp["seed"] = query["seed"]
+        stream["kcpSettings"] = kcp
+    elif network == "quic":
+        stream["quicSettings"] = {
+            "security": query.get("quicSecurity") or query.get("securityType") or query.get("host") or "none",
+            "key": query.get("key") or query.get("path") or "",
+            "header": {"type": query.get("headerType") or query.get("header") or "none"},
+        }
     return stream
 
 
@@ -1123,6 +1627,10 @@ def _sing_box_config(node: XrayNode, listen_host: str, listen_port: int) -> dict
         tls["insecure"] = True
     if node.query.get("alpn"):
         tls["alpn"] = [item.strip() for item in node.query["alpn"].split(",") if item.strip()]
+    tls["utls"] = {
+        "enabled": True,
+        "fingerprint": node.query.get("fp") or node.query.get("fingerprint") or "chrome",
+    }
     outbound["tls"] = tls
     if node.query.get("obfs"):
         obfs_type = node.query.get("obfs")
@@ -1130,8 +1638,15 @@ def _sing_box_config(node: XrayNode, listen_host: str, listen_port: int) -> dict
             obfs_type = "salamander"
         outbound["obfs"] = {"type": obfs_type, "password": node.query.get("obfs-password") or node.query.get("obfsPassword") or node.query.get("obfs_password") or ""}
     return {
-        "log": {"level": "warn"},
-        "inbounds": [{"type": "socks", "tag": "socks-in", "listen": listen_host, "listen_port": listen_port}],
+        "log": {"level": "warn", "disabled": False},
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": listen_host,
+                "listen_port": listen_port,
+            }
+        ],
         "outbounds": [outbound],
         "route": {"final": "proxy"},
     }

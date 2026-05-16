@@ -13,6 +13,7 @@ import statistics
 import sys
 import threading
 import time
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,15 +36,36 @@ from mtproxy_net import (
 
 
 DEFAULT_SOURCES = [
+    "local:telegram-proxy-collector",
     "https://mtpro.xyz/mtproto-ru",
+    "https://mtpro.xyz/api/?type=mtproto",
+    "https://mtpro.xyz/api/?type=mtproto-ru",
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
     "mtproxytg mirrors",
+    "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
+    "https://raw.githubusercontent.com/Grim1313/mtproto-for-telegram/refs/heads/master/all_proxies.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
+    "https://raw.githubusercontent.com/yemixzy/proxy-projects/main/proxies/mtproto.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.txt",
+    "https://raw.githubusercontent.com/Freedom-Guard/Proxy/main/proxies/mtproto.txt",
+    "https://raw.githubusercontent.com/seriyps/mtproto_proxy/master/proxies.txt",
+    "https://raw.githubusercontent.com/MTProto/MTProtoProxy/master/proxies/mtproto.txt",
     "https://t.me/s/mtpro_xyz",
     "https://t.me/s/ProxyFree_Ru",
 ]
 
+LOCAL_COLLECTOR_SOURCE = "local:telegram-proxy-collector"
+LOCAL_COLLECTOR_BUNDLED_SEED_FILE = "telegram_proxy_collector_seed.txt"
+LOCAL_COLLECTOR_DIR_NAME = "telegram-proxy-collector-main"
+LOCAL_COLLECTOR_SEED_FILES = [
+    "verified/proxy_links_clean.txt",
+    "verified/proxy_links_tme_clean.txt",
+    "verified/proxy_all_verified.txt",
+    "proxy_all.txt",
+    "proxy_list.txt",
+]
 MTPROXYTG_MIRROR_GROUP = "mtproxytg mirrors"
 MTPROXYTG_MIRRORS = [f"https://mtproxytg{index}.vercel.app/" for index in range(2, 11)]
 
@@ -89,6 +111,9 @@ PROXY_OBJECT_RE = re.compile(
     r"[^{}]*?[\"']?port[\"']?\s*:\s*[\"']?(?P<port>\d+)[\"']?"
     r"[^{}]*?[\"']?secret[\"']?\s*:\s*[\"'](?P<secret>[^\"']+)[\"'][^{}]*?\}",
     re.IGNORECASE | re.DOTALL,
+)
+SIMPLE_PROXY_RE = re.compile(
+    r"(?<![A-Za-z0-9.-])(?P<host>[A-Za-z0-9.-]{1,253}):(?P<port>\d{1,5}):(?P<secret>[0-9A-Fa-f]{16,512})(?![0-9A-Fa-f])"
 )
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 SECRET_RE = re.compile(r"^[0-9a-fA-F]{16,512}$")
@@ -261,6 +286,7 @@ class CollectorRunResult:
 class Fetcher:
     def __init__(self, timeout: float) -> None:
         self.timeout = timeout
+        self.retries = max(1, int(os.environ.get("MTPROXY_FETCH_RETRIES", "3") or 3))
         self.ssl_context = create_verified_ssl_context()
         self.insecure_ssl_context = create_insecure_ssl_context()
         self.allow_insecure_tls = os.environ.get("MTPROXY_ALLOW_INSECURE_TLS", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -272,6 +298,19 @@ class Fetcher:
             headers["Referer"] = referer
         request = Request(url, headers=headers)
 
+        last_exc: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                return self._fetch_text_once(request)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.retries or not _is_retryable_fetch_error(exc):
+                    break
+                time.sleep(min(2.0, 0.35 * attempt))
+        exc = last_exc or RuntimeError("unknown fetch error")
+        raise _fetch_runtime_error(url, exc) from exc
+
+    def _fetch_text_once(self, request: Request) -> str:
         try:
             return self._fetch_text(request, self.ssl_context)
         except Exception as exc:
@@ -280,15 +319,7 @@ class Fetcher:
                     return self._fetch_text(request, self.insecure_ssl_context)
                 except Exception as retry_exc:
                     exc = retry_exc
-            if isinstance(exc, TimeoutError):
-                raise RuntimeError(f"{url} -> timed out") from exc
-            if isinstance(exc, HTTPError):
-                raise RuntimeError(f"{url} -> HTTP {exc.code}") from exc
-            if isinstance(exc, URLError):
-                raise RuntimeError(f"{url} -> {exc.reason}") from exc
-            if isinstance(exc, OSError):
-                raise RuntimeError(f"{url} -> {exc}") from exc
-            raise RuntimeError(f"{url} -> {exc}") from exc
+            raise exc
 
     def _fetch_text(self, request: Request, context) -> str:
         with telegram_web_dns_override(self.telegram_dns_override):
@@ -297,6 +328,26 @@ class Fetcher:
             payload = response.read()
             charset = response.headers.get_content_charset() or "utf-8"
             return payload.decode(charset, errors="replace")
+
+
+def _is_retryable_fetch_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return int(getattr(exc, "code", 0) or 0) in {408, 425, 429, 500, 502, 503, 504}
+    if isinstance(exc, (TimeoutError, URLError, OSError)):
+        return True
+    return False
+
+
+def _fetch_runtime_error(url: str, exc: Exception) -> RuntimeError:
+    if isinstance(exc, TimeoutError):
+        return RuntimeError(f"{url} -> timed out")
+    if isinstance(exc, HTTPError):
+        return RuntimeError(f"{url} -> HTTP {exc.code}")
+    if isinstance(exc, URLError):
+        return RuntimeError(f"{url} -> {exc.reason}")
+    if isinstance(exc, OSError):
+        return RuntimeError(f"{url} -> {exc}")
+    return RuntimeError(f"{url} -> {exc}")
 
 
 def emit_event(event_sink: EventSink | None, event_name: str, **payload: Any) -> None:
@@ -482,6 +533,19 @@ def parse_json_proxies(payload: Any, source_url: str, found_in: str) -> list[Pro
     return results
 
 
+def parse_simple_proxy_triplet(line: str, source_url: str, found_in: str) -> ProxyRecord | None:
+    match = SIMPLE_PROXY_RE.search(str(line or ""))
+    if match is None:
+        return None
+    return make_proxy(
+        match.group("host"),
+        match.group("port"),
+        match.group("secret"),
+        source_url,
+        found_in,
+    )
+
+
 def parse_json_socks5(payload: Any, source_url: str, found_in: str) -> list[Socks5Record]:
     results: list[Socks5Record] = []
 
@@ -541,6 +605,17 @@ def scan_text(text: str, source_url: str, current_url: str) -> ScanArtifacts:
             artifacts.socks5.append(proxy)
 
     for match in PROXY_OBJECT_RE.finditer(normalized):
+        proxy = make_proxy(
+            match.group("host"),
+            match.group("port"),
+            match.group("secret"),
+            source_url,
+            current_url,
+        )
+        if proxy:
+            artifacts.proxies.append(proxy)
+
+    for match in SIMPLE_PROXY_RE.finditer(normalized):
         proxy = make_proxy(
             match.group("host"),
             match.group("port"),
@@ -669,6 +744,91 @@ def fetch_data_url(
         record_socks5(summary, socks5_registry, proxy)
 
 
+def is_local_collector_source(source_url: str) -> bool:
+    return str(source_url or "").strip().lower() in {
+        LOCAL_COLLECTOR_SOURCE,
+        "telegram-proxy-collector",
+        "telegram proxy collector",
+    }
+
+
+def scrape_local_collector_seed(
+    registry: dict[tuple[str, int, str], ProxyRecord],
+    socks5_registry: dict[tuple[str, int, str, str], Socks5Record],
+    *,
+    verbose: bool,
+    log_sink: LogSink | None,
+) -> SourceSummary:
+    summary = SourceSummary(source_url=LOCAL_COLLECTOR_SOURCE)
+    seed_paths: list[Path] = []
+    seen_paths: set[str] = set()
+
+    for root in _local_collector_resource_roots():
+        bundled_seed = root / LOCAL_COLLECTOR_BUNDLED_SEED_FILE
+        marker = str(bundled_seed.resolve())
+        if bundled_seed.exists() and marker not in seen_paths:
+            seed_paths.append(bundled_seed)
+            seen_paths.add(marker)
+
+    legacy_root = Path(__file__).resolve().parent / LOCAL_COLLECTOR_DIR_NAME
+    if legacy_root.exists():
+        for relative_name in LOCAL_COLLECTOR_SEED_FILES:
+            path = legacy_root / relative_name
+            marker = str(path.resolve())
+            if path.exists() and marker not in seen_paths:
+                seed_paths.append(path)
+                seen_paths.add(marker)
+
+    if not seed_paths:
+        summary.errors.append(f"{LOCAL_COLLECTOR_BUNDLED_SEED_FILE} -> not found")
+        return summary
+
+    for path in seed_paths:
+        summary.fetched_urls.append(str(path))
+        try:
+            payload = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            summary.errors.append(f"{path} -> {exc}")
+            continue
+        artifacts = scan_text(payload, LOCAL_COLLECTOR_SOURCE, str(path))
+        summary.script_urls_found += len(artifacts.script_urls)
+        summary.data_urls_found += len(artifacts.data_urls)
+        for proxy in artifacts.proxies:
+            record_proxy(summary, registry, proxy)
+        for proxy in artifacts.socks5:
+            record_socks5(summary, socks5_registry, proxy)
+
+    log(
+        f"[source] local collector seed -> files={len(summary.fetched_urls)} unique_total={len(registry)}",
+        verbose_only=True,
+        verbose=verbose,
+        sink=log_sink,
+    )
+    return summary
+
+
+def _local_collector_resource_roots() -> list[Path]:
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        executable_path = Path(sys.executable).resolve()
+        roots.append(Path(getattr(sys, "_MEIPASS", executable_path.parent)))
+        roots.append(executable_path.parent)
+    roots.append(Path(__file__).resolve().parent)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            marker = str(root.resolve())
+        except Exception:
+            marker = str(root)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(root)
+    return unique
+
+
 def scrape_source(
     source_url: str,
     fetcher: Fetcher,
@@ -788,18 +948,24 @@ def create_probe_client(proxy: ProxyRecord, timeout: float) -> TelegramClient:
     connection = ConnectionTcpMTProxyRandomizedIntermediate
     proxy_tuple = (proxy.host, proxy.port, proxy.secret)
 
-    return TelegramClient(
-        MemorySession(),
-        PROBE_API_ID,
-        PROBE_API_HASH,
-        connection=connection,
-        proxy=proxy_tuple,
-        timeout=max(1, int(timeout)),
-        connection_retries=0,
-        request_retries=0,
-        auto_reconnect=False,
-        receive_updates=False,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="proxy argument will be ignored because python-socks is not installed",
+            category=UserWarning,
+        )
+        return TelegramClient(
+            MemorySession(),
+            PROBE_API_ID,
+            PROBE_API_HASH,
+            connection=connection,
+            proxy=proxy_tuple,
+            timeout=max(1, int(timeout)),
+            connection_retries=0,
+            request_retries=0,
+            auto_reconnect=False,
+            receive_updates=False,
+        )
 
 
 async def perform_mtproto_request(
@@ -1210,7 +1376,14 @@ def run_collection(
             total=len(config.sources),
         )
 
-        if is_mtproxytg_mirror_group(source_url):
+        if is_local_collector_source(source_url):
+            summary = scrape_local_collector_seed(
+                registry=registry,
+                socks5_registry=socks5_registry,
+                verbose=config.verbose,
+                log_sink=log_sink,
+            )
+        elif is_mtproxytg_mirror_group(source_url):
             summary = scrape_mtproxytg_mirrors(
                 fetcher=fetcher,
                 registry=registry,

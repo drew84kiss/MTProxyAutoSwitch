@@ -8,6 +8,7 @@ import io
 import re
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,14 +23,17 @@ try:
 except ImportError:  # pragma: no cover
     win32crypt = None
 
-from mtproxy_collector import ProxyRecord, parse_proxy_link
+from mtproxy_collector import ProxyRecord, parse_proxy_link, scan_text
 
 THREAD_URL_RE = re.compile(r"^https?://t\.me/(?P<username>[A-Za-z0-9_]+)/(?P<thread_id>\d+)$", re.IGNORECASE)
 TELEGRAM_SOURCE_URL_RE = re.compile(
     r"^https?://t\.me/(?:(?:s/)?)(?P<username>[A-Za-z0-9_]+)(?:/(?P<message_id>\d+))?/?$",
     re.IGNORECASE,
 )
-PROXY_URL_RE = re.compile(r"(?:https://t\.me/proxy\?|tg://proxy\?)[^\s<>'\"]+", re.IGNORECASE)
+PROXY_URL_RE = re.compile(
+    r"(?:https?://(?:t|telegram)\.me/proxy\?|tg://proxy\?)[^\s<>'\"]+",
+    re.IGNORECASE,
+)
 
 DEFAULT_MEDIA_CHANNELS = ["telegram", "durov", "TelegramTips"]
 DEFAULT_TELEGRAM_SOURCE_URLS = [
@@ -46,6 +50,7 @@ DEFAULT_THREAD_MAX_MESSAGES = 350
 DEFAULT_SOURCE_MAX_MESSAGES = DEFAULT_THREAD_MAX_MESSAGES
 DEFAULT_SOURCE_MAX_AGE_DAYS = 5
 DEFAULT_SOURCE_MAX_PROXIES = 80
+DEFAULT_SOURCE_RETRIES = 2
 THREAD_PROGRESS_EVERY = 50
 SESSION_KEY_FILE_NAME = "session_key.bin"
 DPI_WINDOW_MIN_BYTES = 14 * 1024
@@ -215,7 +220,14 @@ def build_client(
         kwargs["proxy"] = proxy_tuple
 
     session = _load_session(config.session_path)
-    return TelegramClient(session, config.api_id, config.api_hash, **kwargs)
+    with warnings.catch_warnings():
+        if connection is not None:
+            warnings.filterwarnings(
+                "ignore",
+                message="proxy argument will be ignored because python-socks is not installed",
+                category=UserWarning,
+            )
+        return TelegramClient(session, config.api_id, config.api_hash, **kwargs)
 
 
 async def get_auth_status(
@@ -777,21 +789,48 @@ async def collect_telegram_sources_proxies(
     )
     for index, source_url in enumerate(unique_urls, start=1):
         _raise_if_cancelled(cancel_event)
-        proxies = await collect_telegram_source_proxies(
-            source_url,
-            config,
-            upstream_proxy=upstream_proxy,
-            log_sink=log_sink,
-            total_timeout=total_timeout,
-            request_timeout=request_timeout,
-            max_messages=max_messages,
-            max_proxies=max_proxies,
-            max_age_days=max_age_days,
-            event_sink=event_sink,
-            source_index=index,
-            total_sources=len(unique_urls),
-            cancel_event=cancel_event,
-        )
+        proxies: list[ProxyRecord] = []
+        last_exc: Exception | None = None
+        for attempt in range(1, DEFAULT_SOURCE_RETRIES + 1):
+            try:
+                proxies = await collect_telegram_source_proxies(
+                    source_url,
+                    config,
+                    upstream_proxy=upstream_proxy,
+                    log_sink=log_sink,
+                    total_timeout=total_timeout,
+                    request_timeout=request_timeout,
+                    max_messages=max_messages,
+                    max_proxies=max_proxies,
+                    max_age_days=max_age_days,
+                    event_sink=event_sink,
+                    source_index=index,
+                    total_sources=len(unique_urls),
+                    cancel_event=cancel_event,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                _raise_if_cancelled(cancel_event)
+                if _is_fatal_telegram_source_error(exc):
+                    raise
+                last_exc = exc
+                if log_sink is not None:
+                    log_sink(f"[telegram] {source_url} attempt {attempt}/{DEFAULT_SOURCE_RETRIES} failed: {exc}")
+                if attempt < DEFAULT_SOURCE_RETRIES:
+                    await asyncio.sleep(min(2.0, 0.5 * attempt))
+        if last_exc is not None:
+            if log_sink is not None:
+                log_sink(f"[telegram] {source_url} skipped after retries: {last_exc}")
+            _emit_progress(
+                event_sink,
+                "telegram_source_failed",
+                source=source_url,
+                index=index,
+                total=len(unique_urls),
+                error=str(last_exc),
+            )
+            continue
         for proxy in proxies:
             registry[proxy.key] = proxy
     _raise_if_cancelled(cancel_event)
@@ -803,6 +842,15 @@ async def collect_telegram_sources_proxies(
         max_age_days=max_age_days,
     )
     return sorted(registry.values(), key=lambda item: item.url)
+
+
+def _is_fatal_telegram_source_error(exc: Exception) -> bool:
+    text = str(exc or "")
+    if text in {"telegram_api_credentials_missing", "telegram_session_not_authorized", "refresh_cancelled"}:
+        return True
+    if text.startswith(TELEGRAM_USER_ERROR_PREFIX):
+        return True
+    return isinstance(exc, (errors.ApiIdInvalidError, errors.AuthKeyError, errors.UserDeactivatedError))
 
 
 async def deep_media_probe(
@@ -1128,6 +1176,9 @@ def _extract_message_proxies(message: Any, source_url: str) -> list[ProxyRecord]
     text_candidates = [getattr(message, "raw_text", "") or "", getattr(message, "message", "") or ""]
 
     for text in text_candidates:
+        artifacts = scan_text(text, source_url, source_url)
+        for proxy in artifacts.proxies:
+            records[proxy.key] = proxy
         for match in PROXY_URL_RE.finditer(text):
             proxy = parse_proxy_link(match.group(0), source_url, source_url)
             if proxy is not None:
@@ -1145,7 +1196,7 @@ def _extract_message_proxies(message: Any, source_url: str) -> list[ProxyRecord]
         length = getattr(entity, "length", 0)
         if length > 0:
             candidate = text[offset : offset + length]
-            if candidate.startswith("https://t.me/proxy?") or candidate.startswith("tg://proxy?"):
+            if PROXY_URL_RE.match(candidate):
                 proxy = parse_proxy_link(candidate, source_url, source_url)
                 if proxy is not None:
                     records[proxy.key] = proxy
@@ -1156,7 +1207,7 @@ def _extract_message_proxies(message: Any, source_url: str) -> list[ProxyRecord]
         buttons = getattr(row, "buttons", None) or []
         for button in buttons:
             url = getattr(button, "url", None)
-            if isinstance(url, str) and (url.startswith("https://t.me/proxy?") or url.startswith("tg://proxy?")):
+            if isinstance(url, str) and PROXY_URL_RE.match(url):
                 proxy = parse_proxy_link(url, source_url, source_url)
                 if proxy is not None:
                     records[proxy.key] = proxy

@@ -9,8 +9,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 from urllib.request import Request
 
-from .balancer import balancer
-from .utils import build_github_opener
+from .utils import balancer, build_github_opener
 
 log = logging.getLogger('tg-mtproto-proxy')
 

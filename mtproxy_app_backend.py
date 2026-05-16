@@ -29,7 +29,7 @@ from mtproxy_collector import (
     run_async,
 )
 from mtproxy_local_proxy import LocalMTProxyServer, ProxyPool
-from mtproxy_tg_ws.stats import stats as tg_ws_stats
+from mtproxy_tg_ws.utils import stats as tg_ws_stats
 from mtproxy_tg_ws_runtime import TgWsProxyRuntimeConfig, TgWsProxyServer
 from mtproxy_telegram import (
     DEFAULT_SOURCE_MAX_AGE_DAYS,
@@ -266,12 +266,17 @@ DATA_DIR_NAME = "data"
 TELEGRAM_AUTH_STATE_FILE_NAME = "telegram_auth.json"
 FILE_ATTRIBUTE_HIDDEN = 0x02
 RECOMMENDED_WEB_SOURCE_ADDITIONS = [
-    "https://t.me/s/ProxyFree_Ru",
+    *DEFAULT_SOURCES,
+    "https://raw.githubusercontent.com/soroushmirzaei/telegram-proxies-collector/main/proxies/ip/mtproto",
+    "https://raw.githubusercontent.com/4IceG/Personal-proxies/master/zap-mtproto",
+    "https://raw.githubusercontent.com/themrb/mtproto-proxy-data/main/all_proxies.txt",
+    "https://raw.githubusercontent.com/mheidari98/.proxy/main/all",
 ]
 RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS = [
     "https://t.me/telemtrs/16160",
     "https://t.me/telemtfreeproxy",
     "https://t.me/ProxyFree_Ru",
+    "https://t.me/JustMTProxy",
 ]
 SAVED_MESSAGES_EXPORT_LIMIT = 20
 
@@ -985,8 +990,21 @@ class AppRuntime:
                                 ),
                                 preferred=preferred_for_telegram,
                                 include_direct=False,
+                                max_pool_candidates=10,
+                                attempts_per_proxy=2,
                             )
-                        self._save_tg_parsed_proxy_records(thread_proxies)
+                        if not thread_proxies:
+                            cached_thread_proxies = self._load_tg_parsed_proxy_records()
+                            if cached_thread_proxies:
+                                self._log(
+                                    f"[telegram] parse returned 0 proxies; keeping cached parsed proxies: "
+                                    f"{len(cached_thread_proxies)}"
+                                )
+                                thread_proxies = cached_thread_proxies
+                            else:
+                                self._log("[telegram] parse returned 0 proxies; cache file was not updated")
+                        else:
+                            self._save_tg_parsed_proxy_records(thread_proxies)
                         self.thread_proxy_count = len(thread_proxies)
                         self.thread_status = f"loaded:{len(thread_proxies)}"
                         new_proxies = [item for item in thread_proxies if item.key not in known_keys]
@@ -2058,6 +2076,7 @@ class AppRuntime:
         preferred: ProxyRecord | None = None,
         include_direct: bool = True,
         include_pool: bool = True,
+        max_pool_candidates: int = 2,
     ) -> list[ProxyRecord | None]:
         candidates: list[ProxyRecord | None] = []
         seen: set[tuple[str, int, str] | None] = set()
@@ -2076,6 +2095,13 @@ class AppRuntime:
         add(preferred)
         if include_pool:
             add(self._best_proxy())
+            for state in self.pool.select_candidates(is_media=False, limit=max(0, int(max_pool_candidates or 0))):
+                add(state.proxy)
+            for outcome in sorted(self.last_working, key=self._working_priority_key)[: max(0, int(max_pool_candidates or 0))]:
+                add(outcome.proxy)
+            if int(max_pool_candidates or 0) > 2:
+                for proxy in self._load_known_working_proxy_records()[: max(0, int(max_pool_candidates or 0))]:
+                    add(proxy)
         if include_direct:
             add(None, allow_none=True)
         return candidates
@@ -2094,6 +2120,8 @@ class AppRuntime:
         preferred: ProxyRecord | None = None,
         include_direct: bool = True,
         include_pool: bool = True,
+        max_pool_candidates: int = 2,
+        attempts_per_proxy: int = 1,
     ) -> Any:
         no_retry_errors = {
             "resend_code_timeout",
@@ -2108,19 +2136,24 @@ class AppRuntime:
             preferred=preferred,
             include_direct=include_direct,
             include_pool=include_pool,
+            max_pool_candidates=max_pool_candidates,
         ):
-            try:
-                self._log(f"[telegram-api] {operation} via {self._telegram_proxy_label(upstream)}")
-                return run_async(factory(upstream))
-            except Exception as exc:
-                text = str(exc)
-                if text.startswith(TELEGRAM_USER_ERROR_PREFIX):
-                    raise RuntimeError(text[len(TELEGRAM_USER_ERROR_PREFIX):]) from exc
-                if text in no_retry_errors:
-                    self._log(f"[telegram-api] {operation} failed via {self._telegram_proxy_label(upstream)} without retry: {exc}")
-                    raise
-                last_exc = exc
-                self._log(f"[telegram-api] {operation} failed via {self._telegram_proxy_label(upstream)}: {exc}")
+            for attempt in range(1, max(1, int(attempts_per_proxy or 1)) + 1):
+                try:
+                    suffix = f" attempt {attempt}" if int(attempts_per_proxy or 1) > 1 else ""
+                    self._log(f"[telegram-api] {operation} via {self._telegram_proxy_label(upstream)}{suffix}")
+                    return run_async(factory(upstream))
+                except Exception as exc:
+                    text = str(exc)
+                    if text.startswith(TELEGRAM_USER_ERROR_PREFIX):
+                        raise RuntimeError(text[len(TELEGRAM_USER_ERROR_PREFIX):]) from exc
+                    if text in no_retry_errors:
+                        self._log(f"[telegram-api] {operation} failed via {self._telegram_proxy_label(upstream)} without retry: {exc}")
+                        raise
+                    last_exc = exc
+                    self._log(f"[telegram-api] {operation} failed via {self._telegram_proxy_label(upstream)}: {exc}")
+                    if attempt < max(1, int(attempts_per_proxy or 1)):
+                        time.sleep(min(2.0, 0.35 * attempt))
         if last_exc is not None:
             raise last_exc
         return run_async(factory(None))
