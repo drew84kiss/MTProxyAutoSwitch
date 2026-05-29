@@ -36,11 +36,11 @@ from mtproxy_net import (
 
 
 DEFAULT_SOURCES = [
-    "local:telegram-proxy-collector",
     "https://mtpro.xyz/mtproto-ru",
     "https://mtpro.xyz/api/?type=mtproto",
     "https://mtpro.xyz/api/?type=mtproto-ru",
     "https://hookzof.github.io/mtpro.xyz/mtproto.html",
+    "https://mtproxy.cfd/",
     "https://mtproxy.tg/",
     "https://mtproxytg.netlify.app/",
     "mtproxytg mirrors",
@@ -52,20 +52,20 @@ DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/Freedom-Guard/Proxy/main/proxies/mtproto.txt",
     "https://raw.githubusercontent.com/seriyps/mtproto_proxy/master/proxies.txt",
     "https://raw.githubusercontent.com/MTProto/MTProtoProxy/master/proxies/mtproto.txt",
+    "https://raw.githubusercontent.com/kort0881/telegram-proxy-collector/main/proxy_all.txt",
     "https://t.me/s/mtpro_xyz",
     "https://t.me/s/ProxyFree_Ru",
+    "https://t.me/s/ProxyMTProto",
+    "https://t.me/s/urlsources/5",
+    "https://t.me/s/urlsources/6",
+    "https://t.me/s/TProxyRU",
+    "https://t.me/s/noWhiteListBlock",
+    "https://t.me/s/ProxyFreeMTProto",
+    "https://t.me/s/vpn4everyone/10",
+    "https://t.me/s/freeinternet_byMygalaru/16",
+    "https://t.me/s/AccarMTProto",
 ]
 
-LOCAL_COLLECTOR_SOURCE = "local:telegram-proxy-collector"
-LOCAL_COLLECTOR_BUNDLED_SEED_FILE = "telegram_proxy_collector_seed.txt"
-LOCAL_COLLECTOR_DIR_NAME = "telegram-proxy-collector-main"
-LOCAL_COLLECTOR_SEED_FILES = [
-    "verified/proxy_links_clean.txt",
-    "verified/proxy_links_tme_clean.txt",
-    "verified/proxy_all_verified.txt",
-    "proxy_all.txt",
-    "proxy_list.txt",
-]
 MTPROXYTG_MIRROR_GROUP = "mtproxytg mirrors"
 MTPROXYTG_MIRRORS = [f"https://mtproxytg{index}.vercel.app/" for index in range(2, 11)]
 
@@ -114,6 +114,12 @@ PROXY_OBJECT_RE = re.compile(
 )
 SIMPLE_PROXY_RE = re.compile(
     r"(?<![A-Za-z0-9.-])(?P<host>[A-Za-z0-9.-]{1,253}):(?P<port>\d{1,5}):(?P<secret>[0-9A-Fa-f]{16,512})(?![0-9A-Fa-f])"
+)
+SERVER_PORT_SECRET_RE = re.compile(
+    r"\bServer\s*:\s*(?P<host>[A-Za-z0-9.-]{1,253})"
+    r".{0,512}?\bPort\s*:\s*(?P<port>\d{1,5})"
+    r".{0,512}?\bSecret\s*:\s*(?P<secret>[0-9A-Fa-fA-Za-z+/_=-]{16,512})",
+    re.IGNORECASE | re.DOTALL,
 )
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 SECRET_RE = re.compile(r"^[0-9a-fA-F]{16,512}$")
@@ -626,6 +632,17 @@ def scan_text(text: str, source_url: str, current_url: str) -> ScanArtifacts:
         if proxy:
             artifacts.proxies.append(proxy)
 
+    for match in SERVER_PORT_SECRET_RE.finditer(normalized):
+        proxy = make_proxy(
+            match.group("host"),
+            match.group("port"),
+            match.group("secret"),
+            source_url,
+            current_url,
+        )
+        if proxy:
+            artifacts.proxies.append(proxy)
+
     for match in CONFIG_URL_RE.finditer(normalized):
         artifacts.data_urls.add(urljoin(current_url, match.group(1)))
 
@@ -742,91 +759,6 @@ def fetch_data_url(
         record_proxy(summary, registry, proxy)
     for proxy in artifacts.socks5:
         record_socks5(summary, socks5_registry, proxy)
-
-
-def is_local_collector_source(source_url: str) -> bool:
-    return str(source_url or "").strip().lower() in {
-        LOCAL_COLLECTOR_SOURCE,
-        "telegram-proxy-collector",
-        "telegram proxy collector",
-    }
-
-
-def scrape_local_collector_seed(
-    registry: dict[tuple[str, int, str], ProxyRecord],
-    socks5_registry: dict[tuple[str, int, str, str], Socks5Record],
-    *,
-    verbose: bool,
-    log_sink: LogSink | None,
-) -> SourceSummary:
-    summary = SourceSummary(source_url=LOCAL_COLLECTOR_SOURCE)
-    seed_paths: list[Path] = []
-    seen_paths: set[str] = set()
-
-    for root in _local_collector_resource_roots():
-        bundled_seed = root / LOCAL_COLLECTOR_BUNDLED_SEED_FILE
-        marker = str(bundled_seed.resolve())
-        if bundled_seed.exists() and marker not in seen_paths:
-            seed_paths.append(bundled_seed)
-            seen_paths.add(marker)
-
-    legacy_root = Path(__file__).resolve().parent / LOCAL_COLLECTOR_DIR_NAME
-    if legacy_root.exists():
-        for relative_name in LOCAL_COLLECTOR_SEED_FILES:
-            path = legacy_root / relative_name
-            marker = str(path.resolve())
-            if path.exists() and marker not in seen_paths:
-                seed_paths.append(path)
-                seen_paths.add(marker)
-
-    if not seed_paths:
-        summary.errors.append(f"{LOCAL_COLLECTOR_BUNDLED_SEED_FILE} -> not found")
-        return summary
-
-    for path in seed_paths:
-        summary.fetched_urls.append(str(path))
-        try:
-            payload = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
-            summary.errors.append(f"{path} -> {exc}")
-            continue
-        artifacts = scan_text(payload, LOCAL_COLLECTOR_SOURCE, str(path))
-        summary.script_urls_found += len(artifacts.script_urls)
-        summary.data_urls_found += len(artifacts.data_urls)
-        for proxy in artifacts.proxies:
-            record_proxy(summary, registry, proxy)
-        for proxy in artifacts.socks5:
-            record_socks5(summary, socks5_registry, proxy)
-
-    log(
-        f"[source] local collector seed -> files={len(summary.fetched_urls)} unique_total={len(registry)}",
-        verbose_only=True,
-        verbose=verbose,
-        sink=log_sink,
-    )
-    return summary
-
-
-def _local_collector_resource_roots() -> list[Path]:
-    roots: list[Path] = []
-    if getattr(sys, "frozen", False):
-        executable_path = Path(sys.executable).resolve()
-        roots.append(Path(getattr(sys, "_MEIPASS", executable_path.parent)))
-        roots.append(executable_path.parent)
-    roots.append(Path(__file__).resolve().parent)
-
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for root in roots:
-        try:
-            marker = str(root.resolve())
-        except Exception:
-            marker = str(root)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        unique.append(root)
-    return unique
 
 
 def scrape_source(
@@ -1376,14 +1308,7 @@ def run_collection(
             total=len(config.sources),
         )
 
-        if is_local_collector_source(source_url):
-            summary = scrape_local_collector_seed(
-                registry=registry,
-                socks5_registry=socks5_registry,
-                verbose=config.verbose,
-                log_sink=log_sink,
-            )
-        elif is_mtproxytg_mirror_group(source_url):
+        if is_mtproxytg_mirror_group(source_url):
             summary = scrape_mtproxytg_mirrors(
                 fetcher=fetcher,
                 registry=registry,

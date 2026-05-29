@@ -27,7 +27,11 @@ from mtproxy_collector import ProxyRecord, parse_proxy_link, scan_text
 
 THREAD_URL_RE = re.compile(r"^https?://t\.me/(?P<username>[A-Za-z0-9_]+)/(?P<thread_id>\d+)$", re.IGNORECASE)
 TELEGRAM_SOURCE_URL_RE = re.compile(
-    r"^https?://t\.me/(?:(?:s/)?)(?P<username>[A-Za-z0-9_]+)(?:/(?P<message_id>\d+))?/?$",
+    r"^https?://t\.me/(?:(?:s/)?)(?P<username>[A-Za-z0-9_]+)(?:/(?P<message_id>\d+))?(?:/(?P<reply_message_id>\d+))?/?$",
+    re.IGNORECASE,
+)
+TELEGRAM_PRIVATE_SOURCE_URL_RE = re.compile(
+    r"^https?://t\.me/c/(?P<channel_id>\d+)(?:/(?P<message_id>\d+))?(?:/(?P<reply_message_id>\d+))?/?$",
     re.IGNORECASE,
 )
 PROXY_URL_RE = re.compile(
@@ -42,6 +46,18 @@ DEFAULT_TELEGRAM_SOURCE_URLS = [
     "https://t.me/telemtfreeproxy",
     "https://t.me/mtpro_xyz",
     "https://t.me/ProxyFree_Ru",
+    "https://t.me/ProxyMTProto",
+    "https://t.me/LowiKForum/10805",
+    "https://t.me/urlsources/5",
+    "https://t.me/urlsources/6",
+    "https://t.me/TProxyRU",
+    "https://t.me/noWhiteListBlock",
+    "https://t.me/ProxyFreeMTProto",
+    "https://t.me/vpn4everyone/10",
+    "https://t.me/freeinternet_byMygalaru/16",
+    "https://t.me/c/3953426502/7",
+    "https://t.me/AccarMTProto",
+    "https://t.me/kfwlforum/8",
 ]
 DEFAULT_AUTH_TIMEOUT = 20.0
 DEFAULT_THREAD_TOTAL_TIMEOUT = 90.0
@@ -91,8 +107,10 @@ class MediaProbeResult:
 
 @dataclass(frozen=True)
 class TelegramSourceSpec:
-    username: str
+    username: str | None
+    channel_id: int | None
     message_id: int | None
+    reply_message_id: int | None
     normalized_url: str
 
 
@@ -106,16 +124,30 @@ def parse_thread_url(thread_url: str) -> tuple[str, int]:
 
 def parse_telegram_source_url(source_url: str) -> TelegramSourceSpec:
     normalized = source_url.strip().rstrip("/")
+    private_match = TELEGRAM_PRIVATE_SOURCE_URL_RE.fullmatch(normalized)
+    if private_match is not None:
+        message_id = private_match.group("message_id")
+        reply_message_id = private_match.group("reply_message_id")
+        return TelegramSourceSpec(
+            username=None,
+            channel_id=int(private_match.group("channel_id")),
+            message_id=int(message_id) if message_id else None,
+            reply_message_id=int(reply_message_id) if reply_message_id else None,
+            normalized_url=normalized,
+        )
     match = TELEGRAM_SOURCE_URL_RE.fullmatch(normalized)
     if match is None:
         raise ValueError(f"Unsupported Telegram source: {source_url}")
     username = match.group("username")
-    if username.lower() in {"proxy", "s"}:
+    if username.lower() in {"proxy", "s", "c"}:
         raise ValueError(f"Unsupported Telegram source: {source_url}")
     message_id = match.group("message_id")
+    reply_message_id = match.group("reply_message_id")
     return TelegramSourceSpec(
         username=username,
+        channel_id=None,
         message_id=int(message_id) if message_id else None,
+        reply_message_id=int(reply_message_id) if reply_message_id else None,
         normalized_url=normalized,
     )
 
@@ -609,7 +641,25 @@ async def collect_telegram_source_proxies(
         if not await _await_timeout(client.is_user_authorized(), _remaining(deadline, request_timeout), "auth_status"):
             raise RuntimeError("telegram_session_not_authorized")
 
-        entity = await _await_timeout(client.get_entity(spec.username), _remaining(deadline, request_timeout), "get_entity")
+        if spec.channel_id is not None:
+            try:
+                entity = await _await_timeout(
+                    client.get_entity(types.PeerChannel(spec.channel_id)),
+                    _remaining(deadline, request_timeout),
+                    "get_entity",
+                )
+            except Exception:
+                entity = await _await_timeout(
+                    client.get_entity(int(f"-100{spec.channel_id}")),
+                    _remaining(deadline, request_timeout),
+                    "get_entity",
+                )
+        else:
+            entity = await _await_timeout(
+                client.get_entity(spec.username or ""),
+                _remaining(deadline, request_timeout),
+                "get_entity",
+            )
 
         if spec.message_id is not None:
             root_message = await _await_timeout(
@@ -675,6 +725,21 @@ async def collect_telegram_source_proxies(
                             proxy_count=len(registry),
                             max_age_days=max_age_days,
                         )
+            if spec.reply_message_id is not None:
+                reply_message = await _await_timeout(
+                    client.get_messages(entity, ids=spec.reply_message_id),
+                    _remaining(deadline, request_timeout),
+                    "get_reply_message",
+                )
+                if reply_message is not None and not _message_is_older_than(reply_message, cutoff_dt):
+                    scanned_messages += 1
+                    if _register_proxies_from_message(
+                        registry,
+                        reply_message,
+                        spec.normalized_url,
+                        max_proxies=max_proxies,
+                    ):
+                        hit_proxy_limit = True
         else:
             iterator = client.iter_messages(entity, limit=None)
             while True:

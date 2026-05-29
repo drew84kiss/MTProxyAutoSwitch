@@ -1,0 +1,2270 @@
+import html as htmllib
+import json
+import re
+import socket
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import List, Any, Optional
+
+import requests
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from hook_utils import find_class
+from client_utils import get_connections_manager, get_last_fragment
+from file_utils import read_file, write_file, get_plugins_dir
+from ui.settings import Header, Switch, Input, Text, Divider, Selector
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+import os
+
+__id__ = "proxy_collector"
+__name__ = "Proxy Collector"
+__description__ = "Собирает прокси из публичных Telegram-каналов/постов и проверяет их доступность."
+__version__ = "2.1.1"
+__author__ = "@zyrus-zi"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.12.0"
+
+MAX_HISTORY = 10
+MODE_NORMAL    = "normal"
+MODE_WHITELIST = "whitelist"
+
+@dataclass
+class ProxyItem:
+    host: str
+    port: int
+    user: Optional[str] = None
+    password: Optional[str] = None
+    secret: Optional[str] = None
+    protocol: str = "UNKNOWN"
+    is_alive: bool = False
+    ping_ms: int = -1
+    country: str = ""
+
+    def tg_link(self) -> str:
+        if self.protocol == "MTPROTO" and self.secret:
+            return f"https://t.me/proxy?server={self.host}&port={self.port}&secret={self.secret}"
+        if self.protocol == "SOCKS5" and self.user and self.password:
+            return f"https://t.me/socks?server={self.host}&port={self.port}&user={self.user}&pass={self.password}"
+        return f"{self.host}:{self.port}"
+
+    def result_line(self) -> str:
+        status = f"✅ {self.ping_ms}ms" if self.is_alive else "❌ Dead"
+        country = f" {self.country}" if self.country else ""
+        return f"{status} [{self.protocol}]{country} — {self.tg_link()}"
+
+    def to_dict(self) -> dict:
+        return {
+            "host": self.host, "port": self.port,
+            "user": self.user, "password": self.password,
+            "secret": self.secret, "protocol": self.protocol,
+            "is_alive": self.is_alive, "ping_ms": self.ping_ms,
+            "country": self.country,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "ProxyItem":
+        return ProxyItem(
+            host=d["host"], port=d["port"],
+            user=d.get("user"), password=d.get("password"),
+            secret=d.get("secret"), protocol=d.get("protocol", "UNKNOWN"),
+            is_alive=d.get("is_alive", False), ping_ms=d.get("ping_ms", -1),
+            country=d.get("country", ""),
+        )
+
+@dataclass
+class HistoryEntry:
+    timestamp: int
+    alive: List[ProxyItem]
+    dead_count: int
+    sources: str
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "alive": [p.to_dict() for p in self.alive],
+            "dead_count": self.dead_count,
+            "sources": self.sources,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "HistoryEntry":
+        return HistoryEntry(
+            timestamp=d["timestamp"],
+            alive=[ProxyItem.from_dict(p) for p in d.get("alive", [])],
+            dead_count=d.get("dead_count", 0),
+            sources=d.get("sources", ""),
+        )
+
+class HistoryStore:
+
+    @staticmethod
+    def _path(mode: str) -> str:
+        return os.path.join(get_plugins_dir(), f"proxy_collector_history_{mode}.json")
+
+    @classmethod
+    def load(cls, mode: str) -> List[HistoryEntry]:
+        try:
+            raw = read_file(cls._path(mode))
+            if not raw:
+                return []
+            return [HistoryEntry.from_dict(d) for d in json.loads(raw)]
+        except Exception:
+            return []
+
+    @classmethod
+    def save(cls, mode: str, entries: List[HistoryEntry]):
+        try:
+            write_file(cls._path(mode), json.dumps([e.to_dict() for e in entries]))
+        except Exception as e:
+            log(f"[ProxyCollector] HistoryStore.save error: {e}")
+
+    @classmethod
+    def add(cls, mode: str, entry: HistoryEntry):
+        entries = cls.load(mode)
+        entries.insert(0, entry)
+        cls.save(mode, entries[:MAX_HISTORY])
+
+class ProxyParser:
+    EXCLUDED_SCHEMES = re.compile(
+        r"(?:^|\s)(ss|vless|vmess|trojan|hysteria2?|tuic|juicity|naive|brook|wireguard|wg)://",
+        re.IGNORECASE
+    )
+    RE_TG_MTPROTO = re.compile(
+        r"(?:(?:https?://)?t\.me|tg://)/?proxy\?([^\s\"'<>]+)"
+    )
+    RE_TG_SOCKS = re.compile(
+        r"(?:(?:https?://)?t\.me|tg://)/?socks\?([^\s\"'<>]+)"
+    )
+    RE_MTPROTO_TEXT = re.compile(
+        r"Server:\s*([\w.\-]+).*?Port:\s*(\d+).*?Secret:\s*([\w+/=\-_]+)", re.DOTALL
+    )
+    RE_IP_PORT_USER_PASS = re.compile(
+        r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5}):([^:\s]+):([^:\s]+)\b"
+    )
+    RE_USER_PASS_IP_PORT = re.compile(
+        r"\b([^:@\s]+):([^:@\s]+)@((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b"
+    )
+    RE_IP_PORT = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b")
+
+    # Только TG-ссылки — для GitHub файлов
+    RE_TG_ONLY = re.compile(
+        r"(?:https?://)?t\.me/(?:proxy|socks)\?[^\s]+"
+    )
+
+    @classmethod
+    def _parse_tg_link(cls, qs: str, protocol: str) -> Optional["ProxyItem"]:
+        """Парсит query string TG ссылки независимо от порядка параметров."""
+        try:
+            import urllib.parse as _up
+            # Нормализуем — убираем возможные HTML entities
+            qs = qs.replace("&amp;", "&")
+            params = {k: v[0] for k, v in _up.parse_qs(qs, keep_blank_values=False).items()}
+            server = params.get("server", "")
+            port_s = params.get("port", "")
+            if not server or not port_s:
+                return None
+            port = int(port_s)
+            if protocol == "MTPROTO":
+                secret = params.get("secret", "")
+                if not secret:
+                    return None
+                return ProxyItem(host=server, port=port, secret=secret, protocol="MTPROTO")
+            elif protocol == "SOCKS5":
+                user = params.get("user", "")
+                password = params.get("pass", "")
+                return ProxyItem(host=server, port=port, user=user, password=password, protocol="SOCKS5")
+        except Exception:
+            return None
+
+    @classmethod
+    def _clean(cls, text: str) -> str:
+        return "\n".join(
+            line for line in text.splitlines()
+            if not cls.EXCLUDED_SCHEMES.search(line)
+        )
+
+    @classmethod
+    def parse(cls, text: str) -> List[ProxyItem]:
+        proxies, seen = [], set()
+
+        def add(item: Optional["ProxyItem"]):
+            if not item:
+                return
+            key = f"{item.host}:{item.port}"
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
+
+        for m in cls.RE_TG_MTPROTO.finditer(text):
+            add(cls._parse_tg_link(m.group(1), "MTPROTO"))
+        for m in cls.RE_TG_SOCKS.finditer(text):
+            add(cls._parse_tg_link(m.group(1), "SOCKS5"))
+        for m in cls.RE_MTPROTO_TEXT.finditer(text):
+            add(ProxyItem(host=m.group(1), port=int(m.group(2)), secret=m.group(3), protocol="MTPROTO"))
+
+        clean = cls._clean(text)
+        for m in cls.RE_IP_PORT_USER_PASS.finditer(clean):
+            add(ProxyItem(host=m.group(1), port=int(m.group(2)), user=m.group(3), password=m.group(4)))
+        for m in cls.RE_USER_PASS_IP_PORT.finditer(clean):
+            add(ProxyItem(host=m.group(3), port=int(m.group(4)), user=m.group(1), password=m.group(2)))
+        for m in cls.RE_IP_PORT.finditer(clean):
+            add(ProxyItem(host=m.group(1), port=int(m.group(2))))
+
+        return proxies
+
+    @classmethod
+    def parse_tg_only(cls, text: str) -> List[ProxyItem]:
+        """Только t.me/proxy? и t.me/socks? — для файлов GitHub."""
+        proxies, seen = [], set()
+
+        def add(item: Optional["ProxyItem"]):
+            if not item:
+                return
+            key = f"{item.host}:{item.port}"
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
+
+        for m in cls.RE_TG_MTPROTO.finditer(text):
+            add(cls._parse_tg_link(m.group(1), "MTPROTO"))
+        for m in cls.RE_TG_SOCKS.finditer(text):
+            add(cls._parse_tg_link(m.group(1), "SOCKS5"))
+
+        return proxies
+
+class GitHubFetcher:
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    @classmethod
+    def fetch(cls, url: str) -> List[ProxyItem]:
+        url = url.strip()
+        if not url:
+            return []
+        # Конвертируем github.com/user/repo/blob/... → raw.githubusercontent.com
+        url = re.sub(
+            r"https?://github\.com/([^/]+/[^/]+)/blob/(.+)",
+            r"https://raw.githubusercontent.com/\1/\2",
+            url
+        )
+        try:
+            r = requests.get(url, headers=cls.HEADERS, timeout=15)
+            r.raise_for_status()
+            proxies = []
+            for line in r.text.splitlines():
+                line = htmllib.unescape(line.strip())
+                found = ProxyParser.parse_tg_only(line)
+                proxies.extend(found)
+            return proxies
+        except Exception as e:
+            log(f"[ProxyCollector] GitHubFetcher error for {url}: {e}")
+            return []
+
+class TelegramFetcher:
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    @classmethod
+    def fetch(cls, url: str, days_limit: int = 7) -> List[ProxyItem]:
+        url = url.strip().rstrip("/")
+        path = (url
+                .replace("https://", "").replace("http://", "")
+                .replace("t.me/s/", "").replace("t.me/", ""))
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return []
+
+        # parts примеры:
+        #   ['channel']                      → канал/чат → _fetch_via_api
+        #   ['channel', '910']               → конкретный пост → _fetch_post
+        #   ['channel', 'topic_id', 'msg']   → пост в топике → _fetch_post
+        #   ['channel', 'topic_id']          → топик → _fetch_topic_via_api
+
+        if len(parts) == 1:
+            # Просто канал/чат
+            return cls._fetch_via_api(parts[0], days_limit)
+        elif len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+            # t.me/channel/topic_id/msg_id — пост в топике
+            return cls._fetch_post(parts)
+        elif len(parts) == 2 and parts[1].isdigit():
+            # t.me/channel/number — может быть пост ИЛИ топик
+            # Пробуем как пост, если не нашли — как топик
+            result = cls._fetch_post(parts)
+            if result:
+                return result
+            return cls._fetch_topic_via_api(parts[0], int(parts[1]))
+        else:
+            return cls._fetch_via_api(parts[0], days_limit)
+
+    @classmethod
+    def _fetch_post(cls, parts: list) -> List[ProxyItem]:
+        """
+        Варианты:
+          t.me/channel/910          → parts = ['channel', '910']
+          t.me/channel/topic/32871  → parts = ['channel', 'topic_id', 'msg_id']
+        """
+        channel = parts[0]
+        msg_id  = int(parts[-1])
+
+        # 1. Пробуем веб-запрос (быстро, не требует авторизации)
+        try:
+            if len(parts) >= 3:
+                web_url = f"https://t.me/{channel}/{parts[1]}/{msg_id}?embed=1&mode=tme"
+            else:
+                web_url = f"https://t.me/s/{channel}/{msg_id}"
+            r = requests.get(web_url, headers=cls.HEADERS, timeout=10)
+            if len(parts) < 3:
+                m = re.search(
+                    r'<div[^>]+data-post=["\']' + re.escape(f"{channel}/{msg_id}") + r'["\'][^>]*>(.*?)</div>\s*</div>',
+                    r.text, re.DOTALL
+                )
+                block = m.group(0) if m else r.text
+            else:
+                block = r.text
+            # Собираем все href, data-url, и сырой текст блока
+            hrefs = re.findall(r'href=["\']([^"\']+)["\']', block)
+            data_urls = re.findall(r'data-url=["\']([^"\']+)["\']', block)
+            all_urls = hrefs + data_urls
+            combined = (htmllib.unescape(block) + "\n"
+                        + "\n".join(htmllib.unescape(h) for h in all_urls))
+            result = ProxyParser.parse(combined)
+            if result:
+                return result
+        except Exception as e:
+            log(f"[ProxyCollector] fetch_post web error: {e}")
+
+        # 2. Фолбэк: получаем конкретное сообщение через API (читает инлайн кнопки)
+        return cls._fetch_single_message_via_api(channel, msg_id)
+
+    @classmethod
+    def _fetch_single_message_via_api(cls, username: str, msg_id: int) -> List[ProxyItem]:
+        """Получает одно конкретное сообщение по id через TL_channels_getMessages."""
+        from org.telegram.tgnet import TLRPC
+        from client_utils import send_request, RequestCallback
+
+        try:
+            peer_obj = cls._resolve_username(username)
+            if not peer_obj:
+                return []
+            input_peer = cls._build_input_peer(peer_obj)
+            if not input_peer:
+                return []
+
+            # Определяем тип peer и используем правильный метод
+            is_channel = hasattr(peer_obj, 'chats') and peer_obj.chats and not peer_obj.chats.isEmpty() and hasattr(peer_obj.chats.get(0), 'access_hash')
+
+            result = [None]
+            done = threading.Event()
+            def cb(response, error):
+                result[0] = response
+                done.set()
+
+            if is_channel:
+                # Для каналов/супергрупп — TL_channels_getMessages
+                try:
+                    req = TLRPC.TL_channels_getMessages()
+                    req.channel = input_peer  # нужен InputChannel
+                    # Строим InputChannel из InputPeerChannel
+                    from org.telegram.tgnet import TLRPC as TLRPC2
+                    input_channel = TLRPC2.TL_inputChannel()
+                    input_channel.channel_id = input_peer.channel_id
+                    input_channel.access_hash = input_peer.access_hash
+                    req.channel = input_channel
+                    # id — это ArrayList<Integer>
+                    from java.util import ArrayList
+                    ids = ArrayList()
+                    ids.add(msg_id)
+                    req.id = ids
+                    send_request(req, RequestCallback(cb))
+                    done.wait(timeout=30)
+                except Exception as e:
+                    log(f"[ProxyCollector] channels_getMessages error: {e}, trying getHistory")
+                    done.clear()
+                    result[0] = None
+                    # Фолбэк через getHistory
+                    req2 = TLRPC.TL_messages_getHistory()
+                    req2.peer = input_peer
+                    req2.offset_id = msg_id + 1
+                    req2.offset_date = req2.add_offset = req2.min_id = req2.hash = 0
+                    req2.max_id = 0
+                    req2.limit = 3
+                    send_request(req2, RequestCallback(cb))
+                    done.wait(timeout=30)
+            else:
+                # Для обычных чатов — TL_messages_getMessages
+                try:
+                    req = TLRPC.TL_messages_getMessages()
+                    from java.util import ArrayList
+                    ids = ArrayList()
+                    ids.add(msg_id)
+                    req.id = ids
+                    send_request(req, RequestCallback(cb))
+                    done.wait(timeout=30)
+                except Exception as e:
+                    log(f"[ProxyCollector] getMessages error: {e}, trying getHistory")
+                    done.clear()
+                    result[0] = None
+                    req2 = TLRPC.TL_messages_getHistory()
+                    req2.peer = input_peer
+                    req2.offset_id = msg_id + 1
+                    req2.offset_date = req2.add_offset = req2.min_id = req2.hash = 0
+                    req2.max_id = 0
+                    req2.limit = 3
+                    send_request(req2, RequestCallback(cb))
+                    done.wait(timeout=30)
+
+            response = result[0]
+            if not response or not hasattr(response, 'messages'):
+                return []
+            messages = response.messages
+            if not messages or messages.isEmpty():
+                return []
+
+            seen_keys = set()
+            proxies = []
+            # Сначала ищем точное совпадение по id
+            for i in range(messages.size()):
+                msg = messages.get(i)
+                if getattr(msg, 'id', 0) == msg_id:
+                    proxies.extend(cls._parse_msg(msg, seen_keys))
+            # Если не нашли по точному id — берём всё что есть
+            if not proxies:
+                for i in range(messages.size()):
+                    proxies.extend(cls._parse_msg(messages.get(i), seen_keys))
+
+            return proxies
+        except Exception as e:
+            log(f"[ProxyCollector] _fetch_single_message_via_api error: {e}\n{traceback.format_exc()}")
+            return []
+
+    @staticmethod
+    def _extract_button_urls(msg) -> str:
+        urls = []
+        try:
+            markup = getattr(msg, 'reply_markup', None)
+            if markup is None:
+                return ""
+            rows = getattr(markup, 'rows', None)
+            if rows is None:
+                return ""
+            for i in range(rows.size()):
+                row = rows.get(i)
+                buttons = getattr(row, 'buttons', None)
+                if buttons is None:
+                    continue
+                for j in range(buttons.size()):
+                    btn = buttons.get(j)
+                    url = getattr(btn, 'url', None)
+                    if url:
+                        urls.append(str(url))
+        except Exception as e:
+            log(f"[ProxyCollector] _extract_button_urls error: {e}")
+        return "\n".join(urls)
+
+    @classmethod
+    def _resolve_username(cls, username: str):
+        from org.telegram.tgnet import TLRPC
+        from client_utils import send_request, RequestCallback
+        req = TLRPC.TL_contacts_resolveUsername()
+        req.username = username
+        result = [None]
+        done = threading.Event()
+        def cb(response, error):
+            result[0] = response
+            done.set()
+        send_request(req, RequestCallback(cb))
+        done.wait(timeout=20)
+        return result[0]
+
+    @classmethod
+    def _build_input_peer(cls, peer_obj):
+        from org.telegram.tgnet import TLRPC
+        if hasattr(peer_obj, 'chats') and peer_obj.chats and not peer_obj.chats.isEmpty():
+            chat = peer_obj.chats.get(0)
+            if hasattr(chat, 'access_hash'):
+                p = TLRPC.TL_inputPeerChannel()
+                p.channel_id = chat.id
+                p.access_hash = chat.access_hash
+            else:
+                p = TLRPC.TL_inputPeerChat()
+                p.chat_id = chat.id
+            return p
+        if hasattr(peer_obj, 'users') and peer_obj.users and not peer_obj.users.isEmpty():
+            user = peer_obj.users.get(0)
+            p = TLRPC.TL_inputPeerUser()
+            p.user_id = user.id
+            p.access_hash = user.access_hash
+            return p
+        return None
+
+    @classmethod
+    def _parse_msg(cls, msg, seen_keys: set) -> List[ProxyItem]:
+        text_parts = []
+        if hasattr(msg, 'message') and msg.message:
+            text_parts.append(htmllib.unescape(str(msg.message)))
+        btn_urls = cls._extract_button_urls(msg)
+        if btn_urls:
+            text_parts.append(btn_urls)
+        if not text_parts:
+            return []
+        found = ProxyParser.parse("\n".join(text_parts))
+        result = []
+        for p in found:
+            key = f"{p.host}:{p.port}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                result.append(p)
+        return result
+
+    @classmethod
+    def _fetch_via_api(cls, username: str, days_limit: int = 7) -> List[ProxyItem]:
+        from org.telegram.tgnet import TLRPC
+        from client_utils import send_request, RequestCallback
+
+        cutoff_ts = 0
+        if days_limit > 0:
+            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days_limit)).timestamp())
+
+        try:
+            peer_obj = cls._resolve_username(username)
+            if not peer_obj:
+                return []
+            input_peer = cls._build_input_peer(peer_obj)
+            if not input_peer:
+                return []
+
+            proxies, seen_keys, offset_id = [], set(), 0
+
+            while True:
+                req = TLRPC.TL_messages_getHistory()
+                req.peer = input_peer
+                req.offset_id = offset_id
+                req.offset_date = req.add_offset = req.max_id = req.min_id = req.hash = 0
+                req.limit = 100
+
+                result = [None]
+                done = threading.Event()
+                def cb(response, error):
+                    result[0] = response
+                    done.set()
+                send_request(req, RequestCallback(cb))
+                done.wait(timeout=30)
+
+                response = result[0]
+                if not response or not hasattr(response, 'messages'):
+                    break
+                messages = response.messages
+                if not messages or messages.isEmpty():
+                    break
+
+                oldest_date = None
+                for i in range(messages.size()):
+                    msg = messages.get(i)
+                    msg_date = getattr(msg, 'date', 0)
+                    offset_id = msg.id
+                    if oldest_date is None or msg_date < oldest_date:
+                        oldest_date = msg_date
+                    if cutoff_ts > 0 and msg_date < cutoff_ts:
+                        continue
+                    proxies.extend(cls._parse_msg(msg, seen_keys))
+
+                if cutoff_ts > 0 and oldest_date and oldest_date < cutoff_ts:
+                    break
+                if messages.size() < 100:
+                    break
+
+            return proxies
+        except Exception as e:
+            log(f"[ProxyCollector] _fetch_via_api error: {e}\n{traceback.format_exc()}")
+            return []
+
+    @classmethod
+    def _fetch_topic_via_api(cls, username: str, topic_id: int) -> List[ProxyItem]:
+        from org.telegram.tgnet import TLRPC
+        from client_utils import send_request, RequestCallback
+
+        try:
+            peer_obj = cls._resolve_username(username)
+            if not peer_obj:
+                return []
+            input_peer = cls._build_input_peer(peer_obj)
+            if not input_peer:
+                return []
+
+            proxies, seen_keys, offset_id = [], set(), 0
+
+            while True:
+                req = TLRPC.TL_messages_getReplies()
+                req.peer = input_peer
+                req.msg_id = topic_id
+                req.offset_id = offset_id
+                req.offset_date = req.add_offset = req.max_id = req.min_id = req.hash = 0
+                req.limit = 100
+
+                result = [None]
+                done = threading.Event()
+                def cb(response, error):
+                    result[0] = response
+                    done.set()
+                send_request(req, RequestCallback(cb))
+                done.wait(timeout=30)
+
+                response = result[0]
+                if not response or not hasattr(response, 'messages'):
+                    break
+                messages = response.messages
+                if not messages or messages.isEmpty():
+                    break
+
+                min_id = None
+                for i in range(messages.size()):
+                    msg = messages.get(i)
+                    msg_id = getattr(msg, 'id', 0)
+                    if msg_id > 0 and (min_id is None or msg_id < min_id):
+                        min_id = msg_id
+                    proxies.extend(cls._parse_msg(msg, seen_keys))
+
+                if min_id is not None:
+                    offset_id = min_id
+
+                if messages.size() < 100:
+                    break
+
+            return proxies
+        except Exception as e:
+            log(f"[ProxyCollector] _fetch_topic_via_api error: {e}\n{traceback.format_exc()}")
+            return []
+
+def _build_padded_text(header: str, links: list, limit: int = 4096) -> str:
+    """
+    Строит текст из заголовка и ссылок.
+    Между чанками вставляет пробелы-заполнители так, чтобы каждый чанк
+    занимал ровно `limit` символов — TG при вставке из share-диалога
+    будет корректно разбивать текст на отдельные сообщения по limit символов.
+    """
+    chunks = []
+    current = header + "\n\n"
+    for link in links:
+        piece = link + "\n\n"
+        if len(current) + len(piece) > limit:
+            # Дополняем текущий чанк пробелами до ровно limit символов
+            padding = limit - len(current)
+            if padding > 0:
+                current += " " * padding
+            chunks.append(current)
+            current = piece
+        else:
+            current += piece
+    if current.strip():
+        chunks.append(current.rstrip())
+    return "".join(chunks)
+
+class ProxyChecker:
+
+    @staticmethod
+    def check(proxy: ProxyItem, timeout: int = 5) -> ProxyItem:
+        try:
+            from java import dynamic_proxy
+            RequestTimeDelegateClass = __import__(
+                "org.telegram.tgnet.ConnectionsManager", fromlist=["RequestTimeDelegate"]
+            ).RequestTimeDelegate
+
+            result_event = threading.Event()
+            result_time = [None]
+
+            class TimeDelegateImpl(dynamic_proxy(RequestTimeDelegateClass)):
+                def run(self, t):
+                    result_time[0] = int(t)
+                    result_event.set()
+
+            cm = get_connections_manager()
+            cm.checkProxy(
+                proxy.host, proxy.port,
+                proxy.user or "", proxy.password or "", proxy.secret or "",
+                TimeDelegateImpl()
+            )
+            result_event.wait(timeout=timeout + 3)
+
+            ping = result_time[0]
+            if ping is None or ping == -1:
+                return ProxyItem(host=proxy.host, port=proxy.port, user=proxy.user,
+                                 password=proxy.password, secret=proxy.secret,
+                                 protocol=proxy.protocol, is_alive=False)
+
+            country = ProxyChecker._get_country(proxy.host)
+            return ProxyItem(host=proxy.host, port=proxy.port, user=proxy.user,
+                             password=proxy.password, secret=proxy.secret,
+                             protocol=proxy.protocol, is_alive=True, ping_ms=ping, country=country)
+
+        except Exception as e:
+            log(f"[ProxyCollector] checkProxy error: {e}, falling back to socket")
+            return ProxyChecker._check_socket(proxy, timeout)
+
+    @staticmethod
+    def _check_socket(proxy: ProxyItem, timeout: int) -> ProxyItem:
+        try:
+            start = time.time()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((proxy.host, proxy.port))
+            ping = int((time.time() - start) * 1000)
+            s.close()
+            country = ProxyChecker._get_country(proxy.host)
+            return ProxyItem(host=proxy.host, port=proxy.port, user=proxy.user,
+                             password=proxy.password, secret=proxy.secret,
+                             protocol=proxy.protocol, is_alive=True, ping_ms=ping, country=country)
+        except Exception:
+            return ProxyItem(host=proxy.host, port=proxy.port, user=proxy.user,
+                             password=proxy.password, secret=proxy.secret,
+                             protocol=proxy.protocol, is_alive=False)
+
+    @staticmethod
+    def _get_country(host: str) -> str:
+        try:
+            r = requests.get(f"https://ipwho.is/{host}", timeout=5)
+            data = r.json()
+            name = data.get("country", "")
+            code = data.get("country_code", "")
+            if code and len(code) == 2:
+                flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code.upper())
+                return f"{flag} {name}"
+            return name
+        except Exception:
+            return ""
+
+def _read_uri(cr, uri) -> str:
+    """Читает текст из URI через ContentResolver."""
+    try:
+        stream = cr.openInputStream(uri)
+        if stream is None:
+            return ""
+        from java.io import BufferedReader, InputStreamReader
+        reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(str(line))
+            line = reader.readLine()
+        reader.close()
+        stream.close()
+        return "\n".join(lines)
+    except Exception as e:
+        log(f"[ProxyCollector] _read_uri error: {e}")
+        return ""
+
+def _read_files(data, mode_ref: str, plugin_ref):
+    """Читает файлы из Intent результата через ContentResolver."""
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        ctx = ApplicationLoader.applicationContext
+        cr  = ctx.getContentResolver()
+        all_text = []
+        clip = data.getClipData()
+        if clip is not None:
+            for i in range(clip.getItemCount()):
+                uri = clip.getItemAt(i).getUri()
+                if uri:
+                    text = _read_uri(cr, uri)
+                    if text:
+                        all_text.append(text)
+        else:
+            uri = data.getData()
+            if uri:
+                text = _read_uri(cr, uri)
+                if text:
+                    all_text.append(text)
+        if not all_text:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось прочитать файл"))
+            return
+        combined = "\n".join(all_text)
+        raw = []
+        for line in combined.splitlines():
+            raw.extend(ProxyParser.parse(line.strip()))
+        if not raw:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Прокси-ссылки не найдены в файле"))
+            return
+        seen, unique = set(), []
+        for p in raw:
+            k = f"{p.host}:{p.port}"
+            if k not in seen:
+                seen.add(k)
+                unique.append(p)
+        import json as _json
+        links = [p.tg_link() for p in unique]
+        plugin_ref.set_setting(
+            f"{mode_ref}_file_links",
+            _json.dumps(links, ensure_ascii=False),
+        )
+        plugin_ref.set_setting("_ts", str(time.time()), reload_settings=True)
+        msg = f"Загружено {len(unique)} прокси из файла. Нажмите «Запустить сбор и проверку»."
+        log(f"[ProxyCollector] {msg}")
+        run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+    except Exception as e:
+        log(f"[ProxyCollector] _read_files error: {e}")
+        run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка чтения: {e}"))
+
+class ModeController:
+    """Хранит состояние и логику для одного режима (normal / whitelist)."""
+
+    def __init__(self, mode: str, plugin: "ProxyCollectorPlugin"):
+        self.mode   = mode
+        self.plugin = plugin
+
+        self._running = False
+        self._cancel  = False
+        self._results: List[ProxyItem] = []
+        self._status  = "Ожидание"
+
+    # Ключи настроек с префиксом режима
+    def _k(self, key: str) -> str:
+        return f"{self.mode}_{key}"
+
+    def get(self, key: str, default=None):
+        return self.plugin.get_setting(self._k(key), default)
+
+    def _reload(self):
+        self.plugin.set_setting(self._k("_ts"), str(time.time()), reload_settings=True)
+
+    def _get_days_limit(self) -> int:
+        preset = self.get("days_preset", 2)
+        mapping = {0: 1, 1: 3, 2: 7, 3: 14, 4: 30, 5: 0}
+        if preset in mapping:
+            return mapping[preset]
+        try:
+            return max(1, int(self.get("days_custom", "7")))
+        except ValueError:
+            return 7
+
+    def create_page(self) -> List[Any]:
+        label = "Обычные прокси" if self.mode == MODE_NORMAL else "Прокси с обходом белых списков"
+        use_sources = self.get("use_sources", True)
+        use_github  = self.get("use_github", False)
+
+        items = [Header(text=label)]
+
+        if self.mode == MODE_WHITELIST:
+            items.append(Divider(text="⚠️ Прокси с обходом белых списков необходимо проверять ТОЛЬКО при включённых белых списках. Проверка без активных белых списков даст некорректные результаты — рабочие прокси могут оказаться мёртвыми."))
+
+        items += [
+            Header(text="Telegram"),
+            Switch(
+                key=self._k("use_sources"),
+                text="Источники Telegram",
+                subtext="Собирать прокси из каналов, чатов, постов и топиков.",
+                default=True,
+                icon="msg_link",
+            ),
+        ]
+
+        if use_sources:
+            items.append(Input(
+                key=self._k("sources"),
+                text="Источники",
+                default="",
+                subtext="Ссылки через пробел или с новой строки.",
+                icon="msg_link",
+            ))
+            items.append(Selector(
+                key=self._k("days_preset"),
+                text="Глубина поиска",
+                items=["1 день", "3 дня", "7 дней", "14 дней", "30 дней", "За всё время", "Вручную"],
+                default=2,
+                icon="msg_recent",
+            ))
+            if self.get("days_preset", 2) == 6:
+                items.append(Input(
+                    key=self._k("days_custom"),
+                    text="Количество дней",
+                    default="7",
+                    subtext="Введите число дней вручную.",
+                    icon="msg_recent",
+                ))
+
+        items.append(Header(text="GitHub"))
+        items.append(Switch(
+            key=self._k("use_github"),
+            text="Файл на GitHub",
+            subtext="Загружать прокси из файла на GitHub.",
+            default=False,
+            icon="msg_download",
+        ))
+
+        if use_github:
+            items.append(Input(
+                key=self._k("github_url"),
+                text="Ссылки на файлы",
+                default="",
+                subtext="Ссылки на файлы GitHub с прокси — каждая с новой строки.",
+                icon="msg_download",
+            ))
+
+        items.append(Header(text="Файл с устройства"))
+        items.append(Switch(
+            key=self._k("use_file"),
+            text="TXT файл с устройства",
+            subtext="Загружать прокси из файла на устройстве. Прокси пройдут полную проверку.",
+            default=False,
+            icon="msg_attach",
+            on_change=lambda v: self._reload(),
+        ))
+        use_file = self.get("use_file", False)
+        if use_file:
+            items.append(Text(
+                text="📂 Открыть выбор файла в браузере",
+                accent=True,
+                icon="msg_forward",
+                on_click=self._on_open_file_picker,
+            ))
+            # Показываем сколько прокси уже загружено из файла
+            file_links_raw = self.plugin.get_setting(f"{self.mode}_file_links", "") or ""
+            if file_links_raw:
+                try:
+                    import json as _json
+                    n = len(_json.loads(file_links_raw))
+                    items.append(Text(
+                        text=f"✅ Загружено из файла: {n} прокси. Нажми «Запустить».",
+                        icon="msg_check",
+                    ))
+                except Exception:
+                    pass
+
+        items += [
+            Header(text="Проверка"),
+            Input(
+                key=self._k("timeout"),
+                text="Таймаут (сек)",
+                default="5",
+                subtext="Максимальное время ожидания ответа от прокси.",
+                icon="msg2_autodelete",
+            ),
+            Switch(
+                key=self._k("check_country"),
+                text="Определять страну",
+                subtext="Дополнительный запрос к ipwho.is для каждого живого прокси.",
+                default=True,
+                icon="msg_language",
+            ),
+            Divider(),
+        ]
+
+        if not self._running:
+            items.append(Text(
+                text="Запустить сбор и проверку",
+                accent=True,
+                icon="msg_forward",
+                on_click=self._on_start_click,
+            ))
+        else:
+            items.append(Text(
+                text=self._status,
+                accent=True,
+                icon="msg_retry",
+            ))
+            items.append(Text(
+                text="Отменить",
+                red=True,
+                icon="msg_close",
+                on_click=self._on_cancel_click,
+            ))
+
+        if not self._running and self._status != "Ожидание":
+            items.append(Divider(text=self._status))
+
+        if self._results:
+            alive = [p for p in self._results if p.is_alive]
+            dead  = [p for p in self._results if not p.is_alive]
+            items.append(Text(
+                text=f"Живых: {len(alive)}   Мёртвых: {len(dead)}",
+                icon="msg_info",
+            ))
+
+        history = HistoryStore.load(self.mode)
+        if history:
+            items += [
+                Divider(),
+                Text(
+                    text=f"История  ({len(history)} из {MAX_HISTORY})",
+                    icon="msg_log",
+                    create_sub_fragment=self._create_history_page,
+                ),
+                Text(
+                    text="Очистить историю",
+                    red=True,
+                    icon="msg_delete",
+                    on_click=self._on_clear_history,
+                ),
+            ]
+
+        return items
+
+    def _create_history_page(self) -> List[Any]:
+        history = HistoryStore.load(self.mode)
+        if not history:
+            return [Header(text="История"), Text(text="История пуста.", icon="msg_info")]
+
+        items = [
+            Header(text="История сборов"),
+            Text(text="Очистить всю историю", red=True, icon="msg_delete",
+                 on_click=self._on_clear_history),
+            Divider(),
+        ]
+        for entry in history:
+            dt = datetime.fromtimestamp(entry.timestamp).strftime("%d.%m.%Y  %H:%M")
+            alive_count = len(entry.alive)
+            items.append(Text(
+                text=f"{dt}  —  ✅ {alive_count}  ❌ {entry.dead_count}",
+                icon="msg_log",
+                on_click=lambda v, e=entry, m=self.mode: self.plugin._open_proxy_list_in_browser(e, m),
+            ))
+            items.append(Text(
+                text="Удалить", red=True, icon="msg_delete",
+                on_click=lambda v, ts=entry.timestamp: self._on_delete_entry(ts),
+            ))
+        return items
+
+    def _on_clear_history(self, view):
+        HistoryStore.save(self.mode, [])
+        self._reload()
+        BulletinHelper.show_info("История очищена")
+
+    def _on_delete_entry(self, timestamp: int):
+        history = HistoryStore.load(self.mode)
+        HistoryStore.save(self.mode, [e for e in history if e.timestamp != timestamp])
+        self._reload()
+        BulletinHelper.show_info("Сбор удалён")
+
+    def _on_cancel_click(self, view):
+        self._cancel = True
+        self._status = "Отмена..."
+        self._reload()
+
+    def _on_open_file_picker(self, view):
+        """Открывает встроенный браузер TG со страницей загрузки файла."""
+        mode_ref   = self.mode
+        plugin_ref = self.plugin
+        threading.Thread(target=self._run_file_picker_server,
+                         args=(mode_ref, plugin_ref), daemon=True).start()
+
+    def _run_file_picker_server(self, mode_ref: str, plugin_ref):
+        import http.server
+        import socketserver
+        import socket as _socket
+        import urllib.parse as _urlparse
+        import email.parser as _eparser
+        import email.policy as _epolicy
+
+        with _socket.socket() as s:
+            s.bind(("", 0))
+            port = s.getsockname()[1]
+
+        stop_event = threading.Event()
+
+        class FPHandler(http.server.BaseHTTPRequestHandler):
+
+            def do_GET(self):
+                if self.path == "/":
+                    self._serve_page()
+                else:
+                    self.send_response(404); self.end_headers()
+
+            def do_POST(self):
+                if self.path != "/upload":
+                    self.send_response(404); self.end_headers()
+                    return
+                try:
+                    ct = self.headers.get("Content-Type", "")
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(length)
+
+                    text_parts = []
+                    if "multipart/form-data" in ct:
+                        boundary = ""
+                        for part in ct.split(";"):
+                            part = part.strip()
+                            if part.startswith("boundary="):
+                                boundary = part[9:].strip('"')
+                        if boundary:
+                            text_parts = self._parse_multipart(body, boundary)
+                    else:
+                        text_parts = [body.decode("utf-8", errors="replace")]
+
+                    combined = "\n".join(text_parts)
+                    if not combined.strip():
+                        self._serve_error("\u0424\u0430\u0439\u043b \u043f\u0443\u0441\u0442\u043e\u0439 \u0438\u043b\u0438 \u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d")
+                        return
+
+                    raw = []
+                    for line in combined.splitlines():
+                        raw.extend(ProxyParser.parse(line.strip()))
+
+                    if not raw:
+                        self._serve_error("\u041f\u0440\u043e\u043a\u0441\u0438-\u0441\u0441\u044b\u043b\u043a\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b \u0432 \u0444\u0430\u0439\u043b\u0435")
+                        return
+
+                    seen, unique = set(), []
+                    for p in raw:
+                        k = f"{p.host}:{p.port}"
+                        if k not in seen:
+                            seen.add(k); unique.append(p)
+
+                    import json as _json
+                    links = [p.tg_link() for p in unique]
+                    plugin_ref.set_setting(
+                        f"{mode_ref}_file_links",
+                        _json.dumps(links, ensure_ascii=False),
+                    )
+                    plugin_ref.set_setting("_ts", str(time.time()), reload_settings=True)
+                    stop_event.set()
+                    self._serve_success(
+                        f"\u0417\u0430\u0433\u0440\u0443\u0436\u0435\u043d\u043e {len(unique)} \u043f\u0440\u043e\u043a\u0441\u0438"
+                    )
+
+                except Exception as e:
+                    self._serve_error(str(e))
+
+            def _parse_multipart(self, body: bytes, boundary: str):
+                """Извлекает текстовое содержимое из multipart/form-data."""
+                parts = []
+                sep = ("--" + boundary).encode()
+                chunks = body.split(sep)
+                for chunk in chunks:
+                    if b"\r\n\r\n" not in chunk:
+                        continue
+                    header_part, _, data_part = chunk.partition(b"\r\n\r\n")
+                    # Убираем trailing \r\n--
+                    data_part = data_part.rstrip(b"\r\n-")
+                    if data_part:
+                        try:
+                            parts.append(data_part.decode("utf-8", errors="replace"))
+                        except Exception:
+                            pass
+                return parts
+
+            def _json(self, data):
+                import json as _json
+                body = _json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _serve_page(self):
+                html = (
+                    "<!DOCTYPE html>"
+                    "<html lang='ru'><head>"
+                    "<meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>Proxy Collector \u2014 \u0418\u043c\u043f\u043e\u0440\u0442</title>"
+                    "<style>"
+                    "*{box-sizing:border-box;margin:0;padding:0}"
+                    "body{font-family:-apple-system,sans-serif;background:#0f0f0f;color:#e8e8e8;padding:24px 16px;max-width:480px;margin:0 auto}"
+                    "h1{font-size:18px;font-weight:700;color:#fff;margin-bottom:8px}"
+                    "p{font-size:13px;color:#888;margin-bottom:24px;line-height:1.6}"
+                    "input[type=file]{display:block;width:100%;padding:12px;border-radius:12px;border:1px solid #333;background:#1a1a1a;color:#e8e8e8;font-size:14px;margin-bottom:16px}"
+                    "button{display:block;width:100%;padding:14px;border-radius:12px;border:none;font-size:15px;font-weight:600;cursor:pointer;background:#1a3a1a;color:#4caf50}"
+                    "button:active{opacity:.7}"
+                    "</style></head><body>"
+                    "<h1>\U0001f4c2 \u0418\u043c\u043f\u043e\u0440\u0442 \u043f\u0440\u043e\u043a\u0441\u0438 \u0438\u0437 \u0444\u0430\u0439\u043b\u0430</h1>"
+                    "<p>\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043e\u0434\u0438\u043d \u0438\u043b\u0438 \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e TXT \u0444\u0430\u0439\u043b\u043e\u0432 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c\u00bb.<br>"
+                    "\u041f\u043e\u0441\u043b\u0435 \u044d\u0442\u043e\u0433\u043e \u0432\u0435\u0440\u043d\u0438\u0442\u0435\u0441\u044c \u0432 \u043f\u043b\u0430\u0433\u0438\u043d \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c\u00bb.</p>"
+                    "<form action='/upload' method='POST' enctype='multipart/form-data'>"
+                    "<input type='file' name='files' accept='.txt,text/plain' multiple>"
+                    "<button type='submit'>\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c</button>"
+                    "</form>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+
+            def _serve_success(self, msg: str):
+                html = (
+                    "<!DOCTYPE html><html lang='ru'><head>"
+                    "<meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>OK</title>"
+                    "<style>body{font-family:-apple-system,sans-serif;background:#0f0f0f;color:#e8e8e8;padding:32px 16px;max-width:480px;margin:0 auto;text-align:center}"
+                    "h1{font-size:32px;margin-bottom:16px}"
+                    "p{font-size:15px;color:#4caf50;line-height:1.6}</style></head><body>"
+                    "<h1>\u2705</h1>"
+                    f"<p>{msg}</p>"
+                    "<p style='color:#888;margin-top:24px'>\u0422\u0435\u043f\u0435\u0440\u044c \u0432\u0435\u0440\u043d\u0438\u0442\u0435\u0441\u044c \u0432 \u043f\u043b\u0430\u0433\u0438\u043d<br>\u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u0441\u0431\u043e\u0440 \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0443\u00bb.</p>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+
+            def _serve_error(self, msg: str):
+                html = (
+                    "<!DOCTYPE html><html lang='ru'><head>"
+                    "<meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>\u041e\u0448\u0438\u0431\u043a\u0430</title>"
+                    "<style>body{font-family:-apple-system,sans-serif;background:#0f0f0f;color:#e8e8e8;padding:32px 16px;max-width:480px;margin:0 auto;text-align:center}"
+                    "h1{font-size:32px;margin-bottom:16px}"
+                    "p{font-size:15px;color:#f44336;line-height:1.6}"
+                    "a{color:#5db0f5;display:block;margin-top:24px;font-size:14px}</style></head><body>"
+                    "<h1>\u274c</h1>"
+                    f"<p>{msg}</p>"
+                    "<a href='/'>\u2190 \u041d\u0430\u0437\u0430\u0434</a>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        httpd = socketserver.TCPServer(("127.0.0.1", port), FPHandler)
+        httpd.allow_reuse_address = True
+        url = f"http://127.0.0.1:{port}/"
+
+        def open_browser():
+            try:
+                from org.telegram.messenger import ApplicationLoader
+                from org.telegram.messenger.browser import Browser
+                Browser.openUrl(ApplicationLoader.applicationContext, url)
+            except Exception:
+                try:
+                    from android.content import Intent
+                    from android.net import Uri
+                    from org.telegram.messenger import ApplicationLoader
+                    intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ApplicationLoader.applicationContext.startActivity(intent)
+                except Exception as e:
+                    log(f"[ProxyCollector] browser error: {e}")
+
+        run_on_ui_thread(open_browser)
+
+        while not stop_event.is_set():
+            httpd.handle_request()
+        httpd.server_close()
+
+    def _on_start_click(self, view):
+        if self._running:
+            return
+        use_sources = self.get("use_sources", True)
+        use_github  = self.get("use_github", False)
+        use_file    = self.get("use_file", False)
+        sources    = self.get("sources", "").strip() if use_sources else ""
+        github_url = self.get("github_url", "").strip() if use_github else ""
+        file_links = self.plugin.get_setting(f"{self.mode}_file_links", "") if use_file else ""
+        if not sources and not github_url and not file_links:
+            BulletinHelper.show_error("Включите и заполните хотя бы один источник")
+            return
+        self._cancel = False
+        threading.Thread(
+            target=self._run,
+            args=(sources, github_url, file_links, self._get_days_limit()),
+            daemon=True
+        ).start()
+
+    def _run(self, sources_raw: str, github_url: str, file_links: str, days_limit: int):
+        self._running = True
+        self._results = []
+        self._status  = "Сбор прокси..."
+        self._reload()
+
+        try:
+            timeout = max(1, min(int(self.get("timeout", "5")), 30))
+        except ValueError:
+            timeout = 5
+
+        all_proxies: List[ProxyItem] = []
+
+        # Сбор из Telegram-источников
+        raw_urls = re.findall(r"(?:https?://)?t\.me/\S+", sources_raw)
+        urls = [re.sub(r"^https?://", "", u) for u in raw_urls]
+        total = len(urls)
+
+        for i, url in enumerate(urls):
+            if self._cancel:
+                break
+            self._status = f"Сбор {i+1}/{total}: {url}..."
+            self._reload()
+            try:
+                all_proxies.extend(TelegramFetcher.fetch(url, days_limit))
+            except Exception as e:
+                log(f"[ProxyCollector] fetch error {url}: {e}")
+
+        # Сбор из GitHub файла
+        if not self._cancel and github_url:
+            github_urls = [u.strip() for u in github_url.splitlines() if u.strip()]
+            for i, gurl in enumerate(github_urls):
+                if self._cancel:
+                    break
+                self._status = f"Загрузка файла GitHub {i+1}/{len(github_urls)}..."
+                self._reload()
+                try:
+                    all_proxies.extend(GitHubFetcher.fetch(gurl))
+                except Exception as e:
+                    log(f"[ProxyCollector] github fetch error {gurl}: {e}")
+
+        # Прокси из файла (загружены через браузер)
+        if not self._cancel and file_links:
+            try:
+                import json as _json
+                links = _json.loads(file_links)
+                self._status = f"Добавляю {len(links)} прокси из файла..."
+                self._reload()
+                for link in links:
+                    all_proxies.extend(ProxyParser.parse(link.strip()))
+                # Очищаем после использования
+                self.plugin.set_setting(f"{self.mode}_file_links", "")
+                log(f"[ProxyCollector] loaded {len(links)} proxies from file")
+            except Exception as e:
+                log(f"[ProxyCollector] file_links parse error: {e}")
+
+        if self._cancel:
+            self._finish_cancelled()
+            return
+
+        # Дедупликация
+        seen, unique = set(), []
+        for p in all_proxies:
+            key = f"{p.host}:{p.port}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(p)
+
+        if not unique:
+            self._status = "Прокси не найдены"
+            self._running = False
+            self._reload()
+            return
+
+        # Проверка
+        self._status = f"Проверка {len(unique)} прокси..."
+        self._reload()
+
+        results = [None] * len(unique)
+        lock = threading.Lock()
+
+        def check_worker(idx: int, proxy: ProxyItem):
+            if self._cancel:
+                return
+            result = ProxyChecker.check(proxy, timeout)
+            if not self.get("check_country", True):
+                result.country = ""
+            with lock:
+                results[idx] = result
+
+        for batch_start in range(0, len(unique), 10):
+            if self._cancel:
+                break
+            batch = unique[batch_start:batch_start + 10]
+            workers = [
+                threading.Thread(target=check_worker, args=(batch_start + j, p))
+                for j, p in enumerate(batch)
+            ]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            done = batch_start + len(batch)
+            self._status = f"Проверено {done}/{len(unique)}..."
+            self._reload()
+
+        if self._cancel:
+            self._finish_cancelled()
+            return
+
+        self._results = [r for r in results if r is not None]
+        alive = [p for p in self._results if p.is_alive]
+        dead  = [p for p in self._results if not p.is_alive]
+
+        self._status = f"Готово: {len(alive)} живых, {len(dead)} мёртвых"
+        self._running = False
+        self._reload()
+
+        sources_label = " | ".join(filter(None, [sources_raw[:80], github_url[:60],
+                                                   "файл" if file_links else ""]))
+        HistoryStore.add(self.mode, HistoryEntry(
+            timestamp=int(time.time()),
+            alive=alive,
+            dead_count=len(dead),
+            sources=sources_label[:200],
+        ))
+
+    def _finish_cancelled(self):
+        self._status  = "Отменено"
+        self._running = False
+        self._cancel  = False
+        self._reload()
+
+class ProxyCollectorPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._mode_normal    = ModeController(MODE_NORMAL, self)
+        self._mode_whitelist = ModeController(MODE_WHITELIST, self)
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text="Proxy Collector",
+            subtext="Сбор и проверка прокси",
+            icon="msg_proxy_settings",
+            on_click=self._on_drawer_click,
+        ))
+
+    def _on_delete_all_data(self, view):
+        def show_dialog():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            activity = frag.getParentActivity()
+            if not activity:
+                return
+
+            def on_confirm(bld, which):
+                bld.dismiss()
+                def do():
+                    try:
+                        import glob
+                        plugins_dir = get_plugins_dir()
+                        # Удаляем оба файла истории
+                        for mode in ["normal", "whitelist"]:
+                            p = os.path.join(plugins_dir, f"proxy_collector_history_{mode}.json")
+                            if os.path.exists(p):
+                                os.remove(p)
+                        # Сбрасываем состояние контроллеров
+                        for ctrl in [self._mode_normal, self._mode_whitelist]:
+                            ctrl._running = False
+                            ctrl._cancel  = False
+                            ctrl._results = []
+                            ctrl._status  = "Ожидание"
+                        self.set_setting("_ts", f"wipe_{int(time.time())}", reload_settings=True)
+                        BulletinHelper.show_success("Все данные плагина удалены")
+                    except Exception as e:
+                        log(f"[ProxyCollector] delete_all_data error: {e}")
+                        BulletinHelper.show_error("Ошибка удаления данных")
+                threading.Thread(target=do, daemon=True).start()
+
+            bld = AlertDialogBuilder(activity)
+            bld.set_title("Удалить все данные плагина")
+            bld.set_message(
+                "Будет удалена вся история сборов обоих режимов.\n\n"
+                "⚠️ Это действие нельзя отменить."
+            )
+            bld.set_positive_button("Удалить всё", on_confirm)
+            bld.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            bld.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            bld.show()
+
+        run_on_ui_thread(show_dialog)
+
+    def _on_show_path_help(self, view):
+        def show():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            activity = frag.getParentActivity()
+            if not activity:
+                return
+            bld = AlertDialogBuilder(activity)
+            bld.set_title("Как найти полный путь к файлу")
+            bld.set_message(
+                "Полный путь к файлу обычно начинается с /storage/emulated/0/\n\n"
+                "Частые расположения:\n"
+                "• /storage/emulated/0/Download/\n"
+                "• /storage/emulated/0/Documents/\n\n"
+                "Как узнать точный путь:\n"
+                "1. Откройте «Файлы» на устройстве\n"
+                "2. Найдите нужный .txt файл\n"
+                "3. Нажмите долгим нажатием → «Свойства» или «Детали»\n"
+                "4. Скопируйте путь оттуда\n\n"
+                "Многие файловые менеджеры (MiXplorer, Solid Explorer, "
+                "Total Commander) показывают путь в адресной строке."
+            )
+            bld.set_positive_button("Понятно", lambda b, w: b.dismiss())
+            bld.show()
+        run_on_ui_thread(show)
+
+    def _on_drawer_click(self, context):
+        def _run():
+            PC  = find_class("com.exteragram.messenger.plugins.PluginsController")
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if PC and PSA:
+                try:
+                    inst = PC.getInstance()
+                    if inst is not None and hasattr(inst, "plugins"):
+                        for pid in [__id__, "proxy_collector"]:
+                            try:
+                                plugin_obj = inst.plugins.get(pid)
+                            except Exception:
+                                plugin_obj = None
+                            if plugin_obj is not None:
+                                frag = get_last_fragment()
+                                if frag is not None:
+                                    frag.presentFragment(PSA(plugin_obj))
+                                    return
+                except Exception:
+                    pass
+            if PC:
+                for pid in [__id__, "proxy_collector"]:
+                    try:
+                        if bool(PC.openPluginSettings(pid)):
+                            return
+                    except Exception:
+                        pass
+            if PC:
+                try:
+                    frag = get_last_fragment()
+                    if frag:
+                        PC.getInstance().openPluginSettings(__id__, frag)
+                except Exception:
+                    pass
+        run_on_ui_thread(_run)
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Proxy Collector"),
+            Text(
+                text="Обычные прокси",
+                icon="msg_proxy_on",
+                create_sub_fragment=self._mode_normal.create_page,
+            ),
+            Text(
+                text="Прокси с обходом белых списков",
+                icon="msg_proxy_on",
+                create_sub_fragment=self._mode_whitelist.create_page,
+            ),
+            Divider(text="⚠️ Для корректной работы с Telegram-источниками необходимо быть подписанным на используемые каналы, чаты и топики. Корректная работа без подписки не гарантируется."),
+            Divider(),
+            Text(
+                text="Удалить все данные плагина",
+                red=True,
+                icon="msg_delete",
+                on_click=self._on_delete_all_data,
+            ),
+        ]
+
+    def _open_proxy_list_in_browser(self, entry: HistoryEntry, mode: str = MODE_NORMAL):
+        def serve_and_open():
+            try:
+                import http.server
+                import socketserver
+                import socket as _socket
+                import urllib.parse as _urlparse
+
+                plugin_ref = self
+                entry_mode = mode
+
+                with _socket.socket() as s:
+                    s.bind(("", 0))
+                    port = s.getsockname()[1]
+
+                stop_event = threading.Event()
+
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        parsed = _urlparse.urlparse(self.path)
+                        path   = parsed.path
+                        params = dict(_urlparse.parse_qsl(parsed.query))
+
+                        if path == "/":
+                            self._serve_page()
+                        elif path == "/api/export_tg":
+                            max_ping = int(params.get("max_ping", 0))
+                            replace  = params.get("replace", "0") == "1"
+                            self._api_export_tg(max_ping, replace)
+                        elif path == "/api/vault_tabs":
+                            self._api_vault_tabs()
+                        elif path == "/api/vault_send":
+                            tab_id   = params.get("tab_id", "")
+                            tab_name = _urlparse.unquote(params.get("tab_name", ""))
+                            max_ping = int(params.get("max_ping", 0))
+                            self._api_vault_send(tab_id, tab_name, max_ping)
+                        elif path == "/api/export_txt":
+                            max_ping = int(params.get("max_ping", 0))
+                            self._api_export_txt(max_ping)
+                        elif path == "/api/send_text_saved":
+                            max_ping = int(params.get("max_ping", 0))
+                            self._api_send_text_saved(max_ping)
+                        elif path == "/api/share_text":
+                            max_ping = int(params.get("max_ping", 0))
+                            self._api_share_text(max_ping)
+                        elif path == "/api/share_file":
+                            max_ping = int(params.get("max_ping", 0))
+                            self._api_share_file(max_ping)
+                        else:
+                            self.send_response(404)
+                            self.end_headers()
+
+                    def _json(self, data):
+                        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                    def _serve_page(self):
+                        html = plugin_ref._build_proxy_html(entry)
+                        body = html.encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                    def _api_export_tg(self, max_ping: int, replace: bool = False):
+                        try:
+                            from org.telegram.messenger import SharedConfig, NotificationCenter
+                            from java.util import ArrayList
+
+                            alive = [p for p in entry.alive
+                                     if max_ping == 0 or p.ping_ms <= max_ping]
+
+                            new_list = ArrayList()
+                            existing_keys = set()
+                            if not replace:
+                                existing = SharedConfig.proxyList
+                                if existing:
+                                    for i in range(existing.size()):
+                                        p = existing.get(i)
+                                        try:
+                                            k = f"{p.address}:{p.port}"
+                                            existing_keys.add(k)
+                                            new_list.add(p)
+                                        except Exception:
+                                            pass
+
+                            added = 0
+                            for p in alive:
+                                k = f"{p.host}:{p.port}"
+                                if k in existing_keys:
+                                    continue
+                                new_list.add(SharedConfig.ProxyInfo(
+                                    p.host, p.port,
+                                    p.user or "", p.password or "", p.secret or ""))
+                                existing_keys.add(k)
+                                added += 1
+
+                            SharedConfig.proxyList = new_list
+                            if new_list.size() > 0:
+                                SharedConfig.currentProxy = new_list.get(0)
+                            SharedConfig.useProxy = new_list.size() > 0
+                            SharedConfig.saveConfig()
+
+                            def notify():
+                                try:
+                                    NotificationCenter.getGlobalInstance().postNotificationName(
+                                        NotificationCenter.proxySettingsChanged)
+                                except Exception:
+                                    pass
+                            run_on_ui_thread(notify)
+                            self._json({"ok": True, "added": added, "total": len(alive)})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def _api_vault_tabs(self):
+                        try:
+                            PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+                            if not PC:
+                                self._json({"error": "vault_not_found"})
+                                return
+                            inst = PC.getInstance()
+                            if not inst or not hasattr(inst, "plugins"):
+                                self._json({"error": "vault_not_found"})
+                                return
+                            vault = inst.plugins.get("proxy_vault")
+                            if not vault:
+                                self._json({"error": "vault_not_found"})
+                                return
+                            # Читаем vault.json напрямую
+                            from file_utils import get_plugins_dir
+                            import os
+                            vault_path = os.path.join(get_plugins_dir(), "proxy_vault.json")
+                            try:
+                                with open(vault_path, "r", encoding="utf-8") as f:
+                                    data = json.load(f)
+                                tabs = [{"tab_id": t["tab_id"], "name": t["name"],
+                                         "count": len(t.get("proxies", []))}
+                                        for t in data]
+                            except Exception:
+                                tabs = []
+                            self._json({"ok": True, "tabs": tabs})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def _api_vault_send(self, tab_id: str, tab_name: str, max_ping: int):
+                        try:
+                            from file_utils import get_plugins_dir, ensure_dir_exists
+                            import os
+                            vault_path = os.path.join(get_plugins_dir(), "proxy_vault.json")
+
+                            alive = [p for p in entry.alive
+                                     if max_ping == 0 or p.ping_ms <= max_ping]
+                            if not alive:
+                                self._json({"ok": False, "msg": "Нет прокси с таким ограничением пинга"})
+                                return
+
+                            # Загружаем vault
+                            try:
+                                with open(vault_path, "r", encoding="utf-8") as f:
+                                    vault_data = json.load(f)
+                            except Exception:
+                                vault_data = []
+
+                            # Создаём новую вкладку если нужно
+                            if not tab_id:
+                                new_id = f"tab_{int(time.time() * 1000)}"
+                                new_tab = {"tab_id": new_id, "name": tab_name, "proxies": []}
+                                vault_data.append(new_tab)
+                                tab_id = new_id
+
+                            # Находим вкладку
+                            target = next((t for t in vault_data if t["tab_id"] == tab_id), None)
+                            if not target:
+                                self._json({"error": "tab not found"})
+                                return
+
+                            existing_keys = {f"{p['host']}:{p['port']}"
+                                             for p in target.get("proxies", [])}
+                            added = 0
+                            for p in alive:
+                                k = f"{p.host}:{p.port}"
+                                if k in existing_keys:
+                                    continue
+                                target.setdefault("proxies", []).append({
+                                    "host": p.host, "port": p.port,
+                                    "user": p.user or "", "password": p.password or "",
+                                    "secret": p.secret or "", "protocol": p.protocol,
+                                })
+                                existing_keys.add(k)
+                                added += 1
+
+                            ensure_dir_exists(get_plugins_dir())
+                            with open(vault_path, "w", encoding="utf-8") as f:
+                                json.dump(vault_data, f, ensure_ascii=False)
+
+                            # Триггерим обновление главного экрана Vault
+                            try:
+                                PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+                                if PC:
+                                    inst = PC.getInstance()
+                                    if inst and hasattr(inst, "plugins"):
+                                        vault_plugin = inst.plugins.get("proxy_vault")
+                                        if vault_plugin:
+                                            vault_plugin.set_setting(
+                                                "_vault_ts", str(time.time()),
+                                                reload_settings=True
+                                            )
+                            except Exception:
+                                pass
+
+                            self._json({"ok": True, "added": added,
+                                        "tab_name": target["name"]})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def _api_export_txt(self, max_ping: int):
+                        try:
+                            from client_utils import get_user_config, send_document
+                            from file_utils import get_plugins_dir, ensure_dir_exists
+
+                            alive = [p for p in entry.alive
+                                     if max_ping == 0 or p.ping_ms <= max_ping]
+                            if not alive:
+                                self._json({"ok": False, "msg": "Нет прокси с таким ограничением пинга"})
+                                return
+
+                            ts   = time.strftime("%Y%m%d_%H%M%S")
+                            path = os.path.join(get_plugins_dir(), f"proxy_collector_export_{ts}.txt")
+                            ensure_dir_exists(get_plugins_dir())
+
+                            lines = [
+                                f"Proxy Collector — экспорт прокси",
+                                f"Дата: {time.strftime('%d.%m.%Y %H:%M:%S')}",
+                                f"Всего: {len(alive)}",
+                                "",
+                            ]
+                            for p in alive:
+                                lines.append(p.tg_link())
+
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write("\n".join(lines))
+
+                            my_id = get_user_config().getClientUserId()
+                            send_document(my_id, path,
+                                          caption=f"📋 Proxy Collector — {len(alive)} прокси")
+                            self._json({"ok": True, "count": len(alive)})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def _api_send_text_saved(self, max_ping: int):
+                        try:
+                            from client_utils import get_user_config, send_text
+                            alive = [p for p in entry.alive
+                                     if max_ping == 0 or p.ping_ms <= max_ping]
+                            if not alive:
+                                self._json({"ok": False, "msg": "Нет прокси с таким ограничением"})
+                                return
+                            my_id = get_user_config().getClientUserId()
+                            header = f"📋 Proxy Collector — {len(alive)} прокси"
+                            links  = [p.tg_link() for p in alive]
+                            current = header + "\n\n"
+                            for link in links:
+                                chunk = link + "\n\n"
+                                if len(current) + len(chunk) > 4096:
+                                    send_text(my_id, current.rstrip())
+                                    current = chunk
+                                else:
+                                    current += chunk
+                            if current.strip():
+                                send_text(my_id, current.rstrip())
+                            self._json({"ok": True, "count": len(alive)})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def _api_share_text(self, max_ping: int):
+                        try:
+                            from org.telegram.messenger import ApplicationLoader
+                            from android.content import Intent
+                            from android.net import Uri
+                            from file_utils import get_plugins_dir, ensure_dir_exists
+                            alive = [p for p in entry.alive
+                                     if max_ping == 0 or p.ping_ms <= max_ping]
+                            if not alive:
+                                self._json({"ok": False, "msg": "Нет прокси с таким ограничением"})
+                                return
+                            text = _build_padded_text(
+                                f"📋 Proxy Collector — {len(alive)} прокси",
+                                [p.tg_link() for p in alive]
+                            )
+                            # Сохраняем во временный файл и передаём через EXTRA_TEXT
+                            # (Intent.EXTRA_TEXT не обрезает, т.к. мы передаём строку напрямую)
+                            intent = Intent(Intent.ACTION_SEND)
+                            intent.setType("text/plain")
+                            intent.putExtra(Intent.EXTRA_TEXT, text)
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            chooser = Intent.createChooser(intent, "Поделиться прокси")
+                            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            def do():
+                                ApplicationLoader.applicationContext.startActivity(chooser)
+                            run_on_ui_thread(do)
+                            self._json({"ok": True})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def _api_share_file(self, max_ping: int):
+                        try:
+                            from org.telegram.messenger import ApplicationLoader
+                            from android.content import Intent
+                            from android.net import Uri
+                            from file_utils import get_plugins_dir, ensure_dir_exists
+                            alive = [p for p in entry.alive
+                                     if max_ping == 0 or p.ping_ms <= max_ping]
+                            if not alive:
+                                self._json({"ok": False, "msg": "Нет прокси с таким ограничением"})
+                                return
+                            ts   = time.strftime("%Y%m%d_%H%M%S")
+                            path = os.path.join(get_plugins_dir(), f"proxy_collector_share_{ts}.txt")
+                            ensure_dir_exists(get_plugins_dir())
+                            lines = [f"Proxy Collector — {len(alive)} прокси", ""] + [p.tg_link() for p in alive]
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write("\n".join(lines))
+                            uri = Uri.fromFile(__import__("java.io", fromlist=["File"]).File(path))
+                            intent = Intent(Intent.ACTION_SEND)
+                            intent.setType("text/plain")
+                            intent.putExtra(Intent.EXTRA_STREAM, uri)
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            chooser = Intent.createChooser(intent, "Поделиться файлом")
+                            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            def do():
+                                ApplicationLoader.applicationContext.startActivity(chooser)
+                            run_on_ui_thread(do)
+                            self._json({"ok": True})
+                        except Exception as e:
+                            self._json({"error": str(e)})
+
+                    def log_message(self, fmt, *args):
+                        pass
+
+                httpd = socketserver.TCPServer(("127.0.0.1", port), Handler)
+                httpd.allow_reuse_address = True
+                url = f"http://127.0.0.1:{port}/"
+
+                def open_browser():
+                    try:
+                        from org.telegram.messenger import ApplicationLoader
+                        from org.telegram.messenger.browser import Browser
+                        Browser.openUrl(ApplicationLoader.applicationContext, url)
+                    except Exception as e:
+                        log(f"[ProxyCollector] Browser.openUrl error: {e}")
+                        try:
+                            from android.content import Intent
+                            from android.net import Uri
+                            from org.telegram.messenger import ApplicationLoader
+                            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            ApplicationLoader.applicationContext.startActivity(intent)
+                        except Exception as e2:
+                            log(f"[ProxyCollector] Intent fallback error: {e2}")
+
+                run_on_ui_thread(open_browser)
+
+                # Живём пока браузер открыт (обслуживаем запросы)
+                while not stop_event.is_set():
+                    httpd.handle_request()
+                httpd.server_close()
+
+            except Exception as e:
+                log(f"[ProxyCollector] HTTP server error: {e}\n{traceback.format_exc()}")
+                BulletinHelper.show_error("Не удалось открыть список")
+
+        threading.Thread(target=serve_and_open, daemon=True).start()
+
+    def _build_proxy_html(self, entry: HistoryEntry) -> str:
+        dt = datetime.fromtimestamp(entry.timestamp).strftime("%d.%m.%Y %H:%M")
+        alive = sorted(entry.alive, key=lambda p: p.ping_ms)
+        rows = []
+        for p in alive:
+            link = p.tg_link()
+            ping = f"{p.ping_ms}ms" if p.is_alive else "—"
+            country = p.country or "—"
+            is_tg_link = link.startswith("https://t.me/")
+            rows.append(
+                f'<tr data-ping="{p.ping_ms}">'
+                f'<td class="ping ok">{ping}</td>'
+                f'<td class="proto">{p.protocol}</td>'
+                f'<td class="country">{country}</td>'
+                f'<td class="addr">'
+                + (f'<a href="{link}">{link}</a>' if is_tg_link else link)
+                + f'</td></tr>'
+            )
+        rows_html = "\n".join(rows)
+        sources_escaped = entry.sources.replace("&", "&amp;").replace("<", "&lt;")
+        return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxy Collector — {dt}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,sans-serif;background:#0f0f0f;color:#e8e8e8;padding:16px}}
+  h1{{font-size:18px;font-weight:700;color:#fff;margin-bottom:4px}}
+  .meta{{font-size:12px;color:#888;margin-bottom:3px}}
+  .sources{{font-size:12px;color:#666;margin-bottom:12px;word-break:break-all}}
+  .stats{{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}}
+  .badge{{padding:6px 14px;border-radius:20px;font-size:13px;font-weight:600}}
+  .badge.alive{{background:#1a3a1a;color:#4caf50}}
+  .badge.dead{{background:#3a1a1a;color:#f44336}}
+  .ping-filter{{display:flex;align-items:center;gap:8px;margin-bottom:12px;background:#1a1a1a;border-radius:10px;padding:10px 14px}}
+  .ping-filter label{{font-size:13px;color:#aaa;white-space:nowrap}}
+  .ping-filter input{{background:#2a2a2a;border:none;border-radius:6px;color:#fff;padding:6px 10px;font-size:13px;width:90px;outline:none}}
+  .ping-filter span{{font-size:12px;color:#666}}
+  .actions{{margin-bottom:14px}}
+  .btn-exp{{width:100%;padding:13px;background:#1a3a1a;color:#4caf50;border:none;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer}}
+  .btn-exp:active{{opacity:.7}}
+  table{{width:100%;border-collapse:collapse;font-size:13px}}
+  th{{text-align:left;padding:8px 10px;color:#888;font-weight:600;font-size:11px;text-transform:uppercase;border-bottom:1px solid #222}}
+  td{{padding:10px;border-bottom:1px solid #1a1a1a;vertical-align:middle}}
+  tr:hover td{{background:#181818}}
+  tr.hidden{{display:none}}
+  td.ping{{font-weight:700;width:60px;color:#4caf50}}
+  td.proto{{color:#888;width:80px;font-size:11px}}
+  td.country{{width:120px}}
+  td.addr a{{color:#5db0f5;text-decoration:none;word-break:break-all}}
+  td.addr a:hover{{text-decoration:underline}}
+  td.addr{{word-break:break-all}}
+  .toast{{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999;max-width:90vw;text-align:center}}
+  .toast.show{{opacity:1}}
+  /* sheets */
+  .ov{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);align-items:flex-end;justify-content:center;z-index:100}}
+  .ov.show{{display:flex}}
+  .sh{{background:#1a1a1a;border-radius:18px 18px 0 0;padding:0 16px 34px;width:100%;max-width:500px;max-height:88vh;display:flex;flex-direction:column}}
+  .sh-handle{{width:36px;height:4px;background:#2e2e2e;border-radius:2px;margin:12px auto 14px;flex-shrink:0}}
+  .sh-head{{display:flex;align-items:center;margin-bottom:14px;flex-shrink:0;gap:8px}}
+  .sh-title{{flex:1;text-align:center;font-size:13px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px}}
+  .btn-back{{background:none;border:none;color:#5db0f5;font-size:14px;font-weight:700;cursor:pointer;padding:0;width:52px;text-align:left}}
+  .sh-spacer{{width:52px}}
+  .sh-ping{{display:flex;align-items:center;gap:8px;margin-bottom:12px;background:#111;border-radius:10px;padding:10px 14px;flex-shrink:0}}
+  .sh-ping label{{font-size:13px;color:#aaa}}
+  .sh-ping input{{background:#2a2a2a;border:none;border-radius:6px;color:#fff;padding:6px 10px;font-size:13px;width:90px;outline:none;margin-left:auto}}
+  .sh-scroll{{overflow-y:auto;flex:1}}
+  .ai{{display:flex;align-items:center;gap:12px;background:#111;border-radius:12px;padding:14px 16px;margin-bottom:8px;cursor:pointer;border:none;width:100%;text-align:left;color:#e8e8e8}}
+  .ai:hover{{background:#1e1e1e}}
+  .ai:active{{opacity:.7}}
+  .ai-ic{{font-size:22px;flex-shrink:0}}
+  .ai-lbl{{font-size:14px;font-weight:600}}
+  .ai-dsc{{font-size:12px;color:#666;margin-top:2px}}
+  .btn-close{{background:#222;color:#aaa;width:100%;padding:13px;border-radius:12px;border:none;font-size:14px;cursor:pointer;margin-top:8px;font-weight:600}}
+  .btn-close:hover{{background:#2a2a2a}}
+  .confirm-msg{{font-size:14px;color:#aaa;text-align:center;margin-bottom:16px;line-height:1.5;flex-shrink:0}}
+  .btn-ok{{width:100%;padding:13px;border-radius:12px;border:none;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px;background:#1a3a1a;color:#4caf50}}
+  .btn-ok:hover{{background:#1e3e1e}}
+  .tab-item{{background:#111;border-radius:10px;padding:12px 14px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}}
+  .tab-item:hover{{background:#1e1e1e}}
+  .tab-name{{font-size:14px;font-weight:600}}
+  .tab-cnt{{font-size:12px;color:#666}}
+  .txt-input{{background:#111;border:none;border-radius:10px;color:#fff;padding:12px 14px;font-size:14px;width:100%;outline:none;margin-bottom:8px}}
+</style>
+</head>
+<body>
+<h1>Proxy Collector</h1>
+<div class="meta">{dt}</div>
+<div class="sources">📍 {sources_escaped}</div>
+<div class="stats">
+  <span class="badge alive">✅ Живых: {len(alive)}</span>
+  <span class="badge dead">❌ Мёртвых: {entry.dead_count}</span>
+</div>
+<div class="ping-filter">
+  <label>Фильтр по пингу:</label>
+  <input type="number" id="pfv" placeholder="без лимита" min="0" oninput="applyFilter()">
+  <span id="pfc"></span>
+</div>
+<div class="actions">
+  <button class="btn-exp" onclick="openExport()">📤 Экспорт</button>
+</div>
+<table>
+  <thead><tr><th>Пинг</th><th>Тип</th><th>Страна</th><th>Адрес</th></tr></thead>
+  <tbody id="tbody">{rows_html}</tbody>
+</table>
+<div class="toast" id="toast"></div>
+
+<!-- Sheet: Экспорт -->
+<div class="ov" id="s-exp" onclick="ovClick(event,'s-exp')">
+<div class="sh" id="sh-exp">
+  <div class="sh-handle" id="hdl-exp"></div>
+  <div class="sh-head"><div class="sh-spacer"></div><div class="sh-title">Экспорт прокси</div><div class="sh-spacer"></div></div>
+  <div class="sh-ping"><label>Макс. пинг (мс):</label><input type="number" id="ep" placeholder="все" min="0"></div>
+  <div class="sh-scroll">
+    <button class="ai" onclick="showSheet('s-tg')"><span class="ai-ic">📲</span><div><div class="ai-lbl">Добавить в Telegram</div><div class="ai-dsc">Выбрать способ добавления</div></div></button>
+    <button class="ai" onclick="showSheet('s-saved')"><span class="ai-ic">⭐</span><div><div class="ai-lbl">Отправить в Избранное</div><div class="ai-dsc">Выбрать формат отправки</div></div></button>
+    <button class="ai" onclick="openShare()"><span class="ai-ic">📨</span><div><div class="ai-lbl">Поделиться через Telegram</div><div class="ai-dsc">Открыть диалог выбора чата в TG</div></div></button>
+    <button class="ai" onclick="openVault()"><span class="ai-ic">🗄</span><div><div class="ai-lbl">Отправить в Proxy Vault</div><div class="ai-dsc">Сохранить во вкладку Proxy Vault</div></div></button>
+    <button class="ai" onclick="copyLinks()"><span class="ai-ic">📋</span><div><div class="ai-lbl">Скопировать все ссылки</div><div class="ai-dsc">Скопировать в буфер обмена</div></div></button>
+  </div>
+  <button class="btn-close" onclick="hideSheet('s-exp')">Закрыть</button>
+</div>
+</div>
+
+<!-- Sheet: Добавить в TG -->
+<div class="ov" id="s-tg" onclick="ovClick(event,'s-tg')">
+<div class="sh">
+  <div class="sh-handle"></div>
+  <div class="sh-head"><button class="btn-back" onclick="goBack('s-exp')">← Назад</button><div class="sh-title">Добавить в Telegram</div><div class="sh-spacer"></div></div>
+  <div class="sh-scroll">
+    <button class="ai" onclick="askConfirm('add_tg','Добавить к текущим','Прокси добавятся к текущим прокси в Telegram.')"><span class="ai-ic">📲</span><div><div class="ai-lbl">Добавить к текущим</div><div class="ai-dsc">Существующие прокси сохранятся</div></div></button>
+    <button class="ai" onclick="askConfirm('rep_tg','Заменить все прокси','Текущие прокси будут удалены и заменены на эти.')"><span class="ai-ic">🔄</span><div><div class="ai-lbl">Заменить все прокси</div><div class="ai-dsc">Удалить текущие и установить эти</div></div></button>
+  </div>
+  <button class="btn-close" onclick="hideSheet('s-tg')">Отмена</button>
+</div>
+</div>
+
+<!-- Sheet: Отправить в Избранное -->
+<div class="ov" id="s-saved" onclick="ovClick(event,'s-saved')">
+<div class="sh">
+  <div class="sh-handle"></div>
+  <div class="sh-head"><button class="btn-back" onclick="goBack('s-exp')">← Назад</button><div class="sh-title">Отправить в Избранное</div><div class="sh-spacer"></div></div>
+  <div class="sh-scroll">
+    <button class="ai" onclick="askConfirm('txt_saved','Отправить ссылками','Прокси будут отправлены текстовым сообщением.')"><span class="ai-ic">💬</span><div><div class="ai-lbl">Отправить ссылками (текст)</div><div class="ai-dsc">Каждая ссылка отдельной строкой</div></div></button>
+    <button class="ai" onclick="askConfirm('file_saved','Отправить TXT файлом','TXT файл с прокси будет отправлен в Избранное.')"><span class="ai-ic">📄</span><div><div class="ai-lbl">Отправить TXT файлом</div><div class="ai-dsc">Файл со всеми ссылками</div></div></button>
+  </div>
+  <button class="btn-close" onclick="hideSheet('s-saved')">Отмена</button>
+</div>
+</div>
+
+<!-- Sheet: Подтверждение -->
+<div class="ov" id="s-cnf" onclick="ovClick(event,'s-cnf')">
+<div class="sh">
+  <div class="sh-handle"></div>
+  <div class="sh-head"><button class="btn-back" onclick="goBack('s-exp')">← Назад</button><div class="sh-title" id="cnf-title"></div><div class="sh-spacer"></div></div>
+  <div class="confirm-msg" id="cnf-msg"></div>
+  <button class="btn-ok" onclick="runAction()">Подтвердить</button>
+  <button class="btn-close" onclick="hideSheet('s-cnf')">Отмена</button>
+</div>
+</div>
+
+<!-- Sheet: Поделиться -->
+<div class="ov" id="s-share" onclick="ovClick(event,'s-share')">
+<div class="sh">
+  <div class="sh-handle"></div>
+  <div class="sh-head"><button class="btn-back" onclick="goBack('s-exp')">← Назад</button><div class="sh-title">Поделиться</div><div class="sh-spacer"></div></div>
+  <div class="sh-scroll">
+    <button class="ai" onclick="askConfirm('share_text','Поделиться ссылками','Откроется диалог выбора чата в Telegram. Прокси будут отправлены текстом.')"><span class="ai-ic">💬</span><div><div class="ai-lbl">Поделиться ссылками (текст)</div><div class="ai-dsc">Отправить ссылки текстовым сообщением</div></div></button>
+    <button class="ai" onclick="askConfirm('share_file','Поделиться TXT файлом','Откроется диалог выбора чата в Telegram. Прокси будут отправлены файлом.')"><span class="ai-ic">📄</span><div><div class="ai-lbl">Поделиться TXT файлом</div><div class="ai-dsc">Отправить прокси в виде файла</div></div></button>
+  </div>
+  <button class="btn-close" onclick="hideSheet('s-share')">Отмена</button>
+</div>
+</div>
+
+<!-- Sheet: Vault -->
+<div class="ov" id="s-vault" onclick="ovClick(event,'s-vault')">
+<div class="sh">
+  <div class="sh-handle"></div>
+  <div class="sh-head"><button class="btn-back" onclick="goBack('s-exp')">← Назад</button><div class="sh-title">Proxy Vault</div><div class="sh-spacer"></div></div>
+  <div class="sh-scroll">
+    <div id="vtabs"></div>
+    <div id="vcreate">
+      <input class="txt-input" id="vtab-name" placeholder="Название новой вкладки...">
+      <button class="ai" onclick="sendNewTab()"><span class="ai-ic">➕</span><div><div class="ai-lbl">Создать и отправить</div></div></button>
+    </div>
+  </div>
+  <button class="btn-close" onclick="hideSheet('s-vault')">Отмена</button>
+</div>
+</div>
+
+<script>
+const BASE = location.origin;
+let _action = null;
+
+function toast(msg, ok) {{
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = ok===false?'#4a1a1a':ok===true?'#1a3a1a':'#333';
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 3000);
+}}
+
+function showSheet(id) {{ document.getElementById(id).classList.add('show'); }}
+function hideSheet(id) {{ document.getElementById(id).classList.remove('show'); }}
+function goBack(id) {{
+  document.querySelectorAll('.ov').forEach(o=>o.classList.remove('show'));
+  showSheet(id);
+}}
+
+// Закрытие по клику на оверлей (вне шита)
+function ovClick(e, id) {{
+  if (e.target === document.getElementById(id)) hideSheet(id);
+}}
+
+// Свайп вниз для закрытия
+(function() {{
+  document.querySelectorAll('.sh-handle').forEach(h => {{
+    let startY = 0;
+    h.parentElement.addEventListener('touchstart', e => {{ startY = e.touches[0].clientY; }}, {{passive:true}});
+    h.parentElement.addEventListener('touchend', e => {{
+      if (e.changedTouches[0].clientY - startY > 60) {{
+        const ov = h.parentElement.closest('.ov');
+        if (ov) ov.classList.remove('show');
+      }}
+    }}, {{passive:true}});
+  }});
+}})();
+
+function getPing() {{ const v=parseInt(document.getElementById('ep').value); return isNaN(v)||v<=0?0:v; }}
+function getFilt() {{ const v=parseInt(document.getElementById('pfv').value); return isNaN(v)||v<=0?0:v; }}
+
+function applyFilter() {{
+  const max=getFilt(); let n=0;
+  document.querySelectorAll('#tbody tr').forEach(tr=>{{
+    const p=parseInt(tr.dataset.ping);
+    const h=max>0&&p>max;
+    tr.classList.toggle('hidden',h);
+    if(!h)n++;
+  }});
+  document.getElementById('pfc').textContent=max>0?`показано: ${{n}}`:'';
+}}
+
+function openExport() {{
+  const f=getFilt(); if(f>0) document.getElementById('ep').value=f;
+  showSheet('s-exp');
+}}
+
+function askConfirm(action, title, msg) {{
+  _action = action;
+  document.getElementById('cnf-title').textContent = title;
+  document.getElementById('cnf-msg').textContent = msg;
+  goBack('s-cnf');
+}}
+
+async function runAction() {{
+  hideSheet('s-cnf');
+  const mp = getPing();
+  if (_action === 'add_tg') {{
+    toast('Добавление в Telegram...');
+    const r = await fetch(`${{BASE}}/api/export_tg?max_ping=${{mp}}&replace=0`);
+    const d = await r.json();
+    toast(d.error ? 'Ошибка: '+d.error : `Добавлено ${{d.added}} прокси`, !d.error);
+  }} else if (_action === 'rep_tg') {{
+    toast('Замена в Telegram...');
+    const r = await fetch(`${{BASE}}/api/export_tg?max_ping=${{mp}}&replace=1`);
+    const d = await r.json();
+    toast(d.error ? 'Ошибка: '+d.error : `Загружено ${{d.added}} прокси (с заменой)`, !d.error);
+  }} else if (_action === 'txt_saved') {{
+    toast('Отправка...');
+    const r = await fetch(`${{BASE}}/api/send_text_saved?max_ping=${{mp}}`);
+    const d = await r.json();
+    toast(d.error ? 'Ошибка: '+d.error : d.ok===false ? d.msg : `${{d.count}} ссылок отправлено`, !d.error&&d.ok!==false);
+  }} else if (_action === 'file_saved') {{
+    toast('Создание файла...');
+    const r = await fetch(`${{BASE}}/api/export_txt?max_ping=${{mp}}`);
+    const d = await r.json();
+    toast(d.error ? 'Ошибка: '+d.error : d.ok===false ? d.msg : `Файл с ${{d.count}} прокси отправлен`, !d.error&&d.ok!==false);
+  }} else if (_action === 'share_text') {{
+    toast('Открываем диалог...');
+    const r = await fetch(`${{BASE}}/api/share_text?max_ping=${{mp}}`);
+    const d = await r.json();
+    if (d.error) toast('Ошибка: '+d.error, false);
+  }} else if (_action === 'share_file') {{
+    toast('Подготовка файла...');
+    const r = await fetch(`${{BASE}}/api/share_file?max_ping=${{mp}}`);
+    const d = await r.json();
+    if (d.error) toast('Ошибка: '+d.error, false);
+  }}
+}}
+
+function openShare() {{ goBack('s-share'); }}
+
+function copyLinks() {{
+  const mp=getPing();
+  const links=[...document.querySelectorAll('#tbody tr')]
+    .filter(tr=>{{if(tr.classList.contains('hidden'))return false; const p=parseInt(tr.dataset.ping); return mp===0||p<=mp;}})
+    .map(tr=>tr.querySelector('.addr a')?.href||tr.querySelector('.addr')?.textContent||'')
+    .filter(Boolean);
+  if(!links.length){{toast('Нет прокси',false);return;}}
+  navigator.clipboard.writeText(links.join('\\n\\n'))
+    .then(()=>{{toast(`Скопировано ${{links.length}} ссылок`,true);hideSheet('s-exp');}})
+    .catch(()=>toast('Ошибка копирования',false));
+}}
+
+async function openVault() {{
+  goBack('s-vault');
+  const cnt=document.getElementById('vtabs');
+  const cre=document.getElementById('vcreate');
+  cnt.innerHTML='<div style="color:#666;text-align:center;padding:20px">Загрузка...</div>';
+  const r=await fetch(BASE+'/api/vault_tabs');
+  const d=await r.json();
+  if(d.error==='vault_not_found'){{cnt.innerHTML='<div style="color:#f44336;text-align:center;padding:20px">⚠️ Proxy Vault не установлен или не включён</div>';if(cre)cre.style.display='none';return;}}
+  if(cre)cre.style.display='';
+  if(d.error){{cnt.innerHTML='<div style="color:#f44336;padding:16px">'+d.error+'</div>';return;}}
+  if(!d.tabs.length){{cnt.innerHTML='<div style="color:#666;text-align:center;padding:16px">Нет вкладок. Создайте ниже.</div>';return;}}
+  cnt.innerHTML=d.tabs.map(t=>`<div class="tab-item" onclick="sendTab('${{t.tab_id}}','${{t.name.replace(/'/g,"\\'")}}')" ><span class="tab-name">${{t.name}}</span><span class="tab-cnt">${{t.count}} прокси</span></div>`).join('');
+}}
+
+async function sendTab(tid,tn) {{
+  hideSheet('s-vault');
+  const mp=getPing();
+  toast('Отправка...');
+  const r=await fetch(`${{BASE}}/api/vault_send?tab_id=${{encodeURIComponent(tid)}}&tab_name=${{encodeURIComponent(tn)}}&max_ping=${{mp}}`);
+  const d=await r.json();
+  toast(!d.ok?(d.msg||d.error||'Ошибка'):`Добавлено ${{d.added}} прокси во вкладку «${{d.tab_name}}»`,!!d.ok);
+}}
+
+async function sendNewTab() {{
+  const nm=document.getElementById('vtab-name').value.trim();
+  if(!nm){{toast('Введите название',false);return;}}
+  await sendTab('',nm);
+}}
+
+applyFilter();
+</script>
+</body>
+</html>"""

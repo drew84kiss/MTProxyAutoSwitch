@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QIcon, QIntValidator, QPalette
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QFontMetrics, QIcon, QIntValidator, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -119,6 +119,10 @@ RUNTIME_BUSY_TASKS = {
     "save_settings",
     "quick_sort_mode",
     "quick_probe",
+    "mtproxy_sort",
+    "mtproxy_import",
+    "mtproxy_delete",
+    "stress_test",
 }
 
 BALANCER_HELP = (
@@ -172,8 +176,9 @@ QFrame#activeCard:hover, QFrame#rowCard:hover {
 }
 QPushButton {
     min-height: 34px;
+    min-width: 0px;
     border-radius: 17px;
-    padding: 0 14px;
+    padding: 0 10px;
     border: 1px solid #D5CCE4;
     background: #FAF8FD;
     color: #221D31;
@@ -497,6 +502,10 @@ def _runtime_task_status(name: str) -> str:
         "save_settings": "Сохранение настроек...",
         "quick_sort_mode": "Быстрая сортировка по пингу...",
         "quick_probe": "Быстрая проверка прокси...",
+        "mtproxy_sort": "Сортировка MTProxy-пула...",
+        "mtproxy_import": "Импорт прокси из буфера...",
+        "mtproxy_delete": "Удаление нерабочих прокси...",
+        "stress_test": "Стресс-тест прокси...",
     }.get(name, "Выполняется операция...")
 
 
@@ -713,6 +722,63 @@ class LinkButton(QPushButton):
         self.url = url
         self.setObjectName("soft")
         self.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.url)))
+
+
+class FitButton(QPushButton):
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._base_point_size = -1.0
+        self._base_pixel_size = -1
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        if text:
+            self.setToolTip(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        if text and not self.toolTip():
+            self.setToolTip(text)
+        self._fit_text()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._fit_text()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._fit_text()
+
+    def _fit_text(self) -> None:
+        text = self.text()
+        if not text or self.width() <= 0:
+            return
+        font = self.font()
+        if font.pixelSize() > 0:
+            if self._base_pixel_size <= 0:
+                self._base_pixel_size = font.pixelSize()
+            available = max(12, self.contentsRect().width() - 14)
+            size = self._base_pixel_size
+            while size > 8:
+                candidate = self.font()
+                candidate.setPixelSize(size)
+                if QFontMetrics(candidate).horizontalAdvance(text) <= available:
+                    break
+                size -= 1
+            font.setPixelSize(max(8, size))
+            self.setFont(font)
+            return
+        if self._base_point_size <= 0:
+            self._base_point_size = font.pointSizeF() if font.pointSizeF() > 0 else 10.0
+        available = max(12, self.contentsRect().width() - 14)
+        size = self._base_point_size
+        while size > 8.0:
+            candidate = self.font()
+            candidate.setPointSizeF(size)
+            if QFontMetrics(candidate).horizontalAdvance(text) <= available:
+                break
+            size -= 0.5
+        font.setPointSizeF(max(8.0, size))
+        self.setFont(font)
 
 
 class MainWindow(QMainWindow):
@@ -1047,7 +1113,7 @@ class MainWindow(QMainWindow):
         return card
 
     def _button(self, text: str, *, accent: bool = False, soft: bool = False, danger: bool = False) -> QPushButton:
-        button = QPushButton(text)
+        button = FitButton(text)
         button.setCursor(Qt.PointingHandCursor)
         if accent:
             button.setObjectName("accent")
@@ -1313,7 +1379,11 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         header = QHBoxLayout()
         self.settings_title = self._label("Настройки", size=24, bold=True)
-        self.settings_back = self._button("Назад")
+        self.settings_back = self._button("←")
+        self.settings_back.setToolTip("Назад")
+        self.settings_back.setMinimumWidth(44)
+        self.settings_back.setMaximumWidth(44)
+        self.settings_back.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.settings_back.clicked.connect(self.settings_back_action)
         header.addWidget(self.settings_title, 1)
         header.addWidget(self.settings_back)
@@ -1364,6 +1434,7 @@ class MainWindow(QMainWindow):
             self.telegram_api_proxy_enabled,
             self.telegram_sources_enabled,
             self.deep_media_enabled,
+            self.rf_whitelist_check_enabled,
         ):
             widget.toggled.connect(self._settings_form_changed)
 
@@ -1914,6 +1985,15 @@ class MainWindow(QMainWindow):
         deep_row.addWidget(self.deep_media_enabled, 1)
         deep_row.addWidget(self._help_marker(self.deep_media_enabled.toolTip()))
         p.addLayout(deep_row)
+        self.rf_whitelist_check_enabled = QCheckBox("Whitelist check через Telegram API")
+        self.rf_whitelist_check_enabled.setToolTip(
+            "Строгая проверка MTProxy через Telegram API/media path: "
+            "провалившиеся proxy будут отклонены. Нужна авторизация Telegram."
+        )
+        whitelist_row = QHBoxLayout()
+        whitelist_row.addWidget(self.rf_whitelist_check_enabled, 1)
+        whitelist_row.addWidget(self._help_marker(self.rf_whitelist_check_enabled.toolTip()))
+        p.addLayout(whitelist_row)
         self.advanced_probe_enabled = QCheckBox("Показать параметры проверки")
         self.advanced_probe_enabled.toggled.connect(self._update_advanced_probe_ui)
         p.addWidget(self.advanced_probe_enabled)
@@ -2040,18 +2120,41 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         top = QHBoxLayout()
-        back = self._button("Назад")
+        back = self._button("←")
+        back.setToolTip("Назад")
+        back.setMinimumWidth(44)
+        back.setMaximumWidth(44)
+        back.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         back.clicked.connect(lambda: self.stack.setCurrentWidget(self.main_page))
-        quick = self._button("Проверить", soft=True)
-        quick.clicked.connect(self.quick_probe)
         top.addWidget(back)
         top.addStretch(1)
-        top.addWidget(quick)
-        self.proxy_quick_button = quick
         layout.addLayout(top)
         layout.addWidget(self._label("Прокси", size=24, bold=True))
         self.proxy_mode_text = self._label("Режим: Auto balance", soft=True)
         layout.addWidget(self.proxy_mode_text)
+        self.proxy_actions_widget = QWidget()
+        actions = QGridLayout(self.proxy_actions_widget)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+        quick = self._button("Сортировать", soft=True)
+        quick.clicked.connect(self.sort_proxy_pool)
+        import_btn = self._button("Импорт", soft=True)
+        import_btn.clicked.connect(self.import_proxy_clipboard)
+        delete_btn = self._button("Удалить", soft=True)
+        delete_btn.clicked.connect(self.delete_unavailable_proxies)
+        stress_btn = self._button("Стресс-тест", accent=True)
+        stress_btn.clicked.connect(self.stress_test_proxies)
+        actions.addWidget(quick, 0, 0)
+        actions.addWidget(import_btn, 0, 1)
+        actions.addWidget(delete_btn, 1, 0)
+        actions.addWidget(stress_btn, 1, 1)
+        actions.setColumnStretch(0, 1)
+        actions.setColumnStretch(1, 1)
+        self.proxy_quick_button = quick
+        self.proxy_import_button = import_btn
+        self.proxy_delete_button = delete_btn
+        self.proxy_stress_button = stress_btn
+        layout.addWidget(self.proxy_actions_widget)
         self.proxy_balancer_widget = QWidget()
         balancer_row = QHBoxLayout(self.proxy_balancer_widget)
         balancer_row.setContentsMargins(0, 0, 0, 0)
@@ -2376,7 +2479,8 @@ class MainWindow(QMainWindow):
             "about": "О приложении",
         }
         self.settings_title.setText(titles.get(key, "Настройки"))
-        self.settings_back.setText("Назад")
+        self.settings_back.setText("←")
+        self.settings_back.setToolTip("Назад")
         if key == "pool":
             self._refresh_pool_table()
         elif key == "telegram":
@@ -2432,6 +2536,7 @@ class MainWindow(QMainWindow):
         self.max_latency.setValue(int(round(float(cfg.max_latency_ms or 300))))
         self.live_probe_top_n.setValue(int(cfg.live_probe_top_n or 12))
         self.deep_media_enabled.setChecked(bool(cfg.deep_media_enabled))
+        self.rf_whitelist_check_enabled.setChecked(bool(cfg.rf_whitelist_check_enabled))
         self._set_list_values(self.xray_subscription_list, [str(item) for item in (cfg.xray_subscription_urls or [])])
         self.xray_socks_host.setText(str(cfg.xray_socks_host or "127.0.0.1"))
         self.xray_socks_port.setValue(int(cfg.xray_socks_port or 10808))
@@ -2654,7 +2759,7 @@ class MainWindow(QMainWindow):
                 "max_latency_ms": float(self.max_latency.value()),
                 "live_probe_top_n": int(self.live_probe_top_n.value()),
                 "deep_media_enabled": bool(self.deep_media_enabled.isChecked()),
-                "rf_whitelist_check_enabled": False,
+                "rf_whitelist_check_enabled": bool(self.rf_whitelist_check_enabled.isChecked()),
                 "xray_subscription_urls": [
                     value.strip()
                     for value in self._list_values(self.xray_subscription_list)
@@ -2803,6 +2908,10 @@ class MainWindow(QMainWindow):
             "routing_mode_combo",
             "restart_mode_button",
             "strategy_combo",
+            "proxy_quick_button",
+            "proxy_import_button",
+            "proxy_delete_button",
+            "proxy_stress_button",
         ):
             widget = getattr(self, widget_name, None)
             if widget is not None:
@@ -3068,6 +3177,26 @@ class MainWindow(QMainWindow):
             self.progress.setVisible(True)
             self.progress.setValue(int(380 + (completed / total) * 480))
             self.progress_text.setText(f"Проверка прокси: {completed}/{total}")
+        elif event_name == "deep_media_started":
+            total = int(payload.get("total") or 0)
+            title = "Whitelist check" if payload.get("strict") else "Deep media check"
+            self.progress.setVisible(True)
+            self.progress.setValue(870)
+            self.progress_text.setText(f"{title}: 0/{total}")
+        elif event_name == "deep_media_progress":
+            total = max(1, int(payload.get("total") or 1))
+            index = max(0, int(payload.get("index") or 0))
+            title = "Whitelist check" if payload.get("strict") else "Deep media check"
+            self.progress.setVisible(True)
+            self.progress.setValue(int(870 + (index / total) * 100))
+            self.progress_text.setText(f"{title}: {index}/{total}")
+        elif event_name == "deep_media_finished":
+            total = int(payload.get("total") or 0)
+            rejected = int(payload.get("rejected") or 0)
+            title = "Whitelist check" if payload.get("strict") else "Deep media check"
+            self.progress.setVisible(True)
+            self.progress.setValue(970)
+            self.progress_text.setText(f"{title}: проверено {total}, отклонено {rejected}")
         elif event_name == "runtime_refresh_waiting":
             self.progress_text.setText("Ждем окончания пользовательской media-сессии Telegram")
         elif event_name == "runtime_refresh_complete":
@@ -3173,6 +3302,52 @@ class MainWindow(QMainWindow):
             if not self.refresh_in_progress and not self.busy_task_names:
                 latency = _format_latency(payload.get("latency_ms"))
                 self.progress_text.setText(f"Подбор прокси: текущий пинг {latency}")
+        elif event_name == "mtproxy_import_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(120)
+            self.progress_text.setText(f"Импорт прокси: проверка {payload.get('new', 0)} новых")
+        elif event_name == "mtproxy_import_probe_result":
+            total = max(1, int(payload.get("total") or 1))
+            completed = max(0, int(payload.get("completed") or 0))
+            self.progress.setVisible(True)
+            self.progress.setValue(int(120 + (completed / total) * 760))
+            self.progress_text.setText(f"Импорт прокси: проверка {completed}/{total}")
+        elif event_name == "mtproxy_import_finished":
+            self.progress.setVisible(True)
+            self.progress.setValue(1000)
+            self.progress_text.setText(
+                f"Импорт: рабочих {payload.get('accepted', 0)}, отклонено {payload.get('rejected', 0)}"
+            )
+            self._refresh_proxy_page(only_if_visible=True)
+        elif event_name == "mtproxy_delete_finished":
+            self.progress.setVisible(True)
+            self.progress.setValue(1000)
+            self.progress_text.setText(f"Удалено нерабочих прокси: {payload.get('removed', 0)}")
+            self._refresh_proxy_page(only_if_visible=True)
+        elif event_name == "mtproxy_sort_finished":
+            self.progress.setVisible(True)
+            self.progress.setValue(1000)
+            self.progress_text.setText(f"Сортировка завершена: проверено {payload.get('checked', 0)}")
+            self._refresh_proxy_page(only_if_visible=True)
+        elif event_name == "mtproxy_stress_started":
+            self.progress.setVisible(True)
+            self.progress.setValue(80)
+            self.progress_text.setText(f"Стресс-тест прокси: 0/{payload.get('total', 0)}")
+        elif event_name == "mtproxy_stress_probe_result":
+            total = max(1, int(payload.get("total") or 1))
+            completed = max(0, int(payload.get("completed") or 0))
+            self.progress.setVisible(True)
+            self.progress.setValue(int(80 + (completed / total) * 820))
+            self.progress_text.setText(f"Стресс-тест прокси: {completed}/{total}")
+        elif event_name == "mtproxy_stress_finished":
+            self.progress.setVisible(True)
+            self.progress.setValue(1000)
+            media = int(payload.get("media_probed") or 0)
+            suffix = f", media-проверка {media}" if media else ""
+            self.progress_text.setText(
+                f"Стресс-тест: стабильных {payload.get('stable', 0)}, отклонено {payload.get('rejected', 0)}{suffix}"
+            )
+            self._refresh_proxy_page(only_if_visible=True)
         elif event_name == "xray_refresh_complete":
             self.progress.setVisible(True)
             total = int(payload.get("total") or 0)
@@ -3219,7 +3394,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "proxy_balancer_widget"):
             self.proxy_balancer_widget.setVisible(mode in {"mtproxy_picker", "xray_core"})
         if hasattr(self, "proxy_quick_button"):
-            self.proxy_quick_button.setText("Проверить" if mode == "mtproxy_picker" else "Сортировать")
+            self.proxy_quick_button.setText("Сортировать")
+        mtproxy_controls = mode == "mtproxy_picker"
+        for widget_name in ("proxy_import_button", "proxy_delete_button", "proxy_stress_button"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setVisible(mtproxy_controls)
         if mode == "xray_core":
             strategy = str(snapshot.get("balancer_strategy") or "sticky_session")
             manual = str(snapshot.get("manual_upstream_url") or "")
@@ -3363,6 +3543,64 @@ class MainWindow(QMainWindow):
     def copy_pool_to_clipboard(self) -> None:
         rows = list(self.runtime.snapshot().get("pool_rows") or [])
         QApplication.clipboard().setText("\n".join(str(row.get("url") or "") for row in rows if row.get("url")))
+
+    def sort_proxy_pool(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        if self.runtime.config.active_mode == "xray_core":
+            self.run_task("quick_sort_mode", lambda: self.runtime.quick_sort_active_mode(cancel_event=self.refresh_cancel_event))
+            return
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            return
+        self.run_task("mtproxy_sort", lambda: self.runtime.sort_mtproxy_pool(limit=self.runtime.config.live_probe_top_n))
+
+    def import_proxy_clipboard(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            return
+        text = QApplication.clipboard().text()
+        if not str(text or "").strip():
+            self.show_warning("Буфер пуст", "В буфере обмена нет MTProxy-ссылок.")
+            return
+        self.run_task(
+            "mtproxy_import",
+            lambda: self.runtime.import_mtproxy_urls_from_text(text),
+            on_success=lambda result: self.show_info(
+                "Импорт",
+                f"Добавлено рабочих: {dict(result or {}).get('accepted', 0)}. "
+                f"Отклонено: {dict(result or {}).get('rejected', 0)}.",
+            ),
+        )
+
+    def delete_unavailable_proxies(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            return
+        self.run_task(
+            "mtproxy_delete",
+            self.runtime.delete_unavailable_mtproxies,
+            on_success=lambda result: self.show_info(
+                "Удаление",
+                f"Удалено: {dict(result or {}).get('removed', 0)}.",
+            ),
+        )
+
+    def stress_test_proxies(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            return
+        self.run_task(
+            "stress_test",
+            lambda: self.runtime.stress_test_mtproxy_pool(limit=24),
+            on_success=lambda result: self.show_info(
+                "Стресс-тест",
+                f"Стабильных: {dict(result or {}).get('stable', 0)}. "
+                f"Отклонено: {dict(result or {}).get('rejected', 0)}.",
+            ),
+        )
 
     def quick_probe(self) -> None:
         if self._warn_runtime_busy():

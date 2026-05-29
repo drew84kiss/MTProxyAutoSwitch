@@ -4,7 +4,6 @@ import os
 datas = [
     ('img/icon.ico', 'img'),
     ('mtproxy_seed.json', '.'),
-    ('telegram_proxy_collector_seed.txt', '.'),
 ]
 if os.path.isdir('bin'):
     datas.append(('bin', 'bin'))

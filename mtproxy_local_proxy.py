@@ -228,6 +228,34 @@ class ProxyPool:
             if self._manual_override_key is not None and self._manual_override_key not in self._states:
                 self._manual_override_key = None
 
+    def remove_keys(self, keys: set[tuple[str, int, str]]) -> int:
+        with self._lock:
+            removed = 0
+            for key in set(keys):
+                if key in self._states:
+                    self._states.pop(key, None)
+                    removed += 1
+            if self._media_pin_key in keys:
+                self._media_pin_key = None
+                self._media_pin_until = 0.0
+            if self._manual_override_key in keys:
+                self._manual_override_key = None
+            self._sticky_assignments = {
+                session_key: assignment
+                for session_key, assignment in self._sticky_assignments.items()
+                if assignment[0] not in keys
+            }
+            return removed
+
+    def cooldown_keys(self) -> set[tuple[str, int, str]]:
+        with self._lock:
+            now = time.time()
+            return {
+                key
+                for key, state in self._states.items()
+                if state.counters.cooldown_until > now
+            }
+
     def update_deep_media_score(
         self,
         proxy_key: tuple[str, int, str],
@@ -645,6 +673,7 @@ class ProxyPool:
                 "url": state.outcome.proxy.url,
                 "host": state.outcome.proxy.host,
                 "port": state.outcome.proxy.port,
+                "live_latency_ms": state.counters.live_latency_ms,
                 "connect_latency_ms": state.counters.connect_latency_ms,
                 "media_score": state.media_score,
                 "deep_media_score": state.counters.deep_media_score,

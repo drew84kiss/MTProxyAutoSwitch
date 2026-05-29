@@ -27,6 +27,7 @@ from mtproxy_collector import (
     probe_all,
     run_collection,
     run_async,
+    scan_text,
 )
 from mtproxy_local_proxy import LocalMTProxyServer, ProxyPool
 from mtproxy_tg_ws.utils import stats as tg_ws_stats
@@ -183,6 +184,9 @@ APP_MODES = {
     "tg_ws_proxy",
 }
 REMOVED_WEB_SOURCES = {
+    "local:telegram-proxy-collector",
+    "telegram-proxy-collector",
+    "telegram proxy collector",
     "https://mtpro.xyz/socks5-ru",
 }
 
@@ -285,6 +289,18 @@ RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS = [
     "https://t.me/telemtfreeproxy",
     "https://t.me/ProxyFree_Ru",
     "https://t.me/JustMTProxy",
+    "https://t.me/ProxyMTProto",
+    "https://t.me/LowiKForum/10805",
+    "https://t.me/urlsources/5",
+    "https://t.me/urlsources/6",
+    "https://t.me/TProxyRU",
+    "https://t.me/noWhiteListBlock",
+    "https://t.me/ProxyFreeMTProto",
+    "https://t.me/vpn4everyone/10",
+    "https://t.me/freeinternet_byMygalaru/16",
+    "https://t.me/c/3953426502/7",
+    "https://t.me/AccarMTProto",
+    "https://t.me/kfwlforum/8",
 ]
 SAVED_MESSAGES_EXPORT_LIMIT = 20
 
@@ -1297,6 +1313,18 @@ class AppRuntime:
             unreachable_failures=2,
         )
 
+    def _import_probe_settings(self) -> ProbeSettings:
+        return ProbeSettings(
+            duration=max(6.0, min(12.0, float(self.config.duration or 35.0))),
+            interval=1.0,
+            timeout=max(4.0, min(8.0, float(self.config.timeout or 8.0))),
+            max_latency_ms=max(450.0, float(self.config.max_latency_ms or 300.0) * 1.5),
+            min_success_rate=0.5,
+            max_high_latency_ratio=1.0,
+            high_latency_streak=max(3, int(self.config.high_latency_streak or 3)),
+            unreachable_failures=2,
+        )
+
     def _run_deep_media_checks(
         self,
         working: list[ProbeOutcome],
@@ -2211,6 +2239,190 @@ class AppRuntime:
         self.xray_runtime.update_selection(self.config.balancer_strategy, "", restart=self.config.active_mode == "xray_core")
         self._emit("xray_upstream_changed", url="")
 
+    def sort_mtproxy_pool(self, *, limit: int | None = None) -> int:
+        if self.config.active_mode != "mtproxy_picker":
+            return self.quick_sort_active_mode()
+        checked = self.quick_probe_pool(limit=limit or self.config.live_probe_top_n, reason="manual_sort")
+        self._sync_last_working_from_pool_order()
+        self._persist_current_mtproxy_lists()
+        self._emit("mtproxy_sort_finished", checked=checked)
+        return checked
+
+    def import_mtproxy_urls_from_text(self, text: str) -> dict[str, int]:
+        if self.config.active_mode != "mtproxy_picker":
+            raise RuntimeError("mtproxy_import_requires_mtproxy_mode")
+        raw_text = str(text or "").strip()
+        artifacts = scan_text(raw_text, "clipboard", "clipboard")
+        parsed: dict[tuple[str, int, str], ProxyRecord] = {}
+        for proxy in artifacts.proxies:
+            parsed.setdefault(proxy.key, proxy)
+        if not parsed:
+            self._emit("mtproxy_import_finished", parsed=0, new=0, accepted=0, rejected=0)
+            return {"parsed": 0, "new": 0, "accepted": 0, "rejected": 0}
+
+        pool_keys = {tuple(row.get("key")) for row in self.pool.snapshot() if row.get("key")}
+        candidates = [proxy for key, proxy in parsed.items() if key not in pool_keys]
+        if not candidates:
+            self._emit("mtproxy_import_finished", parsed=len(parsed), new=0, accepted=0, rejected=0)
+            return {"parsed": len(parsed), "new": 0, "accepted": 0, "rejected": 0}
+
+        self._emit("mtproxy_import_started", parsed=len(parsed), new=len(candidates))
+        outcomes = run_async(
+            probe_all(
+                proxies=candidates,
+                settings=self._import_probe_settings(),
+                concurrency=max(1, min(8, len(candidates), int(self.config.workers or 1))),
+                verbose=False,
+                log_sink=self._log,
+                event_sink=lambda name, payload: self._emit(f"mtproxy_import_{name}", payload),
+            )
+        )
+        accepted = sorted((item for item in outcomes if item.accepted), key=outcome_sort_key)
+        rejected = sorted((item for item in outcomes if not item.accepted), key=lambda item: (item.reason, outcome_sort_key(item)))
+        outcome_keys = {item.proxy.key for item in outcomes}
+        accepted_keys = {item.proxy.key for item in accepted}
+
+        self.last_working = sorted(
+            [item for item in self.last_working if item.proxy.key not in accepted_keys] + accepted,
+            key=self._working_priority_key,
+        )
+        self.last_rejected = sorted(
+            [item for item in self.last_rejected if item.proxy.key not in outcome_keys] + rejected,
+            key=lambda item: (item.reason, outcome_sort_key(item)),
+        )
+        self.last_outcomes = [item for item in self.last_outcomes if item.proxy.key not in outcome_keys] + outcomes
+        self.pool.replace_outcomes(self.last_working)
+        self._apply_manual_override_from_config()
+        self._persist_current_mtproxy_lists()
+        self._emit(
+            "mtproxy_import_finished",
+            parsed=len(parsed),
+            new=len(candidates),
+            accepted=len(accepted),
+            rejected=len(rejected),
+        )
+        return {
+            "parsed": len(parsed),
+            "new": len(candidates),
+            "accepted": len(accepted),
+            "rejected": len(rejected),
+        }
+
+    def delete_unavailable_mtproxies(self) -> dict[str, int]:
+        if self.config.active_mode != "mtproxy_picker":
+            raise RuntimeError("mtproxy_delete_requires_mtproxy_mode")
+        rejected_keys = {item.proxy.key for item in self.last_rejected}
+        cooldown_keys = self.pool.cooldown_keys()
+        delete_keys = rejected_keys | cooldown_keys
+        if not delete_keys:
+            self._emit("mtproxy_delete_finished", removed=0)
+            return {"removed": 0}
+
+        manual_proxy = parse_proxy_link(self.config.manual_upstream_url, "manual", "manual") if self.config.manual_upstream_url else None
+        if manual_proxy is not None and manual_proxy.key in delete_keys:
+            self.config.manual_upstream_url = ""
+            self.save_config()
+
+        removed_from_pool = self.pool.remove_keys(delete_keys)
+        self.last_working = [item for item in self.last_working if item.proxy.key not in delete_keys]
+        self.last_rejected = [item for item in self.last_rejected if item.proxy.key not in delete_keys]
+        self.last_outcomes = [item for item in self.last_outcomes if item.proxy.key not in delete_keys]
+        self._persist_current_mtproxy_lists()
+        self._emit("mtproxy_delete_finished", removed=len(delete_keys), removed_from_pool=removed_from_pool)
+        return {"removed": len(delete_keys), "removed_from_pool": removed_from_pool}
+
+    def stress_test_mtproxy_pool(self, *, limit: int = 24) -> dict[str, int]:
+        if self.config.active_mode != "mtproxy_picker":
+            raise RuntimeError("mtproxy_stress_requires_mtproxy_mode")
+        if self.pool.count() <= 0:
+            self._emit("mtproxy_stress_finished", total=0, stable=0, rejected=0, media_probed=0)
+            return {"total": 0, "stable": 0, "rejected": 0, "media_probed": 0}
+
+        candidates = self.pool.select_candidates(is_media=False, limit=max(1, min(int(limit or 24), self.pool.count())))
+        proxies = [item.proxy for item in candidates]
+        self._emit("mtproxy_stress_started", total=len(proxies))
+        settings = ProbeSettings(
+            duration=60.0,
+            interval=2.0,
+            timeout=max(5.0, min(10.0, float(self.config.timeout or 8.0))),
+            max_latency_ms=float(self.config.max_latency_ms or 300.0),
+            min_success_rate=0.9,
+            max_high_latency_ratio=0.25,
+            high_latency_streak=2,
+            unreachable_failures=2,
+        )
+        outcomes = run_async(
+            probe_all(
+                proxies=proxies,
+                settings=settings,
+                concurrency=max(1, min(6, len(proxies), int(self.config.workers or 1))),
+                verbose=False,
+                log_sink=self._log,
+                event_sink=lambda name, payload: self._emit(f"mtproxy_stress_{name}", payload),
+            )
+        )
+
+        stable: list[ProbeOutcome] = []
+        rejected: list[ProbeOutcome] = []
+        for outcome in outcomes:
+            strict_ok = (
+                outcome.accepted
+                and outcome.success_rate >= 0.9
+                and outcome.high_latency_ratio <= 0.25
+                and outcome.max_consecutive_failures <= 1
+                and outcome.max_consecutive_high_latency < 2
+            )
+            if strict_ok:
+                stable.append(outcome)
+            else:
+                outcome.accepted = False
+                if outcome.reason == "ok":
+                    outcome.reason = "stress_unstable"
+                rejected.append(outcome)
+
+        media_probed = 0
+        if stable and auth_is_configured(self.auth_config):
+            for outcome in sorted(stable, key=outcome_sort_key)[: min(6, len(stable))]:
+                result = run_async(light_media_probe(outcome.proxy, self.auth_config))
+                self._latest_deep_media_scores[outcome.proxy.key] = result
+                self.pool.update_deep_media_score(
+                    outcome.proxy.key,
+                    result.score,
+                    result.note,
+                    upload_kbps=result.upload_kbps,
+                    download_kbps=result.download_kbps,
+                    aux_kbps=result.aux_kbps,
+                )
+                media_probed += 1
+
+        tested_keys = {item.proxy.key for item in outcomes}
+        self.last_working = sorted(
+            [item for item in self.last_working if item.proxy.key not in tested_keys] + stable,
+            key=self._working_priority_key,
+        )
+        self.last_rejected = sorted(
+            [item for item in self.last_rejected if item.proxy.key not in tested_keys] + rejected,
+            key=lambda item: (item.reason, outcome_sort_key(item)),
+        )
+        self.last_outcomes = [item for item in self.last_outcomes if item.proxy.key not in tested_keys] + outcomes
+        self.pool.replace_outcomes(self.last_working)
+        self._apply_manual_override_from_config()
+        self._apply_latest_deep_media_scores()
+        self._persist_current_mtproxy_lists()
+        self._emit(
+            "mtproxy_stress_finished",
+            total=len(outcomes),
+            stable=len(stable),
+            rejected=len(rejected),
+            media_probed=media_probed,
+        )
+        return {
+            "total": len(outcomes),
+            "stable": len(stable),
+            "rejected": len(rejected),
+            "media_probed": media_probed,
+        }
+
     def quick_probe_pool(self, *, limit: int = 8, reason: str = "manual") -> int:
         if self.pool.count() <= 0:
             return 0
@@ -2562,6 +2774,52 @@ class AppRuntime:
         temp_path.write_text(content, encoding="utf-8")
         temp_path.replace(path)
 
+    def _sync_last_working_from_pool_order(self) -> None:
+        if not self.last_working:
+            return
+        order = {
+            str(row.get("url") or ""): index
+            for index, row in enumerate(self.pool.snapshot())
+            if row.get("url")
+        }
+        self.last_working = sorted(
+            self.last_working,
+            key=lambda item: (order.get(item.proxy.url, 1_000_000), self._working_priority_key(item)),
+        )
+
+    def _persist_current_mtproxy_lists(self) -> None:
+        out_dir = (self.install_dir / self.config.out_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        all_txt_path = out_dir / ALL_FILE_NAME
+        working_txt_path = out_dir / LIST_FILE_NAME
+        fast_txt_path = out_dir / FAST_LIST_FILE_NAME
+        rejected_txt_path = out_dir / REJECTED_FILE_NAME
+
+        working = list(self.last_working)
+        rejected = sorted(self.last_rejected, key=lambda item: (item.reason, outcome_sort_key(item)))
+        fast_urls = [item.proxy.url for item in self._select_fast_candidates(working)]
+
+        self._write_url_list(all_txt_path, [item.proxy.url for item in self.last_outcomes])
+        self._write_url_list(working_txt_path, [item.proxy.url for item in working])
+        self._write_url_list(fast_txt_path, fast_urls)
+        self._write_url_list(rejected_txt_path, [item.proxy.url for item in rejected])
+        self.last_export.update(
+            {
+                "all_txt_path": str(all_txt_path),
+                "working_txt_path": str(working_txt_path),
+                "fast_txt_path": str(fast_txt_path),
+                "rejected_txt_path": str(rejected_txt_path),
+            }
+        )
+        self._emit(
+            "files_written",
+            out_dir=str(out_dir),
+            all_txt_path=str(all_txt_path),
+            working_txt_path=str(working_txt_path),
+            fast_txt_path=str(fast_txt_path),
+            rejected_txt_path=str(rejected_txt_path),
+        )
+
     def _load_initial_pool(self) -> None:
         report_candidates = [
             (self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME, "fast_list"),
@@ -2844,7 +3102,7 @@ class AppRuntime:
         sources = [
             str(item).strip()
             for item in data.get("sources", [])
-            if str(item).strip() and str(item).strip() not in REMOVED_WEB_SOURCES
+            if str(item).strip() and str(item).strip().lower() not in REMOVED_WEB_SOURCES
         ]
         mtproxytg_mirror_set = {source.lower() for source in MTPROXYTG_MIRRORS}
         compact_sources: list[str] = []
@@ -2861,7 +3119,7 @@ class AppRuntime:
             normalized = True
         if found_mtproxytg_mirror and MTPROXYTG_MIRROR_GROUP not in sources:
             sources.append(MTPROXYTG_MIRROR_GROUP)
-        if any(str(item).strip() in REMOVED_WEB_SOURCES for item in data.get("sources", [])):
+        if any(str(item).strip().lower() in REMOVED_WEB_SOURCES for item in data.get("sources", [])):
             normalized = True
         for source in RECOMMENDED_WEB_SOURCE_ADDITIONS:
             if source not in sources:
@@ -2966,6 +3224,8 @@ class AppRuntime:
             deep_download_kbps = pool_row.get("deep_media_download_kbps")
         if deep_upload_kbps is None and pool_row:
             deep_upload_kbps = pool_row.get("deep_media_upload_kbps")
+        if pool_row:
+            latency = pool_row.get("live_latency_ms") or pool_row.get("connect_latency_ms") or latency
         media_penalty = -float(media_score) if media_score is not None else 0.0
         deep_download_penalty = -float(deep_download_kbps) if deep_download_kbps is not None else 0.0
         deep_upload_penalty = -float(deep_upload_kbps) if deep_upload_kbps is not None else 0.0
