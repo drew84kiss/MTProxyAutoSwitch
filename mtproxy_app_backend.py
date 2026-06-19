@@ -518,6 +518,16 @@ class AppRuntime:
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self._save_persistent_telegram_auth(payload)
 
+    def set_telegram_sources_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        current = self._normalize_config(self.config)
+        if current.telegram_sources_enabled == enabled and current.thread_source_enabled == enabled:
+            return
+        current.telegram_sources_enabled = enabled
+        current.thread_source_enabled = enabled
+        self.config = current
+        self.save_config()
+
     @staticmethod
     def _config_payload(config: AppConfig) -> dict[str, Any]:
         payload = asdict(config)
@@ -3126,7 +3136,7 @@ class AppRuntime:
                         data[key] = str(value).strip()
                         normalized = True
                 elif key == "telegram_api_proxy_enabled":
-                    if bool(data.get(key, False)) != bool(value):
+                    if key not in data:
                         data[key] = bool(value)
                         normalized = True
         if data.get("telegram_api_proxy_url") == DEFAULT_TELEGRAM_API_PROXY_URL and not bool(data.get("telegram_api_proxy_enabled", False)):
@@ -3145,6 +3155,9 @@ class AppRuntime:
                 data["thread_source_url"] = telegram_sources[0]
                 normalized = True
         if "thread_source_enabled" not in data:
+            data["thread_source_enabled"] = bool(data.get("telegram_sources_enabled", False))
+            normalized = True
+        if bool(data.get("telegram_sources_enabled", False)) != bool(data.get("thread_source_enabled", False)):
             data["thread_source_enabled"] = bool(data.get("telegram_sources_enabled", False))
             normalized = True
         sources = [

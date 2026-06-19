@@ -824,6 +824,7 @@ class MainWindow(QMainWindow):
         self.tray_actions: dict[str, QAction] = {}
         self.tray_mode_actions: dict[str, QAction] = {}
         self._settings_refreshing = False
+        self._settings_ui_hydrated = False
         self._settings_baseline: AppConfig | None = None
         self._last_proxy_page_refresh_at = 0.0
         self._last_progress_ui_at = 0.0
@@ -2478,6 +2479,7 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         self._refresh_settings_from_config()
+        self._settings_ui_hydrated = True
         self.show_settings_page("home")
         self.stack.setCurrentWidget(self.settings_page)
 
@@ -2502,6 +2504,7 @@ class MainWindow(QMainWindow):
         if key == "pool":
             self._refresh_pool_table()
         elif key == "telegram":
+            self._sync_telegram_sources_checkbox_from_config()
             self._update_telegram_auth_ui()
             self.refresh_auth_status()
         elif key == "logs":
@@ -2707,7 +2710,32 @@ class MainWindow(QMainWindow):
         }
         return messages.get(delivery_type, "Код запрошен у Telegram. Проверьте доступные способы доставки.") + suffix
 
+    def _sync_telegram_sources_checkbox_from_config(self) -> None:
+        if not hasattr(self, "telegram_sources_enabled"):
+            return
+        enabled = bool(self.runtime.config.telegram_sources_enabled)
+        if self.telegram_sources_enabled.isChecked() == enabled:
+            return
+        self.telegram_sources_enabled.blockSignals(True)
+        self.telegram_sources_enabled.setChecked(enabled)
+        self.telegram_sources_enabled.blockSignals(False)
+
+    def _telegram_sources_preference_enabled(self) -> bool:
+        if getattr(self, "_settings_ui_hydrated", False) and hasattr(self, "telegram_sources_enabled"):
+            return bool(self.telegram_sources_enabled.isChecked())
+        return bool(self.runtime.config.telegram_sources_enabled)
+
+    def _persist_telegram_sources_preference(self) -> None:
+        if self._settings_refreshing:
+            return
+        enabled = self._telegram_sources_preference_enabled()
+        self.runtime.set_telegram_sources_enabled(enabled)
+        if getattr(self, "_settings_ui_hydrated", False):
+            self._reset_settings_baseline()
+
     def _telegram_sources_toggled(self, checked: bool) -> None:
+        if self._settings_refreshing:
+            return
         if checked and not self._telegram_authorized:
             self.show_warning(
                 "Telegram-источники",
@@ -2716,7 +2744,10 @@ class MainWindow(QMainWindow):
             self.telegram_sources_enabled.blockSignals(True)
             self.telegram_sources_enabled.setChecked(False)
             self.telegram_sources_enabled.blockSignals(False)
+            self._update_telegram_sources_enabled()
+            return
         self._update_telegram_sources_enabled()
+        self._persist_telegram_sources_preference()
 
     def _update_telegram_sources_enabled(self) -> None:
         if not hasattr(self, "telegram_sources_enabled"):
@@ -2759,7 +2790,8 @@ class MainWindow(QMainWindow):
                 "telegram_api_proxy_enabled": bool(self.telegram_api_proxy_enabled.isChecked()),
                 "telegram_api_proxy_url": self.telegram_api_proxy.text().strip() or DEFAULT_TELEGRAM_API_PROXY_URL,
                 "telegram_phone": normalize_telegram_phone(self.telegram_phone.text().strip()) or self.telegram_phone.text().strip(),
-                "telegram_sources_enabled": bool(self.telegram_sources_enabled.isChecked()),
+                "telegram_sources_enabled": self._telegram_sources_preference_enabled(),
+                "thread_source_enabled": self._telegram_sources_preference_enabled(),
                 "telegram_sources": self._list_values(self.telegram_source_list),
                 "sources": self._list_values(self.source_list),
                 "telegram_source_max_messages": int(self.telegram_max_messages.value()),
@@ -3804,12 +3836,14 @@ class MainWindow(QMainWindow):
             self._telegram_authorized = False
             self._telegram_auth_stage = "start"
             self.auth_status.setText("Telegram не авторизован")
+        self._sync_telegram_sources_checkbox_from_config()
         self._update_telegram_auth_ui()
 
     def _auth_status_failed(self, error: str) -> None:
         self._telegram_auth_known = False
         self._telegram_authorized = False
         self.auth_status.setText(f"Ошибка проверки авторизации: {self._format_telegram_error(error)}")
+        self._sync_telegram_sources_checkbox_from_config()
         self._update_telegram_auth_ui()
 
     def _save_auth_config_inline(self) -> None:
@@ -3931,13 +3965,9 @@ class MainWindow(QMainWindow):
         self._telegram_code_requested_at = 0.0
         self._telegram_code_delivery_type = ""
         self._telegram_code_resend_timeout = TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS
-        self.telegram_sources_enabled.setChecked(False)
         self.auth_status.setText("Telegram не авторизован")
+        self._sync_telegram_sources_checkbox_from_config()
         self._update_telegram_auth_ui()
-        with contextlib.suppress(Exception):
-            cfg = self._collect_config()
-            self.runtime.apply_config(cfg)
-            self._reset_settings_baseline()
 
     def send_proxy_list_to_saved(self) -> None:
         if getattr(self, "_telegram_auth_busy", None):
