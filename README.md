@@ -1,5 +1,7 @@
 # MTProxy AutoSwitch
 
+> Форк [pengvench/MTProxyAutoSwitch](https://github.com/pengvench/MTProxyAutoSwitch) · версия **1.6** · см. [CHANGELOG.md](CHANGELOG.md)
+
 `MTProxy AutoSwitch` - приложение для Telegram, которое поднимает локальный proxy и автоматически подбирает рабочий маршрут. Подключение делается только в Telegram через локальную ссылку. Системный VPN, TUN и общий proxy для всей ОС не включаются.
 
 В приложении три режима работы:

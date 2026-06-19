@@ -1,8 +1,8 @@
 #define MyAppName "MTProxy AutoSwitch"
 #define MyAppExeName "MTProxyAutoSwitch.exe"
-#define MyAppVersion "1.5"
-#define MyAppPublisher "pengvench"
-#define MyAppURL "https://github.com/pengvench/MTProxyAutoSwitch"
+#define MyAppVersion "1.6"
+#define MyAppPublisher "drew84kiss"
+#define MyAppURL "https://github.com/drew84kiss/MTProxyAutoSwitch"
 #define MyAppId "MTProxyAutoSwitch"
 
 [Setup]

@@ -14,9 +14,9 @@ from typing import Callable
 
 from mtproxy_net import create_verified_ssl_context
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 APP_PUBLIC_VERSION = APP_VERSION
-GITHUB_REPO = "pengvench/MTProxyAutoSwitch"
+GITHUB_REPO = "drew84kiss/MTProxyAutoSwitch"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 LATEST_RELEASE_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 WINDOWS_INSTALLER_ASSET_CANDIDATES = ("MTProxyAutoSwitch-Setup.exe",)

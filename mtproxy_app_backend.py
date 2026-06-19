@@ -369,6 +369,7 @@ class AppRuntime:
         self.last_export: dict[str, str] = {}
         self.last_refresh_started_at: float = 0.0
         self.last_refresh_finished_at: float = 0.0
+        self.last_refresh_stats: dict[str, int] = {}
         self.seed_source: str = ""
         self.seed_loaded_at: float = 0.0
         self.thread_status: str = "not_checked"
@@ -455,7 +456,7 @@ class AppRuntime:
         return XrayCoreRuntime(
             cfg,
             root_dir=self.install_dir,
-            out_dir=(self.install_dir / self.config.out_dir).resolve(),
+            out_dir=self._out_dir_path(),
             log_sink=self._log,
             event_sink=self._emit,
         )
@@ -464,6 +465,40 @@ class AppRuntime:
     def telegram_session_path(self) -> Path:
         session_name = Path(str(self.config.telegram_session_file or "telegram_user.sec")).name
         return (self.state_dir / session_name).resolve()
+
+    def _user_list_roots(self) -> list[Path]:
+        roots = [self.state_root]
+        if self.state_root != self.install_dir:
+            roots.append(self.install_dir)
+        return roots
+
+    def _out_dir_path(self) -> Path:
+        return (self.state_root / self.config.out_dir).resolve()
+
+    def _out_dir_candidates(self) -> list[Path]:
+        dirs: list[Path] = []
+        seen: set[str] = set()
+        for root in self._user_list_roots():
+            path = (root / self.config.out_dir).resolve()
+            marker = str(path)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            dirs.append(path)
+        return dirs
+
+    def _list_file_candidates(self, *names: str) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for out_dir in self._out_dir_candidates():
+            for name in names:
+                path = out_dir / name
+                marker = str(path)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                paths.append(path)
+        return paths
 
     def shutdown(self) -> None:
         self._shutdown_requested = True
@@ -923,6 +958,7 @@ class AppRuntime:
 
     def run_refresh(self, *, cancel_event: threading.Event | None = None, manual: bool = True) -> None:
         self._refresh_in_progress.set()
+        previous_working = list(self.last_working)
         try:
             self.last_refresh_started_at = time.time()
             self.thread_status = "disabled"
@@ -930,7 +966,7 @@ class AppRuntime:
             self._latest_deep_media_scores = {}
             config = CollectorConfig(
                 sources=list(self.config.sources),
-                out_dir=(self.install_dir / self.config.out_dir).resolve(),
+                out_dir=self._out_dir_path(),
                 duration=self.config.duration,
                 interval=self.config.interval,
                 timeout=self.config.timeout,
@@ -1075,6 +1111,14 @@ class AppRuntime:
                     cancel_event=cancel_event,
                 )
             self._raise_if_cancelled(cancel_event)
+            fresh_working_count = len(combined_working)
+            kept_previous = False
+            if not combined_working and previous_working:
+                combined_working = list(previous_working)
+                kept_previous = True
+                self._log(
+                    f"[runtime] refresh accepted 0 proxies; keeping previous working pool ({len(combined_working)})"
+                )
             self.last_result = base_result
             self.last_outcomes = combined_outcomes
             self.last_working = combined_working
@@ -1087,6 +1131,14 @@ class AppRuntime:
             self._raise_if_cancelled(cancel_event)
             self._export_combined_results(base_result, combined_outcomes, combined_working, combined_rejected)
             self.last_refresh_finished_at = time.time()
+            unique_count = len({item.proxy.key for item in combined_outcomes})
+            self.last_refresh_stats = {
+                "working": len(combined_working),
+                "fresh_working": fresh_working_count,
+                "unique": unique_count,
+                "rejected": len(combined_rejected),
+                "kept_previous": int(kept_previous),
+            }
 
             self._raise_if_cancelled(cancel_event)
             if self.config.active_mode == "mtproxy_picker" and combined_working:
@@ -1095,8 +1147,10 @@ class AppRuntime:
             self._emit(
                 "runtime_refresh_complete",
                 working=len(combined_working),
+                fresh_working=fresh_working_count,
                 rejected=len(combined_rejected),
-                unique=len({item.proxy.key for item in combined_outcomes}),
+                unique=unique_count,
+                kept_previous=kept_previous,
             )
         finally:
             self._refresh_in_progress.clear()
@@ -1225,8 +1279,8 @@ class AppRuntime:
                     "thread_proxy_count": self.thread_proxy_count,
                     "background_refreshing": self._refresh_in_progress.is_set(),
                     "exports": {
-                        "xray_working": str((self.install_dir / self.config.out_dir / "xray_working.json").resolve()),
-                        "xray_rejected": str((self.install_dir / self.config.out_dir / "xray_rejected.json").resolve()),
+                        "xray_working": str((self._out_dir_path() / "xray_working.json").resolve()),
+                        "xray_rejected": str((self._out_dir_path() / "xray_rejected.json").resolve()),
                     },
                 }
             )
@@ -1282,6 +1336,8 @@ class AppRuntime:
             "telegram_api_proxy_url": self.config.telegram_api_proxy_url,
             "last_refresh_started_at": self.last_refresh_started_at,
             "last_refresh_finished_at": self.last_refresh_finished_at,
+            "last_refresh_stats": dict(self.last_refresh_stats),
+            "background_refreshing": self._refresh_in_progress.is_set(),
             "exports": dict(self.last_export),
             "seed_source": self.seed_source,
             "seed_loaded_at": self.seed_loaded_at,
@@ -1992,7 +2048,7 @@ class AppRuntime:
         working: list[ProbeOutcome],
         rejected: list[ProbeOutcome],
     ) -> None:
-        out_dir = (self.install_dir / self.config.out_dir).resolve()
+        out_dir = self._out_dir_path()
         out_dir.mkdir(parents=True, exist_ok=True)
         all_txt_path = out_dir / ALL_FILE_NAME
         working_txt_path = out_dir / LIST_FILE_NAME
@@ -2606,7 +2662,7 @@ class AppRuntime:
         return merged
 
     def _tg_parsed_proxy_path(self) -> Path:
-        return (self.install_dir / self.config.out_dir / TG_PARSED_FILE_NAME).resolve()
+        return (self._out_dir_path() / TG_PARSED_FILE_NAME).resolve()
 
     @staticmethod
     def _telegram_source_parse_slot(timestamp: float | None = None) -> tuple[int, int, str]:
@@ -2649,11 +2705,9 @@ class AppRuntime:
         return list(proxies.values())
 
     def _load_manual_list_proxies(self) -> list[ProxyRecord]:
-        paths = [
-            self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME,
-            self.install_dir / self.config.out_dir / LIST_FILE_NAME,
-            self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
-        ]
+        paths = self._list_file_candidates(FAST_LIST_FILE_NAME, LIST_FILE_NAME)
+        for root in self._user_list_roots():
+            paths.append(root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME)
         proxies: dict[tuple[str, int, str], ProxyRecord] = {}
         for path in paths:
             if not path.exists():
@@ -2676,23 +2730,12 @@ class AppRuntime:
 
     def _load_known_working_proxy_records(self) -> list[ProxyRecord]:
         limit = max(48, min(96, int(self.config.max_proxies or 0) or 96))
-        paths = [
-            self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME,
-            self.install_dir / self.config.out_dir / TG_PARSED_FILE_NAME,
-            self.install_dir / self.config.out_dir / REPORT_FILE_NAME,
-            self.install_dir / self.config.out_dir / LIST_FILE_NAME,
-            self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
-            self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME,
-        ]
-        if self.state_root != self.install_dir:
+        paths = self._list_file_candidates(FAST_LIST_FILE_NAME, TG_PARSED_FILE_NAME, REPORT_FILE_NAME, LIST_FILE_NAME)
+        for root in self._user_list_roots():
             paths.extend(
                 [
-                    self.state_root / self.config.out_dir / FAST_LIST_FILE_NAME,
-                    self.state_root / self.config.out_dir / TG_PARSED_FILE_NAME,
-                    self.state_root / self.config.out_dir / REPORT_FILE_NAME,
-                    self.state_root / self.config.out_dir / LIST_FILE_NAME,
-                    self.state_root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
-                    self.state_root / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME,
+                    root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
+                    root / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME,
                 ]
             )
         proxies: dict[tuple[str, int, str], ProxyRecord] = {}
@@ -2717,11 +2760,9 @@ class AppRuntime:
         return list(proxies.values())
 
     def _read_existing_proxy_list_urls(self) -> list[str]:
-        candidates = [
-            self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME,
-            self.install_dir / self.config.out_dir / LIST_FILE_NAME,
-            self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
-        ]
+        candidates = self._list_file_candidates(FAST_LIST_FILE_NAME, LIST_FILE_NAME)
+        for root in self._user_list_roots():
+            candidates.append(root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME)
         merged: list[str] = []
         seen: set[str] = set()
         for path in candidates:
@@ -2759,6 +2800,9 @@ class AppRuntime:
             return []
 
     def _write_url_list(self, path: Path, urls: list[str]) -> None:
+        if not urls and path.name == LIST_FILE_NAME and path.exists():
+            self._log(f"[export] keeping previous {path.name} unchanged")
+            return
         unique_urls = self._merge_existing_proxy_list([], urls)
         content = "\n".join(unique_urls)
         if content:
@@ -2788,7 +2832,7 @@ class AppRuntime:
         )
 
     def _persist_current_mtproxy_lists(self) -> None:
-        out_dir = (self.install_dir / self.config.out_dir).resolve()
+        out_dir = self._out_dir_path()
         out_dir.mkdir(parents=True, exist_ok=True)
         all_txt_path = out_dir / ALL_FILE_NAME
         working_txt_path = out_dir / LIST_FILE_NAME
@@ -2821,13 +2865,17 @@ class AppRuntime:
         )
 
     def _load_initial_pool(self) -> None:
-        report_candidates = [
-            (self.install_dir / self.config.out_dir / FAST_LIST_FILE_NAME, "fast_list"),
-            (self.install_dir / self.config.out_dir / LIST_FILE_NAME, "default_list"),
-            (self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "legacy_working_list"),
-            (self.install_dir / self.config.out_dir / REPORT_FILE_NAME, "cached_report"),
-            (self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME, "legacy_cached_report"),
-        ]
+        report_candidates: list[tuple[Path, str]] = []
+        for path in self._list_file_candidates(FAST_LIST_FILE_NAME):
+            report_candidates.append((path, "fast_list"))
+        for path in self._list_file_candidates(LIST_FILE_NAME):
+            report_candidates.append((path, "default_list"))
+        for root in self._user_list_roots():
+            report_candidates.append((root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "legacy_working_list"))
+        for path in self._list_file_candidates(REPORT_FILE_NAME):
+            report_candidates.append((path, "cached_report"))
+        for root in self._user_list_roots():
+            report_candidates.append((root / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME, "legacy_cached_report"))
         for bundle_root in bundled_resource_roots():
             report_candidates.append((bundle_root / "mtproxy_seed.json", "bundled_seed"))
 

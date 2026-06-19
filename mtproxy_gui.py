@@ -492,6 +492,24 @@ def _format_reason_counts(counts: object, *, limit: int = 3) -> str:
     return ", ".join(f"{reason}: {count}" for reason, count in items[:limit])
 
 
+def _format_mtproxy_refresh_message(
+    *,
+    working: int,
+    unique: int,
+    fresh_working: int | None = None,
+    kept_previous: bool = False,
+    pool_count: int | None = None,
+) -> str:
+    pool = pool_count if pool_count is not None else working
+    fresh = fresh_working if fresh_working is not None else working
+    if kept_previous and fresh <= 0 and pool > 0:
+        return (
+            f"Обновление завершено: 0 новых рабочих из {unique} проверенных; "
+            f"в пуле осталось {pool}"
+        )
+    return f"Обновление завершено: {working} рабочих из {unique} проверенных"
+
+
 def _runtime_task_status(name: str) -> str:
     return {
         "change_mode": "Переключение режима...",
@@ -2522,9 +2540,7 @@ class MainWindow(QMainWindow):
         self.telegram_api_proxy.setText(str(cfg.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL))
         self.telegram_phone.setText(str(cfg.telegram_phone or ""))
         self.telegram_sources_enabled.blockSignals(True)
-        self.telegram_sources_enabled.setChecked(
-            bool(cfg.telegram_sources_enabled) and (not self._telegram_auth_known or self._telegram_authorized)
-        )
+        self.telegram_sources_enabled.setChecked(bool(cfg.telegram_sources_enabled))
         self.telegram_sources_enabled.blockSignals(False)
         self._set_list_values(self.source_list, [str(item) for item in (cfg.sources or [])])
         self._set_list_values(self.telegram_source_list, [str(item) for item in (cfg.telegram_sources or [])])
@@ -2597,10 +2613,6 @@ class MainWindow(QMainWindow):
         self.telegram_authorized_actions.setVisible(authorized)
 
         self.telegram_sources_enabled.setEnabled(True)
-        if known and not authorized:
-            self.telegram_sources_enabled.blockSignals(True)
-            self.telegram_sources_enabled.setChecked(False)
-            self.telegram_sources_enabled.blockSignals(False)
         self.telegram_sources_locked.setVisible(not authorized)
         self.auth_code_button.setEnabled(not busy and resend_remaining <= 0)
         self.auth_login_button.setEnabled(waiting_for_code and not busy)
@@ -2747,8 +2759,7 @@ class MainWindow(QMainWindow):
                 "telegram_api_proxy_enabled": bool(self.telegram_api_proxy_enabled.isChecked()),
                 "telegram_api_proxy_url": self.telegram_api_proxy.text().strip() or DEFAULT_TELEGRAM_API_PROXY_URL,
                 "telegram_phone": normalize_telegram_phone(self.telegram_phone.text().strip()) or self.telegram_phone.text().strip(),
-                "telegram_sources_enabled": bool(self.telegram_sources_enabled.isChecked())
-                and (not self._telegram_auth_known or self._telegram_authorized),
+                "telegram_sources_enabled": bool(self.telegram_sources_enabled.isChecked()),
                 "telegram_sources": self._list_values(self.telegram_source_list),
                 "sources": self._list_values(self.source_list),
                 "telegram_source_max_messages": int(self.telegram_max_messages.value()),
@@ -3117,9 +3128,18 @@ class MainWindow(QMainWindow):
                     self.progress_text.setText(f"{self.progress_text.text()} ({reason_tail})")
             elif mode == "tg_ws_proxy":
                 self.progress_text.setText(str(snapshot.get("status_text") or "Локальный прокси готов"))
+            elif snapshot.get("background_refreshing"):
+                self.progress_text.setText("Обновление списка proxy...")
             else:
+                refresh_stats = dict(snapshot.get("last_refresh_stats") or {})
                 self.progress_text.setText(
-                    f"Обновление завершено: {snapshot.get('working_count', len(rows))} рабочих из {snapshot.get('unique_count', 0)}"
+                    _format_mtproxy_refresh_message(
+                        working=int(snapshot.get("working_count") or len(rows)),
+                        unique=int(snapshot.get("unique_count") or 0),
+                        fresh_working=int(refresh_stats.get("fresh_working") or snapshot.get("working_count") or 0),
+                        kept_previous=bool(refresh_stats.get("kept_previous")),
+                        pool_count=len(rows),
+                    )
                     if snapshot.get("last_refresh_finished_at")
                     else "Готов к обновлению"
                 )
@@ -3135,7 +3155,20 @@ class MainWindow(QMainWindow):
         elif mode == "tg_ws_proxy":
             self.footer_info.setText("Активен локальный TG WS frontend." if running else "TG WS frontend остановлен.")
         else:
-            self.footer_info.setText("Загружен стартовый пул. Полный refresh запустится автоматически." if rows else "Рабочий пул пока пуст.")
+            refresh_stats = dict(snapshot.get("last_refresh_stats") or {})
+            working = int(snapshot.get("working_count") or len(rows))
+            unique = int(snapshot.get("unique_count") or 0)
+            if snapshot.get("last_refresh_finished_at"):
+                if bool(refresh_stats.get("kept_previous")) and int(refresh_stats.get("fresh_working") or 0) <= 0 and len(rows) > 0:
+                    self.footer_info.setText(
+                        f"Проверено: {unique}. Новых рабочих: 0. В пуле: {len(rows)}."
+                    )
+                else:
+                    self.footer_info.setText(f"Проверено: {unique}. Рабочих в пуле: {working}.")
+            elif rows:
+                self.footer_info.setText(f"Загружен пул: {len(rows)} proxy. Можно запустить обновление.")
+            else:
+                self.footer_info.setText("Рабочий пул пока пуст.")
         self._refresh_proxy_page(only_if_visible=True)
         if hasattr(self, "pool_list") and self.stack.currentWidget() is self.settings_page and self.settings_stack.currentWidget() is self.settings_pages.get("pool"):
             self._refresh_pool_table()
@@ -3202,8 +3235,14 @@ class MainWindow(QMainWindow):
         elif event_name == "runtime_refresh_complete":
             self.progress.setVisible(True)
             self.progress.setValue(1000)
+            payload_dict = dict(payload or {})
             self.progress_text.setText(
-                f"Обновление завершено: {payload.get('working', 0)} рабочих из {payload.get('unique', 0)}"
+                _format_mtproxy_refresh_message(
+                    working=int(payload_dict.get("working") or 0),
+                    unique=int(payload_dict.get("unique") or 0),
+                    fresh_working=int(payload_dict.get("fresh_working") or payload_dict.get("working") or 0),
+                    kept_previous=bool(payload_dict.get("kept_previous")),
+                )
             )
         elif event_name == "xray_probe_progress":
             total = max(1, int(payload.get("total") or 1))
@@ -3895,6 +3934,10 @@ class MainWindow(QMainWindow):
         self.telegram_sources_enabled.setChecked(False)
         self.auth_status.setText("Telegram не авторизован")
         self._update_telegram_auth_ui()
+        with contextlib.suppress(Exception):
+            cfg = self._collect_config()
+            self.runtime.apply_config(cfg)
+            self._reset_settings_baseline()
 
     def send_proxy_list_to_saved(self) -> None:
         if getattr(self, "_telegram_auth_busy", None):
@@ -3972,16 +4015,24 @@ class MainWindow(QMainWindow):
             on_success=prepared,
         )
 
+    def _reset_main_navigation(self) -> None:
+        if hasattr(self, "stack") and hasattr(self, "main_page"):
+            self.stack.setCurrentWidget(self.main_page)
+        if hasattr(self, "settings_stack") and hasattr(self, "settings_home"):
+            self.show_settings_page("home")
+
     def hide_to_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.show_warning("Трей недоступен", "Windows сейчас не отдает системный трей. Окно останется открытым, чтобы приложение не потерялось.")
             return
         self._ensure_tray_alive()
+        self._reset_main_navigation()
         self.hide()
         if self.tray.isVisible():
             self.tray.showMessage(APP_NAME, "Приложение продолжает работать в трее", QSystemTrayIcon.Information, 1800)
 
     def show_from_tray(self) -> None:
+        self._reset_main_navigation()
         self.showNormal()
         self.raise_()
         self.activateWindow()
