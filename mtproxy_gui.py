@@ -76,7 +76,7 @@ GITHUB_HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Github Begin"
 GITHUB_HOSTS_BLOCK_END = "# MTProxy AutoSwitch Github End"
 GITHUB_HOSTS_LINES = [
     "# Github",
-    "144.31.14.104 api.github.com",
+    "140.82.121.6 api.github.com",
     "185.199.109.133 raw.githubusercontent.com",
     "185.199.109.133 release-assets.githubusercontent.com",
     "185.199.108.133 private-user-images.githubusercontent.com",
