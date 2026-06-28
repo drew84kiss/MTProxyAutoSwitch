@@ -510,6 +510,9 @@ class AppRuntime:
             self.tg_ws_server.stop()
         with contextlib.suppress(Exception):
             self.xray_runtime.shutdown()
+        if self.config.active_mode == "mtproxy_picker" and self.last_working:
+            with contextlib.suppress(Exception):
+                self._persist_current_mtproxy_lists()
         if self.live_probe_thread.is_alive():
             self.live_probe_thread.join(timeout=3.0)
 
@@ -2875,17 +2878,19 @@ class AppRuntime:
         )
 
     def _load_initial_pool(self) -> None:
+        # Load the full working pool first. fast_list.txt is a capped export subset
+        # (DEFAULT_FAST_LIST_LIMIT) and must not win over the complete saved pool.
         report_candidates: list[tuple[Path, str]] = []
-        for path in self._list_file_candidates(FAST_LIST_FILE_NAME):
-            report_candidates.append((path, "fast_list"))
         for path in self._list_file_candidates(LIST_FILE_NAME):
             report_candidates.append((path, "default_list"))
-        for root in self._user_list_roots():
-            report_candidates.append((root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "legacy_working_list"))
         for path in self._list_file_candidates(REPORT_FILE_NAME):
             report_candidates.append((path, "cached_report"))
         for root in self._user_list_roots():
+            report_candidates.append((root / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "legacy_working_list"))
+        for root in self._user_list_roots():
             report_candidates.append((root / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME, "legacy_cached_report"))
+        for path in self._list_file_candidates(FAST_LIST_FILE_NAME):
+            report_candidates.append((path, "fast_list"))
         for bundle_root in bundled_resource_roots():
             report_candidates.append((bundle_root / "mtproxy_seed.json", "bundled_seed"))
 
