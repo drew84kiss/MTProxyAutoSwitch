@@ -1115,6 +1115,7 @@ class AppRuntime:
                 (item for item in combined_outcomes if not item.accepted),
                 key=lambda item: (item.reason, outcome_sort_key(item)),
             )
+            basic_working_count = len(combined_working)
 
             if (self.config.deep_media_enabled or self.config.rf_whitelist_check_enabled) and combined_working:
                 combined_working, combined_rejected = self._run_deep_media_checks(
@@ -1123,6 +1124,13 @@ class AppRuntime:
                     strict=self.config.rf_whitelist_check_enabled,
                     cancel_event=cancel_event,
                 )
+            media_filtered_count = max(0, basic_working_count - len(combined_working))
+            final_by_key = {item.proxy.key: item for item in combined_outcomes}
+            for item in combined_rejected:
+                final_by_key[item.proxy.key] = item
+            for item in combined_working:
+                final_by_key[item.proxy.key] = item
+            combined_outcomes = list(final_by_key.values())
             self._raise_if_cancelled(cancel_event)
             fresh_working_count = len(combined_working)
             kept_previous = False
@@ -1148,6 +1156,8 @@ class AppRuntime:
             self.last_refresh_stats = {
                 "working": len(combined_working),
                 "fresh_working": fresh_working_count,
+                "basic_working": basic_working_count,
+                "media_filtered": media_filtered_count,
                 "unique": unique_count,
                 "rejected": len(combined_rejected),
                 "kept_previous": int(kept_previous),
@@ -1161,6 +1171,8 @@ class AppRuntime:
                 "runtime_refresh_complete",
                 working=len(combined_working),
                 fresh_working=fresh_working_count,
+                basic_working=basic_working_count,
+                media_filtered=media_filtered_count,
                 rejected=len(combined_rejected),
                 unique=unique_count,
                 kept_previous=kept_previous,

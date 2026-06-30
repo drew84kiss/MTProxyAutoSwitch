@@ -499,6 +499,8 @@ def _format_mtproxy_refresh_message(
     fresh_working: int | None = None,
     kept_previous: bool = False,
     pool_count: int | None = None,
+    basic_working: int | None = None,
+    media_filtered: int | None = None,
 ) -> str:
     pool = pool_count if pool_count is not None else working
     fresh = fresh_working if fresh_working is not None else working
@@ -506,6 +508,13 @@ def _format_mtproxy_refresh_message(
         return (
             f"Обновление завершено: 0 новых рабочих из {unique} проверенных; "
             f"в пуле осталось {pool}"
+        )
+    basic = int(basic_working or 0)
+    filtered = int(media_filtered or 0)
+    if filtered > 0 and basic > working:
+        return (
+            f"Обновление завершено: {working} в пуле из {unique} проверенных "
+            f"({basic} прошли MTProto, {filtered} отсеяны Whitelist)"
         )
     return f"Обновление завершено: {working} рабочих из {unique} проверенных"
 
@@ -3171,6 +3180,8 @@ class MainWindow(QMainWindow):
                         fresh_working=int(refresh_stats.get("fresh_working") or snapshot.get("working_count") or 0),
                         kept_previous=bool(refresh_stats.get("kept_previous")),
                         pool_count=len(rows),
+                        basic_working=int(refresh_stats.get("basic_working") or 0),
+                        media_filtered=int(refresh_stats.get("media_filtered") or 0),
                     )
                     if snapshot.get("last_refresh_finished_at")
                     else "Готов к обновлению"
@@ -3274,6 +3285,8 @@ class MainWindow(QMainWindow):
                     unique=int(payload_dict.get("unique") or 0),
                     fresh_working=int(payload_dict.get("fresh_working") or payload_dict.get("working") or 0),
                     kept_previous=bool(payload_dict.get("kept_previous")),
+                    basic_working=int(payload_dict.get("basic_working") or 0),
+                    media_filtered=int(payload_dict.get("media_filtered") or 0),
                 )
             )
         elif event_name == "xray_probe_progress":
